@@ -17,11 +17,18 @@ import hashlib
 import os
 import time
 import uuid
+from collections.abc import Iterator
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
 from oikb.connectors import BaseConnector, ManifestEntry
+
+
+def _encode_drive_path(path: str) -> str:
+    """Encode a SharePoint path for Microsoft Graph's colon-path syntax."""
+    return quote(path, safe="/")
 
 
 class SharePointConnector(BaseConnector):
@@ -95,37 +102,130 @@ class SharePointConnector(BaseConnector):
         self._site_id = site_resp.json()["id"]
 
         # Resolve drive ID.
-        drives_resp = self._http.get(f"/sites/{self._site_id}/drives")
-        drives_resp.raise_for_status()
         self._drive_id = None
-        for drive in drives_resp.json().get("value", []):
+        available_drives: list[str] = []
+        for drive in self._iter_collection(f"/sites/{self._site_id}/drives"):
+            name = drive.get("name")
+            if isinstance(name, str):
+                available_drives.append(name)
             if drive.get("name") == self.library:
                 self._drive_id = drive["id"]
                 break
         if not self._drive_id:
-            drives = [d["name"] for d in drives_resp.json().get("value", [])]
-            raise ValueError(f"Library '{self.library}' not found. Available: {drives}")
+            raise ValueError(
+                f"Library '{self.library}' not found. Available: {available_drives}"
+            )
+
+    def _iter_collection(self, url: str) -> Iterator[dict[str, Any]]:
+        """Yield every object from a paginated Microsoft Graph collection."""
+        next_url: str | None = url
+        requested_urls: set[str] = set()
+
+        while next_url:
+            if next_url in requested_urls:
+                raise ValueError(
+                    "Microsoft Graph pagination repeated @odata.nextLink"
+                )
+            requested_urls.add(next_url)
+
+            response = self._http.get(next_url)
+            response.raise_for_status()
+            payload = response.json()
+
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    "Microsoft Graph collection response was not an object"
+                )
+
+            values = payload.get("value")
+            if not isinstance(values, list):
+                raise ValueError(
+                    "Microsoft Graph collection response contained a non-list value"
+                )
+
+            for item in values:
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        "Microsoft Graph collection response contained a non-object item"
+                    )
+                yield item
+
+            next_link = payload.get("@odata.nextLink")
+            if next_link is None or next_link == "":
+                next_url = None
+            elif isinstance(next_link, str):
+                next_url = next_link
+            else:
+                raise ValueError(
+                    "Microsoft Graph collection response contained an invalid "
+                    "@odata.nextLink"
+                )
 
     def build_manifest(self) -> list[ManifestEntry]:
         entries: list[ManifestEntry] = []
-        self._walk_folder("/", "", entries)
+        self._walk_folder("/", "", entries, set(), set())
         entries.sort(key=lambda e: e.display_path)
         return entries
 
-    def _walk_folder(self, folder_path: str, prefix: str, entries: list[ManifestEntry]) -> None:
-        url = f"/drives/{self._drive_id}/root/children" if folder_path == "/" else f"/drives/{self._drive_id}/root:/{folder_path}:/children"
-        resp = self._http.get(url)
-        resp.raise_for_status()
-
-        for item in resp.json().get("value", []):
+    def _walk_folder(
+        self,
+        folder_path: str,
+        prefix: str,
+        entries: list[ManifestEntry],
+        seen_folder_ids: set[str],
+        seen_file_paths: set[str],
+    ) -> None:
+        url = (
+            f"/drives/{self._drive_id}/root/children"
+            if folder_path == "/"
+            else (
+                f"/drives/{self._drive_id}/root:/"
+                f"{_encode_drive_path(folder_path)}:/children"
+            )
+        )
+        for item in self._iter_collection(url):
             if "folder" in item:
-                sub = f"{prefix}/{item['name']}" if prefix else item["name"]
-                child_path = f"{folder_path}/{item['name']}" if folder_path != "/" else item["name"]
-                self._walk_folder(child_path, sub, entries)
+                name = item.get("name")
+                item_id = item.get("id")
+                if not isinstance(name, str) or not name:
+                    raise ValueError(
+                        "Microsoft Graph folder item contained an invalid name"
+                    )
+                if not isinstance(item_id, str) or not item_id:
+                    raise ValueError(
+                        "Microsoft Graph folder item contained an invalid id"
+                    )
+                if item_id in seen_folder_ids:
+                    raise ValueError(f"SharePoint repeated folder item id: {item_id}")
+                seen_folder_ids.add(item_id)
+
+                sub = f"{prefix}/{name}" if prefix else name
+                child_path = (
+                    f"{folder_path}/{name}" if folder_path != "/" else name
+                )
+                self._walk_folder(
+                    child_path,
+                    sub,
+                    entries,
+                    seen_folder_ids,
+                    seen_file_paths,
+                )
             elif "file" in item:
+                name = item.get("name")
+                if not isinstance(name, str) or not name:
+                    raise ValueError(
+                        "Microsoft Graph file item contained an invalid name"
+                    )
+                display_path = f"{prefix}/{name}" if prefix else name
+                if display_path in seen_file_paths:
+                    raise ValueError(
+                        f"SharePoint duplicate file path: {display_path}"
+                    )
+                seen_file_paths.add(display_path)
+
                 etag = (item.get("eTag") or item.get("cTag", "")).strip('"')
                 entries.append(ManifestEntry(
-                    filename=item["name"],
+                    filename=name,
                     path=prefix,
                     checksum=etag[:16] if etag else "",
                     size=item.get("size", 0),
@@ -133,7 +233,10 @@ class SharePointConnector(BaseConnector):
 
     def read_file(self, path: str, filename: str) -> bytes:
         file_path = f"{path}/{filename}" if path else filename
-        resp = self._http.get(f"/drives/{self._drive_id}/root:/{file_path}:/content")
+        resp = self._http.get(
+            f"/drives/{self._drive_id}/root:/{_encode_drive_path(file_path)}:/content",
+            follow_redirects=True,
+        )
         resp.raise_for_status()
         return resp.content
 
