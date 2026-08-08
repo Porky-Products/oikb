@@ -21,9 +21,9 @@ class ZendeskTicketsConnector(BaseConnector):
         self._user = user or os.environ.get("ZENDESKTICKET_USER", "")
         self._token = token or os.environ.get("ZENDESKTICKET_TOKEN", "")
         self._state_dir = state_dir
-        if not self._subdomain or not self._token:
+        if not self._subdomain or not self._user or not self._token:
             raise ValueError(
-                "Zendesk tickets credentials required. Set ZENDESKTICKET_SUBDOMAIN and ZENDESKTICKET_TOKEN env vars."
+                "Zendesk tickets credentials required. Set ZENDESKTICKET_SUBDOMAIN, ZENDESKTICKET_USER, and ZENDESKTICKET_TOKEN env vars."
             )
         self._http = httpx.Client(
             base_url=f"https://{self._subdomain}.zendesk.com/api/v2",

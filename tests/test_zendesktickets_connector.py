@@ -41,6 +41,15 @@ def test_constructor_parses_zendeskticket_env(monkeypatch):
     connector.close()
 
 
+def test_constructor_requires_user(monkeypatch):
+    monkeypatch.setenv("ZENDESKTICKET_SUBDOMAIN", "acme")
+    monkeypatch.delenv("ZENDESKTICKET_USER", raising=False)
+    monkeypatch.setenv("ZENDESKTICKET_TOKEN", "secret")
+
+    with pytest.raises(ValueError, match="Zendesk tickets credentials required"):
+        ZendeskTicketsConnector()
+
+
 def test_build_manifest_is_empty(monkeypatch):
     monkeypatch.setenv("ZENDESKTICKET_SUBDOMAIN", "acme")
     monkeypatch.setenv("ZENDESKTICKET_USER", "agent@example.com")
