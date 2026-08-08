@@ -107,7 +107,7 @@ class ZendeskTicketsConnector(BaseConnector):
                     "per_page": self._page_size,
                     "sort_by": "updated_at",
                     "sort_order": "asc",
-                    "updated_since": self._format_dt(checkpoint),
+                    "start_time": self._format_start_time(checkpoint),
                 },
             )
             response.raise_for_status()
@@ -168,6 +168,12 @@ class ZendeskTicketsConnector(BaseConnector):
 
     def _format_dt(self, value: datetime) -> str:
         return value.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _format_start_time(self, value: datetime) -> int:
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        if value <= epoch:
+            return 0
+        return int(value.astimezone(UTC).timestamp())
 
 
 def parse_zendesktickets_source(source: str) -> dict[str, str | None]:

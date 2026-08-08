@@ -141,7 +141,7 @@ def test_build_manifest_uses_min_datetime_when_checkpoint_missing(monkeypatch):
             "per_page": 10,
             "sort_by": "updated_at",
             "sort_order": "asc",
-            "updated_since": "0001-01-01T00:00:00Z",
+            "start_time": 0,
         },
     }
     assert checkpoint_file.read_text().strip() == "2024-01-02T03:04:05Z"
@@ -213,7 +213,7 @@ def test_build_manifest_filters_by_checkpoint_and_renders_comments(monkeypatch):
             "per_page": 1,
             "sort_by": "updated_at",
             "sort_order": "asc",
-            "updated_since": "2024-01-01T00:00:00Z",
+            "start_time": 1704067200,
         },
     }
     assert text.startswith("# Ticket 1001: Printer down")
