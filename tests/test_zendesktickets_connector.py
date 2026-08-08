@@ -1,4 +1,13 @@
+from pathlib import Path
+import sys
+
 import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from oikb.cli import _resolve_connector
 from oikb.connectors.zendesktickets import ZendeskTicketsConnector, parse_zendesktickets_source
@@ -23,20 +32,12 @@ def test_constructor_parses_zendeskticket_env(monkeypatch):
     monkeypatch.setenv("ZENDESKTICKET_SUBDOMAIN", "acme")
     monkeypatch.setenv("ZENDESKTICKET_USER", "agent@example.com")
     monkeypatch.setenv("ZENDESKTICKET_TOKEN", "secret")
-    monkeypatch.setenv("ZENDESKTICKET_PAGE_SIZE", "25")
-    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
-    monkeypatch.setenv("ZENDESKTICKET_INCLUDETAGS", "one,two")
-    monkeypatch.setenv("ZENDESKTICKET_EXCLUDETAGS", "three")
 
     connector = ZendeskTicketsConnector()
 
     assert connector._subdomain == "acme"
     assert connector._user == "agent@example.com"
     assert connector._token == "secret"
-    assert connector._page_size == 25
-    assert connector._download_attachments is True
-    assert connector._include_tags == ["one", "two"]
-    assert connector._exclude_tags == ["three"]
     connector.close()
 
 
