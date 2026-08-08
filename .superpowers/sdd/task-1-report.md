@@ -35,3 +35,19 @@
 
 **Commit**
 - `91b521c696918d77dc496b4f6396069a2c14501c` — `fix: trim zendesk tickets task 1 scope`
+
+## Missing user validation fix
+
+**Files changed**
+- `tests/test_zendesktickets_connector.py`
+- `src/oikb/connectors/zendesktickets.py`
+
+**Test command**
+- `pytest tests/test_zendesktickets_connector.py -v`
+
+**Test output**
+- Before fix: `test_constructor_requires_user` failed with `Failed: DID NOT RAISE <class 'ValueError'>`
+- After fix: `7 passed in 0.16s`
+
+**Commit**
+- `baebf57` — `fix: require zendesk tickets user`
