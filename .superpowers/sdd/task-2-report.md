@@ -42,3 +42,16 @@ fix follow-up:
   - `10 passed in 0.24s`
 - commit hash:
   - `50cb916` — `fix: advance zendesk checkpoints for filtered tickets`
+
+---
+
+task 2 review follow-up:
+- files changed:
+  - `src/oikb/connectors/zendesktickets.py`
+  - `tests/test_zendesktickets_connector.py`
+- test command:
+  - `pytest tests/test_zendesktickets_connector.py -v`
+- test output:
+  - `10 passed in 0.22s`
+- commit hash:
+  - `1942221` — `fix: use zendesk start_time checkpoint`
