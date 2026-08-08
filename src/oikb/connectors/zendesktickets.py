@@ -49,6 +49,8 @@ class ZendeskTicketsConnector(BaseConnector):
         for page in self._iter_ticket_pages(checkpoint):
             page_max_updated_at: datetime | None = None
             for ticket in page:
+                updated_at = self._parse_dt(ticket["updated_at"])
+                page_max_updated_at = updated_at if page_max_updated_at is None else max(page_max_updated_at, updated_at)
                 if not self._should_include_ticket(ticket):
                     continue
                 comments = self._fetch_ticket_comments(ticket["id"])
@@ -64,8 +66,6 @@ class ZendeskTicketsConnector(BaseConnector):
                     )
                 )
                 self._file_cache[("", filename)] = content
-                updated_at = self._parse_dt(ticket["updated_at"])
-                page_max_updated_at = updated_at if page_max_updated_at is None else max(page_max_updated_at, updated_at)
             if page_max_updated_at is not None:
                 self._save_checkpoint(page_max_updated_at)
 

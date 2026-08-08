@@ -224,6 +224,51 @@ def test_build_manifest_filters_by_checkpoint_and_renders_comments(monkeypatch):
     connector.close()
 
 
+def test_build_manifest_advances_checkpoint_for_filtered_ticket(monkeypatch):
+    monkeypatch.setenv("ZENDESKTICKET_SUBDOMAIN", "acme")
+    monkeypatch.setenv("ZENDESKTICKET_USER", "agent@example.com")
+    monkeypatch.setenv("ZENDESKTICKET_TOKEN", "secret")
+    monkeypatch.setenv("ZENDESKTICKET_INCLUDETAGS", "ops")
+    state_dir = _make_state_dir("filtered-later-ticket")
+    checkpoint_file = state_dir / "resume_checkpoint.txt"
+
+    connector = ZendeskTicketsConnector(state_dir=str(state_dir))
+    connector._http = FakeHTTPClient(
+        pages=[
+            {
+                "tickets": [
+                    {
+                        "id": 1001,
+                        "subject": "Printer down",
+                        "description": "Cannot print boarding passes",
+                        "status": "open",
+                        "priority": "normal",
+                        "updated_at": "2024-01-02T03:04:05Z",
+                        "tags": ["ops"],
+                    },
+                    {
+                        "id": 1002,
+                        "subject": "Badge reader offline",
+                        "description": "Front desk badge reader stopped responding",
+                        "status": "pending",
+                        "priority": "high",
+                        "updated_at": "2024-01-03T04:05:06Z",
+                        "tags": ["facilities"],
+                    },
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    entries = connector.build_manifest()
+
+    assert [entry.filename for entry in entries] == ["1001.md"]
+    assert checkpoint_file.read_text().strip() == "2024-01-03T04:05:06Z"
+    connector.close()
+
+
 def test_read_file_raises_file_not_found(monkeypatch):
     monkeypatch.setenv("ZENDESKTICKET_SUBDOMAIN", "acme")
     monkeypatch.setenv("ZENDESKTICKET_USER", "agent@example.com")
