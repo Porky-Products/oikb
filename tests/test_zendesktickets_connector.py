@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import sys
 from pathlib import Path
 
@@ -16,9 +15,6 @@ if str(SRC) not in sys.path:
 from oikb.connectors import ManifestEntry
 from oikb.connectors.zendesktickets import ZendeskTicketsConnector, parse_zendesktickets_source
 from oikb.sync import run_sync
-
-
-TEST_STATE_ROOT = ROOT / ".test-state" / "zendesktickets"
 
 
 class FakeResponse:
@@ -49,7 +45,7 @@ class FakeHTTPClient:
         if path.endswith("/comments.json"):
             ticket_id = int(path.split("/")[2])
             return FakeResponse({"comments": self._comments.get(ticket_id, [])})
-        if path.startswith("https://attachments.example/"):
+        if path.startswith("https://attachments.example/") or path.startswith("https://acme.zendesk.com/attachments/"):
             name = path.rsplit("/", 1)[-1]
             return FakeBinaryResponse(self._attachments[name])
         raise AssertionError(f"Unexpected request: {path}")
@@ -138,10 +134,8 @@ class FakeClient:
         return {}
 
 
-def _make_state_dir(name: str) -> Path:
-    state_dir = TEST_STATE_ROOT / name
-    if state_dir.exists():
-        shutil.rmtree(state_dir)
+def _make_state_dir(tmp_path: Path, name: str) -> Path:
+    state_dir = tmp_path / name
     state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir
 
@@ -198,8 +192,8 @@ def test_constructor_requires_all_credentials(monkeypatch: pytest.MonkeyPatch):
         ZendeskTicketsConnector()
 
 
-def test_build_manifest_uses_min_datetime_when_checkpoint_missing(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("missing-checkpoint")
+def test_build_manifest_uses_min_datetime_when_checkpoint_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "missing-checkpoint")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -214,8 +208,8 @@ def test_build_manifest_uses_min_datetime_when_checkpoint_missing(monkeypatch: p
     connector.close()
 
 
-def test_build_manifest_renders_comments_and_persists_state_after_success(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("render-comments")
+def test_build_manifest_renders_comments_and_persists_state_after_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "render-comments")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -235,8 +229,8 @@ def test_build_manifest_renders_comments_and_persists_state_after_success(monkey
     connector.close()
 
 
-def test_sync_failure_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("checkpoint-on-success")
+def test_sync_failure_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "checkpoint-on-success")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -250,8 +244,8 @@ def test_sync_failure_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatc
     connector.close()
 
 
-def test_sync_run_advances_checkpoint_only_after_upload_success(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("run-sync-checkpoint")
+def test_sync_run_advances_checkpoint_only_after_upload_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "run-sync-checkpoint")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -266,8 +260,8 @@ def test_sync_run_advances_checkpoint_only_after_upload_success(monkeypatch: pyt
     assert (state_dir / "resume_checkpoint.txt").read_text().strip() == "2024-01-02T03:04:05Z"
 
 
-def test_sync_dry_run_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("dry-run-no-checkpoint")
+def test_sync_dry_run_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "dry-run-no-checkpoint")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -282,8 +276,8 @@ def test_sync_dry_run_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatc
     assert not (state_dir / "resume_checkpoint.txt").exists()
 
 
-def test_sync_exception_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("exception-no-checkpoint")
+def test_sync_exception_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "exception-no-checkpoint")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -301,8 +295,8 @@ def test_sync_exception_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPa
     assert not (state_dir / "resume_checkpoint.txt").exists()
 
 
-def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("carry-forward")
+def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "carry-forward")
     (state_dir / "manifest_state.json").write_text(
         json.dumps(
             {
@@ -337,8 +331,8 @@ def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch:
     connector.close()
 
 
-def test_include_and_exclude_tags_filter_ticket_set(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("tag-filter")
+def test_include_and_exclude_tags_filter_ticket_set(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "tag-filter")
     monkeypatch.setenv("ZENDESKTICKET_INCLUDETAGS", "ops,urgent")
     monkeypatch.setenv("ZENDESKTICKET_EXCLUDETAGS", "ignore-me")
     connector = _build_connector(
@@ -363,8 +357,8 @@ def test_include_and_exclude_tags_filter_ticket_set(monkeypatch: pytest.MonkeyPa
     connector.close()
 
 
-def test_filtered_ticket_is_removed_from_kb_on_next_sync(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("filtered-removal")
+def test_filtered_ticket_is_removed_from_kb_on_next_sync(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "filtered-removal")
     existing_files = [
         {"path": "", "filename": "1001.md", "checksum": "old", "file_id": "file-1"},
         {"path": "1001", "filename": "1001-screenshot.png", "checksum": "old2", "file_id": "file-2"},
@@ -401,8 +395,8 @@ def test_filtered_ticket_is_removed_from_kb_on_next_sync(monkeypatch: pytest.Mon
     assert result.deleted == 2
 
 
-def test_attachments_are_added_when_enabled(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("attachments-enabled")
+def test_attachments_are_added_when_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "attachments-enabled")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
     connector = _build_connector(
         monkeypatch,
@@ -413,13 +407,21 @@ def test_attachments_are_added_when_enabled(monkeypatch: pytest.MonkeyPatch):
                     _ticket(
                         1001,
                         "2024-01-02T03:04:05Z",
-                        attachments=[_attachment("error-log.txt")],
+                        attachments=[_attachment("error-log.txt", url="https://acme.zendesk.com/attachments/error-log.txt")],
                     )
                 ],
                 "next_page": None,
             }
         ],
-        comments={1001: [_comment(501, "See screenshot", attachments=[_attachment("screenshot.png")])]},
+        comments={
+            1001: [
+                _comment(
+                    501,
+                    "See screenshot",
+                    attachments=[_attachment("screenshot.png", url="https://acme.zendesk.com/attachments/screenshot.png")],
+                )
+            ]
+        },
         attachments={"error-log.txt": b"log-bytes", "screenshot.png": b"image-bytes"},
     )
 
@@ -434,8 +436,8 @@ def test_attachments_are_added_when_enabled(monkeypatch: pytest.MonkeyPatch):
     connector.close()
 
 
-def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytest.MonkeyPatch):
-    state_dir = _make_state_dir("attachments-disabled")
+def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "attachments-disabled")
     (state_dir / "manifest_state.json").write_text(
         json.dumps(
             {
@@ -473,16 +475,66 @@ def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytes
     assert client.cleanup_calls == [{"kb_id": "kb-1", "file_ids": ["file-img", "file-md"], "dir_ids": None}]
 
 
-def test_page_size_defaults_to_ten_and_is_overrideable(monkeypatch: pytest.MonkeyPatch):
+def test_page_size_defaults_to_ten_and_is_overrideable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("ZENDESKTICKET_SUBDOMAIN", "acme")
     monkeypatch.setenv("ZENDESKTICKET_USER", "agent@example.com")
     monkeypatch.setenv("ZENDESKTICKET_TOKEN", "secret")
     monkeypatch.delenv("ZENDESKTICKET_PAGE_SIZE", raising=False)
-    default_connector = ZendeskTicketsConnector(state_dir=str(_make_state_dir("default-page-size")))
+    default_connector = ZendeskTicketsConnector(state_dir=str(_make_state_dir(tmp_path, "default-page-size")))
     assert default_connector._page_size == 10
     default_connector.close()
 
     monkeypatch.setenv("ZENDESKTICKET_PAGE_SIZE", "25")
-    custom_connector = ZendeskTicketsConnector(state_dir=str(_make_state_dir("custom-page-size")))
+    custom_connector = ZendeskTicketsConnector(state_dir=str(_make_state_dir(tmp_path, "custom-page-size")))
     assert custom_connector._page_size == 25
     custom_connector.close()
+
+
+def test_page_size_must_be_positive_integer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setenv("ZENDESKTICKET_SUBDOMAIN", "acme")
+    monkeypatch.setenv("ZENDESKTICKET_USER", "agent@example.com")
+    monkeypatch.setenv("ZENDESKTICKET_TOKEN", "secret")
+
+    monkeypatch.setenv("ZENDESKTICKET_PAGE_SIZE", "abc")
+    with pytest.raises(ValueError, match="ZENDESKTICKET_PAGE_SIZE must be a positive integer"):
+        ZendeskTicketsConnector(state_dir=str(_make_state_dir(tmp_path, "invalid-page-size")))
+
+    monkeypatch.setenv("ZENDESKTICKET_PAGE_SIZE", "0")
+    with pytest.raises(ValueError, match="ZENDESKTICKET_PAGE_SIZE must be a positive integer"):
+        ZendeskTicketsConnector(state_dir=str(_make_state_dir(tmp_path, "zero-page-size")))
+
+
+def test_external_attachment_downloads_without_authenticated_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "external-attachments")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[_attachment("external.png")],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+    external_calls: list[dict[str, object]] = []
+
+    def fake_httpx_get(url: str, timeout: float) -> FakeBinaryResponse:
+        external_calls.append({"url": url, "timeout": timeout})
+        return FakeBinaryResponse(b"external-bytes")
+
+    monkeypatch.setattr("oikb.connectors.zendesktickets.httpx.get", fake_httpx_get)
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md", "1001/1001-external.png"]
+    assert external_calls == [{"url": "https://attachments.example/external.png", "timeout": 30.0}]
+    assert all(call["path"] != "https://attachments.example/external.png" for call in connector._http.calls)
+    connector.close()

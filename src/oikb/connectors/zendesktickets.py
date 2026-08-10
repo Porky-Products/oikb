@@ -10,6 +10,7 @@ import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 import httpx
 
@@ -27,7 +28,7 @@ class ZendeskTicketsConnector(BaseConnector):
         self._subdomain = subdomain or os.environ.get("ZENDESKTICKET_SUBDOMAIN", "")
         self._user = user or os.environ.get("ZENDESKTICKET_USER", "")
         self._token = token or os.environ.get("ZENDESKTICKET_TOKEN", "")
-        self._page_size = int(os.environ.get("ZENDESKTICKET_PAGE_SIZE", "10"))
+        self._page_size = _parse_page_size(os.environ.get("ZENDESKTICKET_PAGE_SIZE", "10"))
         self._download_attachments = _parse_bool(os.environ.get("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "false"))
         self._include_tags = _parse_tags(os.environ.get("ZENDESKTICKET_INCLUDETAGS", ""))
         self._exclude_tags = _parse_tags(os.environ.get("ZENDESKTICKET_EXCLUDETAGS", ""))
@@ -229,7 +230,12 @@ class ZendeskTicketsConnector(BaseConnector):
         return attachments
 
     def _download_attachment(self, url: str) -> bytes:
-        response = self._http.get(url)
+        hostname = (urlparse(url).hostname or "").lower()
+        zendesk_host = f"{self._subdomain}.zendesk.com".lower()
+        if hostname and hostname != zendesk_host:
+            response = httpx.get(url, timeout=30.0)
+        else:
+            response = self._http.get(url)
         response.raise_for_status()
         return response.content
 
@@ -315,3 +321,13 @@ def _parse_bool(value: str) -> bool:
 
 def _parse_tags(value: str) -> set[str]:
     return {part.strip().lower() for part in value.split(",") if part.strip()}
+
+
+def _parse_page_size(value: str) -> int:
+    try:
+        page_size = int(value)
+    except ValueError as exc:
+        raise ValueError("ZENDESKTICKET_PAGE_SIZE must be a positive integer.") from exc
+    if page_size <= 0:
+        raise ValueError("ZENDESKTICKET_PAGE_SIZE must be a positive integer.")
+    return page_size
