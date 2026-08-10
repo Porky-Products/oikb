@@ -155,15 +155,18 @@ def run_sync(
     result = SyncResult()
     result.errors = []
     result.warnings = []
+    completed = False
 
     try:
-        return _run_sync_inner(
+        sync_result = _run_sync_inner(
             client, connector, kb_id, dry_run, verbose, quiet,
             manifest_filter, concurrency, result, cancel_requested,
         )
+        completed = True
+        return sync_result
     finally:
         mark_sync_complete = getattr(connector, "mark_sync_complete", None)
-        if callable(mark_sync_complete) and not result.errors:
+        if completed and not dry_run and callable(mark_sync_complete) and not result.errors:
             mark_sync_complete()
         connector.close()
 

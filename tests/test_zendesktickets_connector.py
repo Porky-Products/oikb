@@ -42,7 +42,7 @@ class FakeHTTPClient:
 
     def get(self, path: str, params: dict | None = None) -> FakeResponse:
         self.calls.append({"path": path, "params": params})
-        if path == "/tickets.json":
+        if path == "/incremental/tickets.json" or "/incremental/tickets.json" in path:
             if not self._ticket_pages:
                 raise AssertionError("No more ticket pages configured")
             return FakeResponse(self._ticket_pages.pop(0))
@@ -264,6 +264,41 @@ def test_sync_run_advances_checkpoint_only_after_upload_success(monkeypatch: pyt
 
     assert result.added == 1
     assert (state_dir / "resume_checkpoint.txt").read_text().strip() == "2024-01-02T03:04:05Z"
+
+
+def test_sync_dry_run_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch):
+    state_dir = _make_state_dir("dry-run-no-checkpoint")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+    client = FakeClient()
+
+    result = run_sync(client=client, connector=connector, kb_id="kb-1", quiet=True, dry_run=True)
+
+    assert result.added == 1
+    assert not (state_dir / "resume_checkpoint.txt").exists()
+
+
+def test_sync_exception_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch):
+    state_dir = _make_state_dir("exception-no-checkpoint")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+
+    class FailingClient(FakeClient):
+        def sync_diff(self, kb_id: str, manifest: list[dict]) -> dict:
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_sync(client=FailingClient(), connector=connector, kb_id="kb-1", quiet=True)
+
+    assert not (state_dir / "resume_checkpoint.txt").exists()
 
 
 def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch: pytest.MonkeyPatch):

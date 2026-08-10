@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
@@ -43,9 +44,10 @@ class ZendeskTicketsConnector(BaseConnector):
             auth=(f"{self._user}/token", self._token),
             timeout=30.0,
         )
-        self._file_cache: dict[tuple[str, str], bytes] = {}
+        self._file_cache: dict[tuple[str, str], Path] = {}
         self._manifest_snapshot: dict[str, Any] = {}
         self._pending_checkpoint: datetime | None = None
+        self._run_cache_dir: Path | None = None
 
     def build_manifest(self) -> list[ManifestEntry]:
         state = self._load_state()
@@ -53,8 +55,9 @@ class ZendeskTicketsConnector(BaseConnector):
         prior_entries = self._state_entries_by_ticket(state)
         attachments_enabled_previously = bool(state.get("attachments_enabled", False))
 
-        self._file_cache.clear()
+        self._reset_run_cache()
         current_entries_by_ticket: dict[str, list[ManifestEntry]] = {}
+        current_updated_at_by_ticket: dict[str, str] = {}
         excluded_ticket_ids: set[str] = set()
         pending_checkpoint = checkpoint
         seen_ticket_ids: set[str] = set()
@@ -72,8 +75,9 @@ class ZendeskTicketsConnector(BaseConnector):
                     continue
 
                 comments = self._fetch_ticket_comments(ticket["id"])
-                entries = self._build_ticket_entries(ticket, comments)
+                entries, updated_at_value = self._build_ticket_entries(ticket, comments)
                 current_entries_by_ticket[ticket_id] = entries
+                current_updated_at_by_ticket[ticket_id] = updated_at_value
 
             if page_max_updated_at is not None:
                 pending_checkpoint = page_max_updated_at
@@ -97,7 +101,10 @@ class ZendeskTicketsConnector(BaseConnector):
             "ticket_files": {
                 ticket_id: {
                     "entries": [entry.to_dict() for entry in entries],
-                    "updated_at": self._ticket_updated_at(ticket_id, state, current_entries_by_ticket),
+                    "updated_at": current_updated_at_by_ticket.get(
+                        ticket_id,
+                        ((state.get("ticket_files") or {}).get(ticket_id, {})).get("updated_at", ""),
+                    ),
                 }
                 for ticket_id, entries in combined_entries_by_ticket.items()
             },
@@ -106,10 +113,10 @@ class ZendeskTicketsConnector(BaseConnector):
         return manifest
 
     def read_file(self, path: str, filename: str) -> bytes:
-        content = self._file_cache.get((path, filename))
-        if content is None:
+        content_path = self._file_cache.get((path, filename))
+        if content_path is None:
             raise FileNotFoundError(f"Ticket file not found: {path}/{filename}" if path else f"Ticket file not found: {filename}")
-        return content
+        return content_path.read_bytes()
 
     def mark_sync_complete(self) -> None:
         if self._pending_checkpoint is not None:
@@ -123,10 +130,15 @@ class ZendeskTicketsConnector(BaseConnector):
         return bool(self._manifest_snapshot) and not self.has_content()
 
     def close(self) -> None:
+        if self._run_cache_dir and self._run_cache_dir.exists():
+            shutil.rmtree(self._run_cache_dir, ignore_errors=True)
+        self._run_cache_dir = None
+        self._file_cache.clear()
         self._http.close()
 
-    def _build_ticket_entries(self, ticket: dict[str, Any], comments: list[dict[str, Any]]) -> list[ManifestEntry]:
+    def _build_ticket_entries(self, ticket: dict[str, Any], comments: list[dict[str, Any]]) -> tuple[list[ManifestEntry], str]:
         ticket_id = str(ticket["id"])
+        updated_at_value = str(ticket.get("updated_at") or "")
         markdown = self._render_ticket_markdown(ticket, comments).encode("utf-8")
         entries = [self._cache_entry(path="", filename=f"{ticket_id}.md", content=markdown)]
 
@@ -137,10 +149,15 @@ class ZendeskTicketsConnector(BaseConnector):
                 filename = f"{ticket_id}-{self._sanitize_filename(attachment['file_name'])}"
                 entries.append(self._cache_entry(path=ticket_id, filename=filename, content=content))
 
-        return entries
+        return entries, updated_at_value
 
     def _cache_entry(self, path: str, filename: str, content: bytes) -> ManifestEntry:
-        self._file_cache[(path, filename)] = content
+        if self._run_cache_dir is None:
+            raise RuntimeError("Run cache directory not initialized")
+        key = f"{path}/{filename}" if path else filename
+        cache_file = self._run_cache_dir / hashlib.sha256(key.encode("utf-8")).hexdigest()
+        cache_file.write_bytes(content)
+        self._file_cache[(path, filename)] = cache_file
         return ManifestEntry(
             filename=filename,
             path=path,
@@ -149,25 +166,25 @@ class ZendeskTicketsConnector(BaseConnector):
         )
 
     def _iter_ticket_pages(self, checkpoint: datetime) -> Iterator[list[dict[str, Any]]]:
-        page = 1
+        next_page: str | None = None
         while True:
-            response = self._http.get(
-                "/tickets.json",
-                params={
-                    "page": page,
-                    "per_page": self._page_size,
-                    "sort_by": "updated_at",
-                    "sort_order": "asc",
-                    "start_time": self._format_start_time(checkpoint),
-                },
-            )
+            if next_page:
+                response = self._http.get(next_page)
+            else:
+                response = self._http.get(
+                    "/incremental/tickets.json",
+                    params={
+                        "per_page": self._page_size,
+                        "start_time": self._format_start_time(checkpoint),
+                    },
+                )
             response.raise_for_status()
             payload = response.json()
             tickets = payload.get("tickets", [])
             yield tickets
-            if not payload.get("next_page"):
+            next_page = payload.get("next_page")
+            if not next_page:
                 break
-            page += 1
 
     def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]]:
         response = self._http.get(f"/tickets/{ticket_id}/comments.json")
@@ -263,15 +280,13 @@ class ZendeskTicketsConnector(BaseConnector):
             result[ticket_id] = [ManifestEntry(**entry) for entry in ticket_state.get("entries", [])]
         return result
 
-    def _ticket_updated_at(self, ticket_id: str, state: dict[str, Any], current_entries_by_ticket: dict[str, list[ManifestEntry]]) -> str:
-        if ticket_id in current_entries_by_ticket:
-            for path, filename in self._file_cache:
-                if filename == f"{ticket_id}.md" and path == "":
-                    content = self._file_cache[(path, filename)].decode("utf-8")
-                    for line in content.splitlines():
-                        if line.startswith("Updated at: "):
-                            return line.removeprefix("Updated at: ").strip()
-        return ((state.get("ticket_files") or {}).get(ticket_id, {})).get("updated_at", "")
+    def _reset_run_cache(self) -> None:
+        cache_dir = self._state_dir / ".run-cache"
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        self._run_cache_dir = cache_dir
+        self._file_cache.clear()
 
     def _parse_dt(self, value: str) -> datetime:
         return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).astimezone(UTC)
