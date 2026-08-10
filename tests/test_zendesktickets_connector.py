@@ -429,10 +429,10 @@ def test_attachments_are_added_when_enabled(monkeypatch: pytest.MonkeyPatch, tmp
 
     assert sorted(entry.display_path for entry in manifest) == [
         "1001.md",
-        "1001/1001-error-log.txt",
-        "1001/1001-screenshot.png",
+        "1001/1001-91561f-error-log.txt",
+        "1001/1001-e39f8d-screenshot.png",
     ]
-    assert connector.read_file("1001", "1001-screenshot.png") == b"image-bytes"
+    assert connector.read_file("1001", "1001-e39f8d-screenshot.png") == b"image-bytes"
     connector.close()
 
 
@@ -473,6 +473,41 @@ def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytes
     assert result.deleted == 1
     assert [upload["filename"] for upload in client.upload_calls] == ["1001.md"]
     assert client.cleanup_calls == [{"kb_id": "kb-1", "file_ids": ["file-img", "file-md"], "dir_ids": None}]
+
+
+def test_attachments_with_same_name_use_content_hashes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "attachments-same-name")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[
+                            _attachment("screenshot.png", url="https://acme.zendesk.com/attachments/screenshot-1.png"),
+                            _attachment("screenshot.png", url="https://acme.zendesk.com/attachments/screenshot-2.png"),
+                        ],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+        attachments={"screenshot-1.png": b"one-bytes", "screenshot-2.png": b"two-bytes"},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert sorted(entry.display_path for entry in manifest) == [
+        "1001.md",
+        "1001/1001-1fa9b9-screenshot.png",
+        "1001/1001-4311eb-screenshot.png",
+    ]
+    connector.close()
 
 
 def test_page_size_defaults_to_ten_and_is_overrideable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -534,7 +569,7 @@ def test_external_attachment_downloads_without_authenticated_client(monkeypatch:
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md", "1001/1001-external.png"]
+    assert [entry.display_path for entry in manifest] == ["1001.md", "1001/1001-b5eb7d-external.png"]
     assert external_calls == [{"url": "https://attachments.example/external.png", "timeout": 30.0}]
     assert all(call["path"] != "https://attachments.example/external.png" for call in connector._http.calls)
     connector.close()

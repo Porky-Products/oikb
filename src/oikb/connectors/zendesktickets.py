@@ -147,7 +147,8 @@ class ZendeskTicketsConnector(BaseConnector):
             attachments = self._collect_attachments(ticket, comments)
             for attachment in attachments:
                 content = self._download_attachment(attachment["content_url"])
-                filename = f"{ticket_id}-{self._sanitize_filename(attachment['file_name'])}"
+                short_hash = hashlib.sha1(content).hexdigest()[:6]  # noqa: S324
+                filename = f"{ticket_id}-{short_hash}-{self._sanitize_filename(attachment['file_name'])}"
                 entries.append(self._cache_entry(path=ticket_id, filename=filename, content=content))
 
         return entries, updated_at_value
