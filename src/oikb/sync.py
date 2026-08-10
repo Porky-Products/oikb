@@ -162,6 +162,9 @@ def run_sync(
             manifest_filter, concurrency, result, cancel_requested,
         )
     finally:
+        mark_sync_complete = getattr(connector, "mark_sync_complete", None)
+        if callable(mark_sync_complete) and not result.errors:
+            mark_sync_complete()
         connector.close()
 
 
@@ -207,9 +210,13 @@ def _run_sync_inner(
             click.echo(f"  {len(manifest)} files after filtering", err=True)
 
     if not manifest:
-        if not quiet:
-            click.echo("Source is empty — nothing to sync.", err=True)
-        return result
+        requires_empty_sync = getattr(connector, "requires_empty_sync", None)
+        if callable(requires_empty_sync) and requires_empty_sync():
+            manifest = []
+        else:
+            if not quiet:
+                click.echo("Source is empty — nothing to sync.", err=True)
+            return result
 
     # ── 3. Compute diff ────────────────────────────────────────
     check_stop()
