@@ -407,6 +407,34 @@ Optional settings:
 | `ZOTERO_WEBDAV_URL` | WebDAV Zotero storage base; fetches `<attachment-key>.zip` on Zotero file 404 |
 | `ZOTERO_WEBDAV_USER` / `ZOTERO_WEBDAV_PASSWORD` | WebDAV credentials |
 
+### Zendesk Tickets
+
+Sync Zendesk support tickets from the tickets API as Markdown, with optional attachment ingestion.
+
+```bash
+export ZENDESKTICKET_SUBDOMAIN=acme
+export ZENDESKTICKET_USER=agent@example.com
+export ZENDESKTICKET_TOKEN=...
+
+oikb sync zendesktickets:acme --kb-id your-kb-id
+```
+
+Optional settings:
+
+| Variable | Description |
+|---|---|
+| `ZENDESKTICKET_PAGE_SIZE` | Tickets per page, defaults to `10` |
+| `ZENDESKTICKET_DOWNLOAD_ATTACHMENTS` | Download ticket and comment attachments when true |
+| `ZENDESKTICKET_INCLUDETAGS` | Comma-separated tags; include tickets matching any listed tag |
+| `ZENDESKTICKET_EXCLUDETAGS` | Comma-separated tags to skip |
+
+Behavior notes:
+
+- If no checkpoint exists on disk, sync starts from the minimum datetime.
+- Checkpoints advance only after a successful sync run.
+- Tickets filtered out by tags or removed from Zendesk are removed from the KB on later syncs.
+- Turning `ZENDESKTICKET_DOWNLOAD_ATTACHMENTS` off removes previously synced attachment files on the next run.
+
 ### All Connectors
 
 46 connectors available. See the full list:
@@ -416,7 +444,7 @@ Optional settings:
 | **Git** | GitHub, GitLab, Bitbucket |
 | **Cloud Storage** | S3, GCS, Azure Blob, Dropbox, R2, Google Drive, SharePoint, Nextcloud, Egnyte, Oracle Cloud |
 | **Wikis & KBs** | Confluence, Notion, BookStack, Discourse, GitBook, Guru, Outline, Slab, Document360, DokuWiki, Google Sites |
-| **Ticketing** | Jira, Linear, Zendesk, Freshdesk, Asana, ClickUp, Airtable, ServiceNow, ProductBoard |
+| **Ticketing** | Jira, Linear, Zendesk, Zendesk Tickets, Freshdesk, Asana, ClickUp, Airtable, ServiceNow, ProductBoard |
 | **Messaging** | Slack, Discord, Microsoft Teams, Gmail, Zulip |
 | **Meetings** | Gong, Fireflies |
 | **Forums** | XenForo |
