@@ -19,7 +19,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 
@@ -29,6 +29,30 @@ from oikb.connectors import BaseConnector, ManifestEntry
 def _encode_drive_path(path: str) -> str:
     """Encode a SharePoint path for Microsoft Graph's colon-path syntax."""
     return quote(path, safe="/")
+
+
+_ALLOWED_SHAREPOINT_DOWNLOAD_HOSTS = (
+    "graph.microsoft.com",
+    "sharepoint.com",
+    "sharepoint-df.com",
+    "sharepointonline.com",
+)
+_SHAREPOINT_DOWNLOAD_REDIRECT_CODES = {301, 302, 303, 307, 308}
+_SHAREPOINT_DOWNLOAD_MAX_REDIRECTS = 5
+
+
+def _validate_sharepoint_download_url(url: str) -> None:
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if parsed.scheme != "https" or not host:
+        raise ValueError(f"Refusing unexpected SharePoint download URL: {url}")
+    normalized_host = host.lower()
+    if not any(
+        normalized_host == allowed
+        or normalized_host.endswith(f".{allowed}")
+        for allowed in _ALLOWED_SHAREPOINT_DOWNLOAD_HOSTS
+    ):
+        raise ValueError(f"Refusing unexpected SharePoint download URL: {url}")
 
 
 class SharePointConnector(BaseConnector):
@@ -93,7 +117,6 @@ class SharePointConnector(BaseConnector):
             base_url="https://graph.microsoft.com/v1.0",
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=60.0,
-            follow_redirects=True,
         )
 
         # Resolve site ID.
@@ -109,7 +132,13 @@ class SharePointConnector(BaseConnector):
             if isinstance(name, str):
                 available_drives.append(name)
             if drive.get("name") == self.library:
-                self._drive_id = drive["id"]
+                drive_id = drive.get("id")
+                if not isinstance(drive_id, str) or not drive_id:
+                    raise ValueError(
+                        "Microsoft Graph drive item contained an invalid id for "
+                        f"library '{self.library}'"
+                    )
+                self._drive_id = drive_id
                 break
         if not self._drive_id:
             raise ValueError(
@@ -124,7 +153,8 @@ class SharePointConnector(BaseConnector):
         while next_url:
             if next_url in requested_urls:
                 raise ValueError(
-                    "Microsoft Graph pagination repeated @odata.nextLink"
+                    "Microsoft Graph pagination repeated @odata.nextLink for "
+                    f"{next_url}"
                 )
             requested_urls.add(next_url)
 
@@ -134,19 +164,22 @@ class SharePointConnector(BaseConnector):
 
             if not isinstance(payload, dict):
                 raise ValueError(
-                    "Microsoft Graph collection response was not an object"
+                    "Microsoft Graph collection response was not an object for "
+                    f"{next_url}"
                 )
 
             values = payload.get("value")
             if not isinstance(values, list):
                 raise ValueError(
-                    "Microsoft Graph collection response contained a non-list value"
+                    "Microsoft Graph collection response contained a non-list "
+                    f"value for {next_url}"
                 )
 
             for item in values:
                 if not isinstance(item, dict):
                     raise ValueError(
-                        "Microsoft Graph collection response contained a non-object item"
+                        "Microsoft Graph collection response contained a "
+                        f"non-object item for {next_url}"
                     )
                 yield item
 
@@ -158,7 +191,7 @@ class SharePointConnector(BaseConnector):
             else:
                 raise ValueError(
                     "Microsoft Graph collection response contained an invalid "
-                    "@odata.nextLink"
+                    f"@odata.nextLink for {next_url}"
                 )
 
     def build_manifest(self) -> list[ManifestEntry]:
@@ -175,70 +208,108 @@ class SharePointConnector(BaseConnector):
         seen_folder_ids: set[str],
         seen_file_paths: set[str],
     ) -> None:
-        url = (
-            f"/drives/{self._drive_id}/root/children"
-            if folder_path == "/"
-            else (
-                f"/drives/{self._drive_id}/root:/"
-                f"{_encode_drive_path(folder_path)}:/children"
+        stack: list[tuple[str, str]] = [(folder_path, prefix)]
+        while stack:
+            current_folder_path, current_prefix = stack.pop()
+            url = (
+                f"/drives/{self._drive_id}/root/children"
+                if current_folder_path == "/"
+                else (
+                    f"/drives/{self._drive_id}/root:/"
+                    f"{_encode_drive_path(current_folder_path)}:/children"
+                )
             )
-        )
-        for item in self._iter_collection(url):
-            if "folder" in item:
-                name = item.get("name")
-                item_id = item.get("id")
-                if not isinstance(name, str) or not name:
-                    raise ValueError(
-                        "Microsoft Graph folder item contained an invalid name"
-                    )
-                if not isinstance(item_id, str) or not item_id:
-                    raise ValueError(
-                        "Microsoft Graph folder item contained an invalid id"
-                    )
-                if item_id in seen_folder_ids:
-                    raise ValueError(f"SharePoint repeated folder item id: {item_id}")
-                seen_folder_ids.add(item_id)
+            for item in self._iter_collection(url):
+                if "folder" in item:
+                    name = item.get("name")
+                    item_id = item.get("id")
+                    if not isinstance(name, str) or not name:
+                        raise ValueError(
+                            "Microsoft Graph folder item contained an invalid name"
+                        )
+                    if not isinstance(item_id, str) or not item_id:
+                        raise ValueError(
+                            "Microsoft Graph folder item contained an invalid id"
+                        )
+                    if item_id in seen_folder_ids:
+                        raise ValueError(
+                            f"SharePoint repeated folder item id: {item_id}"
+                        )
+                    seen_folder_ids.add(item_id)
 
-                sub = f"{prefix}/{name}" if prefix else name
-                child_path = (
-                    f"{folder_path}/{name}" if folder_path != "/" else name
-                )
-                self._walk_folder(
-                    child_path,
-                    sub,
-                    entries,
-                    seen_folder_ids,
-                    seen_file_paths,
-                )
-            elif "file" in item:
-                name = item.get("name")
-                if not isinstance(name, str) or not name:
-                    raise ValueError(
-                        "Microsoft Graph file item contained an invalid name"
+                    sub = f"{current_prefix}/{name}" if current_prefix else name
+                    child_path = (
+                        f"{current_folder_path}/{name}"
+                        if current_folder_path != "/"
+                        else name
                     )
-                display_path = f"{prefix}/{name}" if prefix else name
-                if display_path in seen_file_paths:
-                    raise ValueError(
-                        f"SharePoint duplicate file path: {display_path}"
+                    stack.append((child_path, sub))
+                elif "file" in item:
+                    name = item.get("name")
+                    if not isinstance(name, str) or not name:
+                        raise ValueError(
+                            "Microsoft Graph file item contained an invalid name"
+                        )
+                    display_path = (
+                        f"{current_prefix}/{name}" if current_prefix else name
                     )
-                seen_file_paths.add(display_path)
+                    if display_path in seen_file_paths:
+                        raise ValueError(
+                            f"SharePoint duplicate file path: {display_path}"
+                        )
+                    seen_file_paths.add(display_path)
 
-                etag = (item.get("eTag") or item.get("cTag", "")).strip('"')
-                entries.append(ManifestEntry(
-                    filename=name,
-                    path=prefix,
-                    checksum=etag[:16] if etag else "",
-                    size=item.get("size", 0),
-                ))
+                    etag = (item.get("eTag") or item.get("cTag", "")).strip('"')
+                    entries.append(
+                        ManifestEntry(
+                            filename=name,
+                            path=current_prefix,
+                            checksum=etag[:16] if etag else "",
+                            size=item.get("size", 0),
+                        )
+                    )
 
     def read_file(self, path: str, filename: str) -> bytes:
         file_path = f"{path}/{filename}" if path else filename
         resp = self._http.get(
             f"/drives/{self._drive_id}/root:/{_encode_drive_path(file_path)}:/content",
-            follow_redirects=True,
+            follow_redirects=False,
         )
+        if resp.status_code in _SHAREPOINT_DOWNLOAD_REDIRECT_CODES:
+            location = resp.headers.get("location")
+            if not location:
+                raise ValueError(
+                    "SharePoint download redirect response did not include a location"
+                )
+            return self._read_sharepoint_download_redirect(
+                urljoin(str(resp.request.url), location)
+            )
         resp.raise_for_status()
         return resp.content
+
+    def _read_sharepoint_download_redirect(self, url: str) -> bytes:
+        _validate_sharepoint_download_url(url)
+        with httpx.Client(
+            timeout=self._http.timeout,
+            follow_redirects=False,
+        ) as client:
+            next_url = url
+            for _ in range(_SHAREPOINT_DOWNLOAD_MAX_REDIRECTS + 1):
+                resp = client.get(next_url)
+                if resp.status_code not in _SHAREPOINT_DOWNLOAD_REDIRECT_CODES:
+                    resp.raise_for_status()
+                    return resp.content
+
+                location = resp.headers.get("location")
+                if not location:
+                    raise ValueError(
+                        "SharePoint download redirect response did not include a "
+                        "location"
+                    )
+                next_url = urljoin(str(resp.request.url), location)
+                _validate_sharepoint_download_url(next_url)
+
+        raise ValueError("SharePoint download exceeded redirect limit")
 
     def close(self) -> None:
         self._http.close()
