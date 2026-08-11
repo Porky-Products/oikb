@@ -153,6 +153,12 @@ def _resolve_connector(source: str, branch: str | None = None, path: str | None 
         parsed = parse_linear_source(source)
         return LinearConnector(team_key=parsed["team_key"])
 
+    if source.startswith("zendesktickets:"):
+        from oikb.connectors.zendesktickets import ZendeskTicketsConnector, parse_zendesktickets_source
+
+        parsed = parse_zendesktickets_source(source)
+        return ZendeskTicketsConnector(subdomain=parsed["subdomain"])
+
     if source.startswith("zendesk:"):
         from oikb.connectors.zendesk import ZendeskConnector, parse_zendesk_source
         parsed = parse_zendesk_source(source)

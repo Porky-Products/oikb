@@ -11,3 +11,6 @@ build/
 .DS_Store
 Thumbs.db
 uv.lock
+.superpowers/
+.oikb.yaml
+.oikb_state/

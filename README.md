@@ -159,7 +159,7 @@ This workflow is configured to use the **`localdocker`** environment. Store the 
 | **Code Repos** | GitHub, GitLab, Bitbucket |
 | **Cloud Storage** | S3, GCS, Azure Blob, Dropbox, R2, Google Drive, SharePoint, Nextcloud, Egnyte, Oracle Cloud |
 | **Wikis & KBs** | Confluence, Notion, BookStack, Discourse, GitBook, Guru, Outline, Slab, Document360, DokuWiki, Google Sites |
-| **Ticketing** | Jira, Linear, Zendesk, Freshdesk, Asana, ClickUp, Airtable, ServiceNow, ProductBoard |
+| **Ticketing** | Jira, Linear, Zendesk, Zendesk Tickets, Freshdesk, Asana, ClickUp, Airtable, ServiceNow, ProductBoard |
 | **Messaging** | Slack, Discord, Microsoft Teams, Gmail, Zulip |
 | **Meetings** | Gong, Fireflies |
 | **Forums** | XenForo |
@@ -177,6 +177,30 @@ oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id
 ```
 
 Some connectors need an optional extra: `pip install oikb[gdrive]`, `pip install oikb[s3]`, `pip install oikb[zotero]`, or `pip install oikb[all]` for everything.
+
+### Zendesk Tickets
+
+```bash
+export ZENDESKTICKET_SUBDOMAIN=acme
+export ZENDESKTICKET_USER=agent@example.com
+export ZENDESKTICKET_TOKEN=...
+
+oikb sync zendesktickets:acme --kb-id your-kb-id
+```
+
+Options:
+
+| Variable | Description |
+|---|---|
+| `ZENDESKTICKET_PAGE_SIZE` | Tickets per page, defaults to `10` |
+| `ZENDESKTICKET_DOWNLOAD_ATTACHMENTS` | Download ticket and comment attachments when true |
+| `ZENDESKTICKET_INCLUDETAGS` | Comma-separated tags; include tickets matching any listed tag |
+| `ZENDESKTICKET_EXCLUDETAGS` | Comma-separated tags to skip |
+| `ZENDESKTICKET_VERBOSE_HTTP` | Print Zendesk request URLs/params for debugging when true |
+| `ZENDESKTICKET_MAX_RETRIES` | Max retries for `429 Too Many Requests`, defaults to `5` |
+| `ZENDESKTICKET_BACKOFF_BASE_SECONDS` | Base exponential backoff delay in seconds, defaults to `1.0` |
+| `ZENDESKTICKET_BACKOFF_MAX_SECONDS` | Maximum backoff delay in seconds, defaults to `90.0` |
+| `ZENDESKTICKET_AGGRESSIVE_CHECKPOINT` | Persist checkpoint after each page when true; defaults to `false` |
 
 ### Zotero
 
