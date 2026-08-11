@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
@@ -15,6 +16,9 @@ from urllib.parse import urlparse
 import httpx
 
 from oikb.connectors import BaseConnector, ManifestEntry
+
+_ZENDESK_ATTACHMENT_REDIRECT_CODES = {301, 302, 303, 307, 308}
+_ZENDESK_RATE_LIMIT_STATUS = 429
 
 
 class ZendeskTicketsConnector(BaseConnector):
@@ -30,8 +34,24 @@ class ZendeskTicketsConnector(BaseConnector):
         self._token = token or os.environ.get("ZENDESKTICKET_TOKEN", "")
         self._page_size = _parse_page_size(os.environ.get("ZENDESKTICKET_PAGE_SIZE", "10"))
         self._download_attachments = _parse_bool(os.environ.get("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "false"))
-        self._include_tags = _parse_tags(os.environ.get("ZENDESKTICKET_INCLUDETAGS", ""))
-        self._exclude_tags = _parse_tags(os.environ.get("ZENDESKTICKET_EXCLUDETAGS", ""))
+        self._verbose_http = _parse_bool(os.environ.get("ZENDESKTICKET_VERBOSE_HTTP", "false"))
+        self._max_retries = _parse_non_negative_int(os.environ.get("ZENDESKTICKET_MAX_RETRIES", "5"), "ZENDESKTICKET_MAX_RETRIES")
+        self._backoff_base_seconds = _parse_positive_float(
+            os.environ.get("ZENDESKTICKET_BACKOFF_BASE_SECONDS", "1.0"),
+            "ZENDESKTICKET_BACKOFF_BASE_SECONDS",
+        )
+        self._backoff_max_seconds = _parse_positive_float(
+            os.environ.get("ZENDESKTICKET_BACKOFF_MAX_SECONDS", "90.0"),
+            "ZENDESKTICKET_BACKOFF_MAX_SECONDS",
+        )
+        include_tags_value = os.environ.get("ZENDESKTICKET_INCLUDETAGS")
+        if include_tags_value is None:
+            include_tags_value = os.environ.get("ZENDESKTICKET_INCLUDETAG", "")
+        exclude_tags_value = os.environ.get("ZENDESKTICKET_EXCLUDETAGS")
+        if exclude_tags_value is None:
+            exclude_tags_value = os.environ.get("ZENDESKTICKET_EXCLUDETAG", "")
+        self._include_tags = _parse_tags(include_tags_value)
+        self._exclude_tags = _parse_tags(exclude_tags_value)
         if not self._subdomain or not self._user or not self._token:
             raise ValueError(
                 "Zendesk tickets credentials required. Set ZENDESKTICKET_SUBDOMAIN, "
@@ -49,6 +69,7 @@ class ZendeskTicketsConnector(BaseConnector):
         self._manifest_snapshot: dict[str, Any] = {}
         self._pending_checkpoint: datetime | None = None
         self._run_cache_dir: Path | None = None
+        self._aggressive_checkpoint = _parse_bool(os.environ.get("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "false"))
 
     def build_manifest(self) -> list[ManifestEntry]:
         state = self._load_state()
@@ -82,6 +103,8 @@ class ZendeskTicketsConnector(BaseConnector):
 
             if page_max_updated_at is not None:
                 pending_checkpoint = page_max_updated_at
+                if self._aggressive_checkpoint:
+                    self._save_checkpoint(pending_checkpoint)
 
         carried_forward = {
             ticket_id: entries
@@ -171,9 +194,9 @@ class ZendeskTicketsConnector(BaseConnector):
         next_page: str | None = None
         while True:
             if next_page:
-                response = self._http.get(next_page)
+                response = self._zendesk_get(next_page)
             else:
-                response = self._http.get(
+                response = self._zendesk_get(
                     "/incremental/tickets.json",
                     params={
                         "per_page": self._page_size,
@@ -189,7 +212,7 @@ class ZendeskTicketsConnector(BaseConnector):
                 break
 
     def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]]:
-        response = self._http.get(f"/tickets/{ticket_id}/comments.json")
+        response = self._zendesk_get(f"/tickets/{ticket_id}/comments.json")
         response.raise_for_status()
         return response.json().get("comments", [])
 
@@ -234,11 +257,55 @@ class ZendeskTicketsConnector(BaseConnector):
         hostname = (urlparse(url).hostname or "").lower()
         zendesk_host = f"{self._subdomain}.zendesk.com".lower()
         if hostname and hostname != zendesk_host:
-            response = httpx.get(url, timeout=30.0)
+            return self._download_with_redirects(url)
         else:
-            response = self._http.get(url)
+            return self._download_with_redirects(url, client=self._http)
+
+    def _download_with_redirects(self, url: str, client: httpx.Client | None = None) -> bytes:
+        if client is not None:
+            response = client.get(url)
+            status_code = getattr(response, "status_code", None)
+            if status_code in _ZENDESK_ATTACHMENT_REDIRECT_CODES:
+                location = getattr(response, "headers", {}).get("location")
+                if not location:
+                    raise ValueError("Zendesk attachment redirect response did not include a location")
+                response = client.get(location)
+            response.raise_for_status()
+            return response.content
+
+        response = httpx.get(url, timeout=30.0)
         response.raise_for_status()
         return response.content
+
+    def _zendesk_get(self, path: str, params: dict[str, Any] | None = None):
+        if self._verbose_http:
+            print(f"[zendesktickets] GET {path} params={params}")
+        last_response = None
+        for attempt in range(self._max_retries + 1):
+            response = self._http.get(path, params=params)
+            last_response = response
+            status_code = getattr(response, "status_code", None)
+            if status_code != _ZENDESK_RATE_LIMIT_STATUS:
+                return response
+            if attempt == self._max_retries:
+                return response
+            delay = self._retry_delay_seconds(response, attempt)
+            if self._verbose_http:
+                print(f"[zendesktickets] 429 retry in {delay:.2f}s (attempt {attempt + 1}/{self._max_retries})")
+            time.sleep(delay)
+        return last_response
+
+    def _retry_delay_seconds(self, response: Any, attempt: int) -> float:
+        retry_after = getattr(response, "headers", {}).get("retry-after")
+        if retry_after:
+            try:
+                parsed = float(retry_after)
+            except ValueError:
+                parsed = 0.0
+            if parsed > 0:
+                return min(parsed, self._backoff_max_seconds)
+        exponential_delay = self._backoff_base_seconds * (2**attempt)
+        return min(exponential_delay, self._backoff_max_seconds)
 
     def _should_include_ticket(self, ticket: dict[str, Any]) -> bool:
         tags = {str(tag).strip().lower() for tag in ticket.get("tags") or [] if str(tag).strip()}
@@ -332,3 +399,23 @@ def _parse_page_size(value: str) -> int:
     if page_size <= 0:
         raise ValueError("ZENDESKTICKET_PAGE_SIZE must be a positive integer.")
     return page_size
+
+
+def _parse_non_negative_int(value: str, var_name: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{var_name} must be a non-negative integer.") from exc
+    if parsed < 0:
+        raise ValueError(f"{var_name} must be a non-negative integer.")
+    return parsed
+
+
+def _parse_positive_float(value: str, var_name: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{var_name} must be a positive number.") from exc
+    if parsed <= 0:
+        raise ValueError(f"{var_name} must be a positive number.")
+    return parsed
