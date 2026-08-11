@@ -1,0 +1,206 @@
+name: Docker (On-Prem Registry)
+
+on:
+  push:
+    branches: [porky]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-onprem-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ${{ vars.ONPREM_DOCKER_REGISTRY }}
+  IMAGE_REPOSITORY: ${{ vars.ONPREM_DOCKER_IMAGE_REPOSITORY }}
+  IMAGE: ${{ vars.ONPREM_DOCKER_REGISTRY }}/${{ vars.ONPREM_DOCKER_IMAGE_REPOSITORY }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate-config:
+    environment: localdocker
+    runs-on:
+      group: onprem
+      labels: [self-hosted, Linux, X64]
+    steps:
+      - name: Validate registry configuration
+        env:
+          REGISTRY_USERNAME: ${{ secrets.ONPREM_DOCKER_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.ONPREM_DOCKER_PASSWORD }}
+          UPDATE_WEBHOOK: ${{ secrets.UPDATE_WEBHOOK }}
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for var in REGISTRY IMAGE_REPOSITORY REGISTRY_USERNAME REGISTRY_PASSWORD UPDATE_WEBHOOK; do
+            if [ -z "${!var:-}" ]; then
+              echo "Missing required workflow configuration: $var" >&2
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+  read-version:
+    needs: validate-config
+    environment: localdocker
+    runs-on:
+      group: onprem
+      labels: [self-hosted, Linux, X64]
+    outputs:
+      version: ${{ steps.pkg.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: pkg
+        run: |
+          VERSION=$(python3 -c "
+          import re, pathlib
+          text = pathlib.Path('pyproject.toml').read_text()
+          m = re.search(r'^version\s*=\s*\"([^\"]+)\"', text, re.M)
+          print(m.group(1))
+          ")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  build-release:
+    needs: read-version
+    environment: localdocker
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner_labels: [self-hosted, Linux, X64]
+            arch: amd64
+            flavor: default
+            dockerfile: Dockerfile
+          - platform: linux/amd64
+            runner_labels: [self-hosted, Linux, X64]
+            arch: amd64
+            flavor: alpine
+            dockerfile: Dockerfile.alpine
+    runs-on:
+      group: onprem
+      labels: ${{ matrix.runner_labels }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to on-prem registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ONPREM_DOCKER_USERNAME }}
+          password: ${{ secrets.ONPREM_DOCKER_PASSWORD }}
+
+      - name: Build and push ${{ matrix.platform }} release image by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=onprem-release-${{ matrix.flavor }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=onprem-release-${{ matrix.flavor }}-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-release-${{ matrix.flavor }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-release:
+    needs: [read-version, build-release]
+    environment: localdocker
+    runs-on:
+      group: onprem
+      labels: [self-hosted, Linux, X64]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-release-default-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to on-prem registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ONPREM_DOCKER_USERNAME }}
+          password: ${{ secrets.ONPREM_DOCKER_PASSWORD }}
+
+      - name: Create release multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          VERSION="${{ needs.read-version.outputs.version }}"
+          MAJOR_MINOR="${VERSION%.*}"
+          tags=("${{ env.IMAGE }}:latest" "${{ env.IMAGE }}:${VERSION}" "${{ env.IMAGE }}:${MAJOR_MINOR}")
+          docker buildx imagetools create $(printf -- '-t %s ' "${tags[@]}") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+  merge-release-alpine:
+    needs: [read-version, build-release]
+    environment: localdocker
+    runs-on:
+      group: onprem
+      labels: [self-hosted, Linux, X64]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-release-alpine-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to on-prem registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ONPREM_DOCKER_USERNAME }}
+          password: ${{ secrets.ONPREM_DOCKER_PASSWORD }}
+
+      - name: Create release Alpine multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          VERSION="${{ needs.read-version.outputs.version }}"
+          MAJOR_MINOR="${VERSION%.*}"
+          tags=("${{ env.IMAGE }}:alpine" "${{ env.IMAGE }}:latest-alpine" "${{ env.IMAGE }}:${VERSION}-alpine" "${{ env.IMAGE }}:${MAJOR_MINOR}-alpine")
+          docker buildx imagetools create $(printf -- '-t %s ' "${tags[@]}") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+  update-stack:
+    needs: [merge-release, merge-release-alpine]
+    environment: localdocker
+    runs-on:
+      group: onprem
+      labels: [self-hosted, Linux, X64]
+    steps:
+      - name: Trigger stack update webhook
+        env:
+          UPDATE_WEBHOOK: ${{ secrets.UPDATE_WEBHOOK }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error -X POST "$UPDATE_WEBHOOK" -k >/dev/null
