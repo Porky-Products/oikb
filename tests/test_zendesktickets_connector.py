@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import httpx
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,10 +19,16 @@ from oikb.sync import run_sync
 
 
 class FakeResponse:
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, status_code: int = 200, headers: dict[str, str] | None = None):
         self._payload = payload
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            request = httpx.Request("GET", "https://acme.zendesk.com/api/v2/mock")
+            response = httpx.Response(self.status_code, request=request)
+            raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=request, response=response)
         return None
 
     def json(self) -> dict:
@@ -55,8 +62,10 @@ class FakeHTTPClient:
 
 
 class FakeBinaryResponse:
-    def __init__(self, content: bytes):
+    def __init__(self, content: bytes, status_code: int = 200, headers: dict[str, str] | None = None):
         self.content = content
+        self.status_code = status_code
+        self.headers = headers or {}
 
     def raise_for_status(self) -> None:
         return None
@@ -262,6 +271,7 @@ def test_sync_run_advances_checkpoint_only_after_upload_success(monkeypatch: pyt
 
 def test_sync_dry_run_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "dry-run-no-checkpoint")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "false")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -278,6 +288,7 @@ def test_sync_dry_run_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatc
 
 def test_sync_exception_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "exception-no-checkpoint")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "false")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -335,6 +346,34 @@ def test_include_and_exclude_tags_filter_ticket_set(monkeypatch: pytest.MonkeyPa
     state_dir = _make_state_dir(tmp_path, "tag-filter")
     monkeypatch.setenv("ZENDESKTICKET_INCLUDETAGS", "ops,urgent")
     monkeypatch.setenv("ZENDESKTICKET_EXCLUDETAGS", "ignore-me")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:04:05Z", tags=["ops"]),
+                    _ticket(1002, "2024-01-02T03:05:05Z", tags=["facilities"]),
+                    _ticket(1003, "2024-01-02T03:06:05Z", tags=["urgent", "ignore-me"]),
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    connector.close()
+
+
+def test_singular_tag_env_vars_are_supported_for_compatibility(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "singular-tag-filter")
+    monkeypatch.delenv("ZENDESKTICKET_INCLUDETAGS", raising=False)
+    monkeypatch.delenv("ZENDESKTICKET_EXCLUDETAGS", raising=False)
+    monkeypatch.setenv("ZENDESKTICKET_INCLUDETAG", "ops,urgent")
+    monkeypatch.setenv("ZENDESKTICKET_EXCLUDETAG", "ignore-me")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -572,4 +611,90 @@ def test_external_attachment_downloads_without_authenticated_client(monkeypatch:
     assert [entry.display_path for entry in manifest] == ["1001.md", "1001/1001-b5eb7d-external.png"]
     assert external_calls == [{"url": "https://attachments.example/external.png", "timeout": 30.0}]
     assert all(call["path"] != "https://attachments.example/external.png" for call in connector._http.calls)
+    connector.close()
+
+
+def test_zendesk_attachment_redirect_is_followed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "zendesk-attachment-redirect")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[
+                            _attachment(
+                                "processing.pdf",
+                                url="https://acme.zendesk.com/attachments/token/qb562ozvi78zu8u/?name=4510018376_processing.pdf",
+                            )
+                        ],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    original_get = connector._http.get
+
+    def fake_get(path: str, params: dict[str, object] | None = None):
+        if path.startswith("https://acme.zendesk.com/attachments/token/"):
+            return FakeBinaryResponse(
+                b"",
+                status_code=302,
+                headers={"location": "https://p27.zdusercontent.com/attachment/11400/qb562ozvi78zu8u?token=abc"},
+            )
+        if path.startswith("https://p27.zdusercontent.com/attachment/11400/qb562ozvi78zu8u"):
+            return FakeBinaryResponse(b"redirected-bytes")
+        return original_get(path, params)
+
+    monkeypatch.setattr(connector._http, "get", fake_get)
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md", "1001/1001-6bd1d2-processing.pdf"]
+    connector.close()
+
+
+def test_rate_limited_ticket_fetch_retries_with_retry_after(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "rate-limit-retry")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+    monkeypatch.setenv("ZENDESKTICKET_MAX_RETRIES", "2")
+    monkeypatch.setenv("ZENDESKTICKET_BACKOFF_BASE_SECONDS", "0.1")
+    monkeypatch.setenv("ZENDESKTICKET_BACKOFF_MAX_SECONDS", "1")
+    connector._max_retries = 2
+    connector._backoff_base_seconds = 0.1
+    connector._backoff_max_seconds = 1.0
+
+    original_get = connector._http.get
+    sleep_calls: list[float] = []
+    calls = {"count": 0}
+
+    def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    def fake_get(path: str, params: dict | None = None):
+        if path == "/incremental/tickets.json":
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return FakeResponse({}, status_code=429, headers={"retry-after": "0.25"})
+        return original_get(path, params)
+
+    monkeypatch.setattr("oikb.connectors.zendesktickets.time.sleep", fake_sleep)
+    monkeypatch.setattr(connector._http, "get", fake_get)
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert sleep_calls == [0.25]
     connector.close()

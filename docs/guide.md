@@ -427,6 +427,11 @@ Optional settings:
 | `ZENDESKTICKET_DOWNLOAD_ATTACHMENTS` | Download ticket and comment attachments when true |
 | `ZENDESKTICKET_INCLUDETAGS` | Comma-separated tags; include tickets matching any listed tag |
 | `ZENDESKTICKET_EXCLUDETAGS` | Comma-separated tags to skip |
+| `ZENDESKTICKET_VERBOSE_HTTP` | Print Zendesk request URLs/params for debugging when true |
+| `ZENDESKTICKET_MAX_RETRIES` | Max retries for `429 Too Many Requests`, defaults to `5` |
+| `ZENDESKTICKET_BACKOFF_BASE_SECONDS` | Base exponential backoff delay in seconds, defaults to `1.0` |
+| `ZENDESKTICKET_BACKOFF_MAX_SECONDS` | Maximum backoff delay in seconds, defaults to `90.0` |
+| `ZENDESKTICKET_AGGRESSIVE_CHECKPOINT` | Persist checkpoint after each page when true; defaults to `false` |
 
 Behavior notes:
 
