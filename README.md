@@ -136,6 +136,22 @@ services:
       start_period: 15s
 ```
 
+### Publishing to an on-prem registry
+
+The repository includes `.github/workflows/docker-onprem.yml`, which mirrors the existing release Docker build and publishes the same images to your own registry on pushes to `porky` or by manual dispatch. Every job is pinned to the `onprem` self-hosted runner group.
+
+Configure these GitHub Actions settings before enabling it:
+
+| Type | Name | Example |
+|---|---|---|
+| Variable | `ONPREM_DOCKER_REGISTRY` | `registry.example.internal` |
+| Variable | `ONPREM_DOCKER_IMAGE_REPOSITORY` | `open-webui/oikb` |
+| Secret | `ONPREM_DOCKER_USERNAME` | `ci-publisher` |
+| Secret | `ONPREM_DOCKER_PASSWORD` | `********` |
+| Secret | `UPDATE_WEBHOOK` | `https://stack-updater.internal/...` |
+
+This workflow is configured to use the **`localdocker`** environment. Store the credentials and webhook there as **environment secrets** so approval gates, branch restrictions, and scoped secret exposure apply to the publish jobs. The workflow is restricted to the `onprem` runner group with the `self-hosted`, `Linux`, and `X64` labels.
+
 ## 46 Connectors
 
 | Category | Sources |
