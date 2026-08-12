@@ -50,8 +50,10 @@ class ZendeskTicketsConnector(BaseConnector):
         exclude_tags_value = os.environ.get("ZENDESKTICKET_EXCLUDETAGS")
         if exclude_tags_value is None:
             exclude_tags_value = os.environ.get("ZENDESKTICKET_EXCLUDETAG", "")
+        status_value = os.environ.get("ZENDESKTICKET_STATUS", "")
         self._include_tags = _parse_tags(include_tags_value)
         self._exclude_tags = _parse_tags(exclude_tags_value)
+        self._statuses = _parse_statuses(status_value)
         if not self._subdomain or not self._user or not self._token:
             raise ValueError(
                 "Zendesk tickets credentials required. Set ZENDESKTICKET_SUBDOMAIN, "
@@ -154,7 +156,8 @@ class ZendeskTicketsConnector(BaseConnector):
         return bool(self._manifest_snapshot) and not self.has_content()
 
     def close(self) -> None:
-        if self._run_cache_dir and self._run_cache_dir.exists():
+        preserve = self._aggressive_checkpoint and self._checkpoint_path().exists()
+        if not preserve and self._run_cache_dir and self._run_cache_dir.exists():
             shutil.rmtree(self._run_cache_dir, ignore_errors=True)
         self._run_cache_dir = None
         self._file_cache.clear()
@@ -169,7 +172,11 @@ class ZendeskTicketsConnector(BaseConnector):
         if self._download_attachments:
             attachments = self._collect_attachments(ticket, comments)
             for attachment in attachments:
-                content = self._download_attachment(attachment["content_url"])
+                content = self._download_attachment_with_retry(attachment["content_url"])
+                if content is None:
+                    if self._verbose_http:
+                        print(f"[zendesktickets] skipping attachment after retries: {attachment['content_url']}")
+                    continue
                 short_hash = hashlib.sha1(content).hexdigest()[:6]  # noqa: S324
                 filename = f"{ticket_id}-{short_hash}-{self._sanitize_filename(attachment['file_name'])}"
                 entries.append(self._cache_entry(path=ticket_id, filename=filename, content=content))
@@ -261,6 +268,25 @@ class ZendeskTicketsConnector(BaseConnector):
         else:
             return self._download_with_redirects(url, client=self._http)
 
+    def _download_attachment_with_retry(self, url: str) -> bytes | None:
+        retries = 3
+        for attempt in range(retries + 1):
+            try:
+                return self._download_attachment(url)
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status in (404,) or status == 429 or status >= 500:
+                    if attempt == retries:
+                        return None
+                    time.sleep(30 * (attempt + 1))
+                    continue
+                raise
+            except httpx.TransportError:
+                if attempt == retries:
+                    raise
+                time.sleep(30 * (attempt + 1))
+        return None
+
     def _download_with_redirects(self, url: str, client: httpx.Client | None = None) -> bytes:
         if client is not None:
             response = client.get(url)
@@ -308,6 +334,10 @@ class ZendeskTicketsConnector(BaseConnector):
         return min(exponential_delay, self._backoff_max_seconds)
 
     def _should_include_ticket(self, ticket: dict[str, Any]) -> bool:
+        if self._statuses:
+            status = str(ticket.get("status") or "").strip().lower()
+            if status not in self._statuses:
+                return False
         tags = {str(tag).strip().lower() for tag in ticket.get("tags") or [] if str(tag).strip()}
         if self._include_tags and not (tags & self._include_tags):
             return False
@@ -356,6 +386,11 @@ class ZendeskTicketsConnector(BaseConnector):
 
     def _reset_run_cache(self) -> None:
         cache_dir = self._state_dir / ".run-cache"
+        if self._aggressive_checkpoint and self._checkpoint_path().exists():
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            self._run_cache_dir = cache_dir
+            self._file_cache.clear()
+            return
         if cache_dir.exists():
             shutil.rmtree(cache_dir, ignore_errors=True)
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -388,6 +423,10 @@ def _parse_bool(value: str) -> bool:
 
 
 def _parse_tags(value: str) -> set[str]:
+    return {part.strip().lower() for part in value.split(",") if part.strip()}
+
+
+def _parse_statuses(value: str) -> set[str]:
     return {part.strip().lower() for part in value.split(",") if part.strip()}
 
 

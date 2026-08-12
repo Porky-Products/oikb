@@ -68,6 +68,10 @@ class FakeBinaryResponse:
         self.headers = headers or {}
 
     def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            request = httpx.Request("GET", "https://acme.zendesk.com/attachments/mock")
+            response = httpx.Response(self.status_code, request=request)
+            raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=request, response=response)
         return None
 
 
@@ -247,10 +251,49 @@ def test_sync_failure_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatc
         comments={1001: []},
     )
 
+    connector._http._ticket_pages.append({"tickets": [], "next_page": None})
     connector.build_manifest()
 
     assert not (state_dir / "resume_checkpoint.txt").exists()
     connector.close()
+
+
+def test_aggressive_checkpoint_keeps_run_cache_after_failure_for_resume(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "aggressive-cache-preserve")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+
+    connector.build_manifest()
+
+    # Simulate failed sync: close() is always called (even on failure) by run_sync().
+    # With aggressive checkpointing and a checkpoint file present, close() should NOT
+    # delete .run-cache so the next run can resume.
+    assert (state_dir / "resume_checkpoint.txt").exists()
+    run_cache = state_dir / ".run-cache"
+    assert run_cache.exists()
+    sentinel = run_cache / "preserve.me"
+    sentinel.write_text("keep")
+
+    connector.close()
+
+    # .run-cache must survive close() when aggressive checkpoint is active.
+    assert sentinel.exists()
+
+    # A new connector instance picks up the preserved cache and resumes from checkpoint.
+    connector2 = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+    connector2.build_manifest()
+    assert (state_dir / "resume_checkpoint.txt").exists()
+    connector2.close()
 
 
 def test_sync_run_advances_checkpoint_only_after_upload_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -393,6 +436,31 @@ def test_singular_tag_env_vars_are_supported_for_compatibility(monkeypatch: pyte
     manifest = connector.build_manifest()
 
     assert [entry.display_path for entry in manifest] == ["1001.md"]
+    connector.close()
+
+
+def test_status_filter_includes_only_configured_statuses(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "status-filter")
+    monkeypatch.setenv("ZENDESKTICKET_STATUS", "solved, closed")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:04:05Z", status="open"),
+                    _ticket(1002, "2024-01-02T03:05:05Z", status="solved"),
+                    _ticket(1003, "2024-01-02T03:06:05Z", status="closed"),
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1002: [], 1003: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1002.md", "1003.md"]
     connector.close()
 
 
@@ -658,6 +726,51 @@ def test_zendesk_attachment_redirect_is_followed(monkeypatch: pytest.MonkeyPatch
     manifest = connector.build_manifest()
 
     assert [entry.display_path for entry in manifest] == ["1001.md", "1001/1001-6bd1d2-processing.pdf"]
+    connector.close()
+
+
+def test_missing_attachment_retries_then_skips_without_aborting_sync(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "missing-attachment-skip")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[_attachment("missing.pdf", url="https://acme.zendesk.com/attachments/missing.pdf")],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    sleep_calls: list[float] = []
+    original_get = connector._http.get
+    calls = {"count": 0}
+
+    def fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+
+    def fake_get(path: str, params: dict | None = None):
+        if path == "https://acme.zendesk.com/attachments/missing.pdf":
+            calls["count"] += 1
+            return FakeBinaryResponse(b"", status_code=404)
+        return original_get(path, params)
+
+    monkeypatch.setattr("oikb.connectors.zendesktickets.time.sleep", fake_sleep)
+    monkeypatch.setattr(connector._http, "get", fake_get)
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert calls["count"] == 4
+    assert sleep_calls == [30, 60, 90]
     connector.close()
 
 
