@@ -2,7 +2,7 @@ name: Docker (On-Prem Registry)
 
 on:
   push:
-    branches: [porky]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
