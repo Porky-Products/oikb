@@ -113,15 +113,16 @@ jobs:
 
       - name: Export digest
         run: |
-          mkdir -p /tmp/digests
+          digest_dir="/tmp/${RUNNER_NAME}/digests"
+          rm -rf "$digest_dir" && mkdir -p "$digest_dir"
           digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          touch "$digest_dir/${digest#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
           name: digests-release-${{ matrix.flavor }}-${{ matrix.arch }}
-          path: /tmp/digests/*
+          path: /tmp/${{ runner.name }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
@@ -132,10 +133,15 @@ jobs:
       group: onprem
       labels: [self-hosted, Linux, X64]
     steps:
+      - name: Clean digest staging directory
+        run: |
+          digest_dir="/tmp/${RUNNER_NAME}/digests"
+          rm -rf "$digest_dir" && mkdir -p "$digest_dir"
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
-          path: /tmp/digests
+          path: /tmp/${{ runner.name }}/digests
           pattern: digests-release-default-*
           merge-multiple: true
 
@@ -150,13 +156,14 @@ jobs:
           password: ${{ secrets.ONPREM_DOCKER_PASSWORD }}
 
       - name: Create release multi-arch manifest
-        working-directory: /tmp/digests
+        env:
+          DIGEST_DIR: /tmp/${{ runner.name }}/digests
         run: |
           VERSION="${{ needs.read-version.outputs.version }}"
           MAJOR_MINOR="${VERSION%.*}"
           tags=("${{ env.IMAGE }}:latest" "${{ env.IMAGE }}:${VERSION}" "${{ env.IMAGE }}:${MAJOR_MINOR}")
           docker buildx imagetools create $(printf -- '-t %s ' "${tags[@]}") \
-            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+            $(printf '${{ env.IMAGE }}@sha256:%s ' "$DIGEST_DIR"/*)
 
   merge-release-alpine:
     needs: [read-version, build-release]
@@ -165,10 +172,15 @@ jobs:
       group: onprem
       labels: [self-hosted, Linux, X64]
     steps:
+      - name: Clean digest staging directory
+        run: |
+          digest_dir="/tmp/${RUNNER_NAME}/digests"
+          rm -rf "$digest_dir" && mkdir -p "$digest_dir"
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
-          path: /tmp/digests
+          path: /tmp/${{ runner.name }}/digests
           pattern: digests-release-alpine-*
           merge-multiple: true
 
@@ -183,13 +195,14 @@ jobs:
           password: ${{ secrets.ONPREM_DOCKER_PASSWORD }}
 
       - name: Create release Alpine multi-arch manifest
-        working-directory: /tmp/digests
+        env:
+          DIGEST_DIR: /tmp/${{ runner.name }}/digests
         run: |
           VERSION="${{ needs.read-version.outputs.version }}"
           MAJOR_MINOR="${VERSION%.*}"
           tags=("${{ env.IMAGE }}:alpine" "${{ env.IMAGE }}:latest-alpine" "${{ env.IMAGE }}:${VERSION}-alpine" "${{ env.IMAGE }}:${MAJOR_MINOR}-alpine")
           docker buildx imagetools create $(printf -- '-t %s ' "${tags[@]}") \
-            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+            $(printf '${{ env.IMAGE }}@sha256:%s ' "$DIGEST_DIR"/*)
 
   update-stack:
     needs: [merge-release, merge-release-alpine]
