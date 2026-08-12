@@ -270,17 +270,30 @@ def test_aggressive_checkpoint_keeps_run_cache_after_failure_for_resume(monkeypa
 
     connector.build_manifest()
 
-    # Simulate failed sync (no mark_sync_complete call), then start a new run.
+    # Simulate failed sync: close() is always called (even on failure) by run_sync().
+    # With aggressive checkpointing and a checkpoint file present, close() should NOT
+    # delete .run-cache so the next run can resume.
     assert (state_dir / "resume_checkpoint.txt").exists()
     run_cache = state_dir / ".run-cache"
     assert run_cache.exists()
     sentinel = run_cache / "preserve.me"
     sentinel.write_text("keep")
 
-    connector.build_manifest()
-
-    assert sentinel.exists()
     connector.close()
+
+    # .run-cache must survive close() when aggressive checkpoint is active.
+    assert sentinel.exists()
+
+    # A new connector instance picks up the preserved cache and resumes from checkpoint.
+    connector2 = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+    connector2.build_manifest()
+    assert (state_dir / "resume_checkpoint.txt").exists()
+    connector2.close()
 
 
 def test_sync_run_advances_checkpoint_only_after_upload_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

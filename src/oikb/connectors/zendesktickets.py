@@ -156,7 +156,8 @@ class ZendeskTicketsConnector(BaseConnector):
         return bool(self._manifest_snapshot) and not self.has_content()
 
     def close(self) -> None:
-        if self._run_cache_dir and self._run_cache_dir.exists():
+        preserve = self._aggressive_checkpoint and self._checkpoint_path().exists()
+        if not preserve and self._run_cache_dir and self._run_cache_dir.exists():
             shutil.rmtree(self._run_cache_dir, ignore_errors=True)
         self._run_cache_dir = None
         self._file_cache.clear()
@@ -272,9 +273,17 @@ class ZendeskTicketsConnector(BaseConnector):
         for attempt in range(retries + 1):
             try:
                 return self._download_attachment(url)
-            except httpx.HTTPError:
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status in (404,) or status == 429 or status >= 500:
+                    if attempt == retries:
+                        return None
+                    time.sleep(30 * (attempt + 1))
+                    continue
+                raise
+            except httpx.TransportError:
                 if attempt == retries:
-                    return None
+                    raise
                 time.sleep(30 * (attempt + 1))
         return None
 
