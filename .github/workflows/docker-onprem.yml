@@ -112,11 +112,12 @@ jobs:
           cache-to: type=gha,mode=max,scope=onprem-release-${{ matrix.flavor }}-${{ matrix.arch }}
 
       - name: Export digest
+        env:
+          DIGEST_DIR: /tmp/${{ runner.name }}/digests
         run: |
-          digest_dir="/tmp/${RUNNER_NAME}/digests"
-          rm -rf "$digest_dir" && mkdir -p "$digest_dir"
+          rm -rf "$DIGEST_DIR" && mkdir -p "$DIGEST_DIR"
           digest="${{ steps.build.outputs.digest }}"
-          touch "$digest_dir/${digest#sha256:}"
+          touch "$DIGEST_DIR/${digest#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
@@ -134,9 +135,10 @@ jobs:
       labels: [self-hosted, Linux, X64]
     steps:
       - name: Clean digest staging directory
+        env:
+          DIGEST_DIR: /tmp/${{ runner.name }}/digests
         run: |
-          digest_dir="/tmp/${RUNNER_NAME}/digests"
-          rm -rf "$digest_dir" && mkdir -p "$digest_dir"
+          rm -rf "$DIGEST_DIR" && mkdir -p "$DIGEST_DIR"
 
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -162,8 +164,12 @@ jobs:
           VERSION="${{ needs.read-version.outputs.version }}"
           MAJOR_MINOR="${VERSION%.*}"
           tags=("${{ env.IMAGE }}:latest" "${{ env.IMAGE }}:${VERSION}" "${{ env.IMAGE }}:${MAJOR_MINOR}")
+          digests=()
+          for digest_path in "$DIGEST_DIR"/*; do
+            digests+=("${{ env.IMAGE }}@sha256:$(basename "$digest_path")")
+          done
           docker buildx imagetools create $(printf -- '-t %s ' "${tags[@]}") \
-            $(printf '${{ env.IMAGE }}@sha256:%s ' "$DIGEST_DIR"/*)
+            "${digests[@]}"
 
   merge-release-alpine:
     needs: [read-version, build-release]
@@ -173,9 +179,10 @@ jobs:
       labels: [self-hosted, Linux, X64]
     steps:
       - name: Clean digest staging directory
+        env:
+          DIGEST_DIR: /tmp/${{ runner.name }}/digests
         run: |
-          digest_dir="/tmp/${RUNNER_NAME}/digests"
-          rm -rf "$digest_dir" && mkdir -p "$digest_dir"
+          rm -rf "$DIGEST_DIR" && mkdir -p "$DIGEST_DIR"
 
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -201,8 +208,12 @@ jobs:
           VERSION="${{ needs.read-version.outputs.version }}"
           MAJOR_MINOR="${VERSION%.*}"
           tags=("${{ env.IMAGE }}:alpine" "${{ env.IMAGE }}:latest-alpine" "${{ env.IMAGE }}:${VERSION}-alpine" "${{ env.IMAGE }}:${MAJOR_MINOR}-alpine")
+          digests=()
+          for digest_path in "$DIGEST_DIR"/*; do
+            digests+=("${{ env.IMAGE }}@sha256:$(basename "$digest_path")")
+          done
           docker buildx imagetools create $(printf -- '-t %s ' "${tags[@]}") \
-            $(printf '${{ env.IMAGE }}@sha256:%s ' "$DIGEST_DIR"/*)
+            "${digests[@]}"
 
   update-stack:
     needs: [merge-release, merge-release-alpine]
