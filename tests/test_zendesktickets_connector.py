@@ -300,7 +300,7 @@ def test_aggressive_checkpoint_keeps_run_cache_after_failure_for_resume(monkeypa
     connector2.close()
 
 
-def test_sync_run_advances_checkpoint_only_after_upload_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_sync_run_advances_checkpoint_after_completed_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "run-sync-checkpoint")
     connector = _build_connector(
         monkeypatch,
@@ -351,6 +351,33 @@ def test_sync_exception_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPa
         run_sync(client=FailingClient(), connector=connector, kb_id="kb-1", quiet=True)
 
     assert not (state_dir / "resume_checkpoint.txt").exists()
+
+
+def test_sync_advances_checkpoint_even_when_some_uploads_fail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Checkpoint must advance after a completed run even if individual uploads errored.
+
+    Upload errors are already retried 3× by the upload loop.  Blocking the
+    checkpoint on remaining errors would cause every subsequent run to
+    re-process the full ticket set from the same start_time, compounding the
+    problem instead of making forward progress.
+    """
+    state_dir = _make_state_dir(tmp_path, "checkpoint-despite-upload-error")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+
+    class UploadFailingClient(FakeClient):
+        def upload_file(self, file_content: bytes, filename: str, kb_id: str, file_hash: str, directory_id: str | None = None) -> dict:
+            raise httpx.HTTPStatusError("500", request=httpx.Request("POST", "https://example.com"), response=httpx.Response(500))
+
+    result = run_sync(client=UploadFailingClient(), connector=connector, kb_id="kb-1", quiet=True)
+
+    assert result.errors  # upload failed
+    # Checkpoint must still have advanced.
+    assert (state_dir / "resume_checkpoint.txt").read_text().strip() == "2024-01-02T03:04:05Z"
 
 
 def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -880,4 +907,208 @@ def test_inaccessible_ticket_comments_5xx_retries_then_skips_without_aborting_sy
 
     assert [entry.display_path for entry in manifest] == ["1001.md"]
     assert len(sleep_calls) == 2  # two retries before giving up
+    connector.close()
+
+
+def test_end_of_stream_true_stops_pagination_even_when_next_page_present(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """end_of_stream=true must terminate iteration even when next_page is set.
+
+    Zendesk always returns a next_page URL on the incremental endpoint, even
+    after all results have been delivered.  The only reliable signal that
+    pagination is done is end_of_stream=true.  Without this guard the sync
+    re-requests the same start_time forever.
+    """
+    state_dir = _make_state_dir(tmp_path, "end-of-stream")
+    next_page_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=100&start_time=1786648901"
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "next_page": next_page_url,
+                "end_of_stream": True,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    # Only one GET should have been made (no follow-up on next_page).
+    ticket_calls = [c for c in connector._http.calls if "incremental/tickets.json" in (c["path"] or "")]
+    assert len(ticket_calls) == 1
+    connector.close()
+
+
+def test_stale_next_page_url_stops_pagination(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A repeated next_page URL (same cursor) must not be followed a second time.
+
+    This is a secondary safety guard: if end_of_stream is missing or False but
+    next_page resolves back to the same URL on consecutive pages, following it
+    would loop forever.  The guard detects this by tracking seen URLs and
+    breaking when the same next_page appears again.
+    """
+    state_dir = _make_state_dir(tmp_path, "stale-next-page")
+    same_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=100&start_time=1786648901"
+    # Two pages: both return the same next_page URL, simulating a stuck cursor.
+    # The connector should follow it once (first page → second page) and then
+    # stop when it would loop back to the same URL again.
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "next_page": same_url,
+                "end_of_stream": False,
+            },
+            {
+                "tickets": [],
+                "next_page": same_url,  # same URL again — guard must fire here
+                "end_of_stream": False,
+            },
+        ],
+        comments={1001: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    # Exactly two incremental ticket fetches: initial + one follow (then stop).
+    incremental_calls = [c for c in connector._http.calls if "incremental/tickets.json" in (c.get("path") or "")]
+    assert len(incremental_calls) == 2
+    connector.close()
+
+
+# ── MAX_TICKETS_PER_RUN tests ──────────────────────────────────────────────
+
+def test_max_tickets_per_run_stops_after_cap_and_saves_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """build_manifest stops after ZENDESKTICKET_MAX_TICKETS_PER_RUN included tickets.
+
+    Excluded tickets (tag/status filtered) do not count toward the cap.
+    The checkpoint must reflect the last ticket seen in the truncated run so
+    the next run resumes from the right place.
+    """
+    state_dir = _make_state_dir(tmp_path, "max-tickets-cap")
+    monkeypatch.setenv("ZENDESKTICKET_MAX_TICKETS_PER_RUN", "2")
+    # Three tickets on one page; cap of 2 should stop after the second included ticket.
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T01:00:00Z"),
+                    _ticket(1002, "2024-01-02T02:00:00Z"),
+                    _ticket(1003, "2024-01-02T03:00:00Z"),
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: [], 1002: [], 1003: []},
+    )
+    connector._max_tickets_per_run = 2
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md", "1002.md"]
+    # Checkpoint reflects the max updated_at of tickets actually processed
+    # (tickets 1001 and 1002). Ticket 1003 was not reached before the cap
+    # fired, so the next run will resume from 1002's timestamp and re-fetch
+    # from that point — ensuring 1003 is not skipped.
+    connector.mark_sync_complete()
+    checkpoint_text = (state_dir / "resume_checkpoint.txt").read_text().strip()
+    assert checkpoint_text == "2024-01-02T02:00:00Z"
+    connector.close()
+
+
+def test_max_tickets_per_run_excluded_tickets_do_not_count_toward_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Tickets excluded by tag filter must not consume cap slots."""
+    state_dir = _make_state_dir(tmp_path, "max-tickets-excluded")
+    monkeypatch.setenv("ZENDESKTICKET_MAX_TICKETS_PER_RUN", "2")
+    monkeypatch.setenv("ZENDESKTICKET_INCLUDETAGS", "ops")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T01:00:00Z", tags=["facilities"]),  # excluded
+                    _ticket(1002, "2024-01-02T02:00:00Z", tags=["ops"]),
+                    _ticket(1003, "2024-01-02T03:00:00Z", tags=["ops"]),
+                    _ticket(1004, "2024-01-02T04:00:00Z", tags=["ops"]),
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1002: [], 1003: [], 1004: []},
+    )
+    connector._max_tickets_per_run = 2
+
+    manifest = connector.build_manifest()
+
+    # 1001 excluded, then 1002 and 1003 fill the 2-slot cap; 1004 never reached.
+    assert [entry.display_path for entry in manifest] == ["1002.md", "1003.md"]
+    connector.close()
+
+
+def test_max_tickets_per_run_zero_disables_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Setting ZENDESKTICKET_MAX_TICKETS_PER_RUN=0 disables the cap entirely."""
+    state_dir = _make_state_dir(tmp_path, "max-tickets-disabled")
+    monkeypatch.setenv("ZENDESKTICKET_MAX_TICKETS_PER_RUN", "0")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T01:00:00Z"),
+                    _ticket(1002, "2024-01-02T02:00:00Z"),
+                    _ticket(1003, "2024-01-02T03:00:00Z"),
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: [], 1002: [], 1003: []},
+    )
+    assert connector._max_tickets_per_run is None
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md", "1002.md", "1003.md"]
+    connector.close()
+
+
+def test_max_tickets_per_run_cap_spans_multiple_pages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Cap is enforced across page boundaries, not just within a single page."""
+    state_dir = _make_state_dir(tmp_path, "max-tickets-multipage")
+    next_page_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=2&start_time=1000"
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T01:00:00Z"),
+                    _ticket(1002, "2024-01-02T02:00:00Z"),
+                ],
+                "next_page": next_page_url,
+            },
+            {
+                "tickets": [
+                    _ticket(1003, "2024-01-02T03:00:00Z"),
+                    _ticket(1004, "2024-01-02T04:00:00Z"),
+                ],
+                "next_page": None,
+            },
+        ],
+        comments={1001: [], 1002: [], 1003: [], 1004: []},
+    )
+    connector._max_tickets_per_run = 3
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md", "1002.md", "1003.md"]
     connector.close()

@@ -72,6 +72,8 @@ class ZendeskTicketsConnector(BaseConnector):
         self._pending_checkpoint: datetime | None = None
         self._run_cache_dir: Path | None = None
         self._aggressive_checkpoint = _parse_bool(os.environ.get("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "false"))
+        max_tickets_value = os.environ.get("ZENDESKTICKET_MAX_TICKETS_PER_RUN", "1000")
+        self._max_tickets_per_run: int | None = _parse_optional_positive_int(max_tickets_value, "ZENDESKTICKET_MAX_TICKETS_PER_RUN")
 
     def build_manifest(self) -> list[ManifestEntry]:
         state = self._load_state()
@@ -85,6 +87,8 @@ class ZendeskTicketsConnector(BaseConnector):
         excluded_ticket_ids: set[str] = set()
         pending_checkpoint = checkpoint
         seen_ticket_ids: set[str] = set()
+        tickets_processed = 0
+        cap_reached = False
 
         for page in self._iter_ticket_pages(checkpoint):
             page_max_updated_at: datetime | None = None
@@ -105,11 +109,19 @@ class ZendeskTicketsConnector(BaseConnector):
                 entries, updated_at_value = self._build_ticket_entries(ticket, comments)
                 current_entries_by_ticket[ticket_id] = entries
                 current_updated_at_by_ticket[ticket_id] = updated_at_value
+                tickets_processed += 1
+
+                if self._max_tickets_per_run is not None and tickets_processed >= self._max_tickets_per_run:
+                    cap_reached = True
+                    break
 
             if page_max_updated_at is not None:
                 pending_checkpoint = page_max_updated_at
                 if self._aggressive_checkpoint:
                     self._save_checkpoint(pending_checkpoint)
+
+            if cap_reached:
+                break
 
         carried_forward = {
             ticket_id: entries
@@ -202,6 +214,7 @@ class ZendeskTicketsConnector(BaseConnector):
 
     def _iter_ticket_pages(self, checkpoint: datetime) -> Iterator[list[dict[str, Any]]]:
         next_page: str | None = None
+        seen_page_urls: set[str] = set()
         while True:
             if next_page:
                 response = self._zendesk_get(next_page)
@@ -217,9 +230,23 @@ class ZendeskTicketsConnector(BaseConnector):
             payload = response.json()
             tickets = payload.get("tickets", [])
             yield tickets
+
+            # Zendesk incremental API signals "caught up" via end_of_stream.
+            # Always check this before following next_page — when end_of_stream
+            # is true, next_page still exists but points back to the same cursor,
+            # which would cause an infinite loop.
+            if payload.get("end_of_stream"):
+                break
+
             next_page = payload.get("next_page")
             if not next_page:
                 break
+
+            # Guard: if we have already fetched this exact URL the cursor has
+            # not advanced and continuing would loop forever.
+            if next_page in seen_page_urls:
+                break
+            seen_page_urls.add(next_page)
 
     def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]] | None:
         """Fetch comments for a ticket, returning None on 404 or after exhausting retries."""
@@ -478,4 +505,18 @@ def _parse_positive_float(value: str, var_name: str) -> float:
         raise ValueError(f"{var_name} must be a positive number.") from exc
     if parsed <= 0:
         raise ValueError(f"{var_name} must be a positive number.")
+    return parsed
+
+
+def _parse_optional_positive_int(value: str, var_name: str) -> int | None:
+    """Parse a positive integer, returning None if the value is '0' or empty (meaning no cap)."""
+    stripped = value.strip()
+    if not stripped or stripped == "0":
+        return None
+    try:
+        parsed = int(stripped)
+    except ValueError as exc:
+        raise ValueError(f"{var_name} must be a positive integer or 0 to disable.") from exc
+    if parsed < 0:
+        raise ValueError(f"{var_name} must be a positive integer or 0 to disable.")
     return parsed
