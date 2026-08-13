@@ -92,6 +92,10 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          # Unique builder name per job so parallel matrix jobs on the same
+          # host don't share a BuildKit daemon, which causes EOF/transport errors.
+          name: builder-${{ github.run_id }}-${{ matrix.flavor }}-${{ matrix.arch }}
 
       - name: Log in to on-prem registry
         uses: docker/login-action@v3
