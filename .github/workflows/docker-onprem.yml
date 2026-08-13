@@ -95,7 +95,6 @@ jobs:
         with:
           # Unique builder name per job so parallel matrix jobs on the same
           # host don't share a BuildKit daemon, which causes EOF/transport errors.
-          driver-opts: network=host
           name: builder-${{ github.run_id }}-${{ matrix.flavor }}-${{ matrix.arch }}
 
       - name: Log in to on-prem registry
