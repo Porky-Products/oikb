@@ -202,6 +202,7 @@ class ZendeskTicketsConnector(BaseConnector):
 
     def _iter_ticket_pages(self, checkpoint: datetime) -> Iterator[list[dict[str, Any]]]:
         next_page: str | None = None
+        seen_page_urls: set[str] = set()
         while True:
             if next_page:
                 response = self._zendesk_get(next_page)
@@ -217,9 +218,23 @@ class ZendeskTicketsConnector(BaseConnector):
             payload = response.json()
             tickets = payload.get("tickets", [])
             yield tickets
+
+            # Zendesk incremental API signals "caught up" via end_of_stream.
+            # Always check this before following next_page — when end_of_stream
+            # is true, next_page still exists but points back to the same cursor,
+            # which would cause an infinite loop.
+            if payload.get("end_of_stream"):
+                break
+
             next_page = payload.get("next_page")
             if not next_page:
                 break
+
+            # Guard: if we have already fetched this exact URL the cursor has
+            # not advanced and continuing would loop forever.
+            if next_page in seen_page_urls:
+                break
+            seen_page_urls.add(next_page)
 
     def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]] | None:
         """Fetch comments for a ticket, returning None on 404 or after exhausting retries."""

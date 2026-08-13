@@ -881,3 +881,75 @@ def test_inaccessible_ticket_comments_5xx_retries_then_skips_without_aborting_sy
     assert [entry.display_path for entry in manifest] == ["1001.md"]
     assert len(sleep_calls) == 2  # two retries before giving up
     connector.close()
+
+
+def test_end_of_stream_true_stops_pagination_even_when_next_page_present(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """end_of_stream=true must terminate iteration even when next_page is set.
+
+    Zendesk always returns a next_page URL on the incremental endpoint, even
+    after all results have been delivered.  The only reliable signal that
+    pagination is done is end_of_stream=true.  Without this guard the sync
+    re-requests the same start_time forever.
+    """
+    state_dir = _make_state_dir(tmp_path, "end-of-stream")
+    next_page_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=100&start_time=1786648901"
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "next_page": next_page_url,
+                "end_of_stream": True,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    # Only one GET should have been made (no follow-up on next_page).
+    ticket_calls = [c for c in connector._http.calls if "incremental/tickets.json" in (c["path"] or "")]
+    assert len(ticket_calls) == 1
+    connector.close()
+
+
+def test_stale_next_page_url_stops_pagination(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A repeated next_page URL (same cursor) must not be followed a second time.
+
+    This is a secondary safety guard: if end_of_stream is missing or False but
+    next_page resolves back to the same URL on consecutive pages, following it
+    would loop forever.  The guard detects this by tracking seen URLs and
+    breaking when the same next_page appears again.
+    """
+    state_dir = _make_state_dir(tmp_path, "stale-next-page")
+    same_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=100&start_time=1786648901"
+    # Two pages: both return the same next_page URL, simulating a stuck cursor.
+    # The connector should follow it once (first page → second page) and then
+    # stop when it would loop back to the same URL again.
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "next_page": same_url,
+                "end_of_stream": False,
+            },
+            {
+                "tickets": [],
+                "next_page": same_url,  # same URL again — guard must fire here
+                "end_of_stream": False,
+            },
+        ],
+        comments={1001: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    # Exactly two incremental ticket fetches: initial + one follow (then stop).
+    incremental_calls = [c for c in connector._http.calls if "incremental/tickets.json" in (c.get("path") or "")]
+    assert len(incremental_calls) == 2
+    connector.close()
