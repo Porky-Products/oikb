@@ -380,6 +380,41 @@ def test_sync_advances_checkpoint_even_when_some_uploads_fail(monkeypatch: pytes
     assert (state_dir / "resume_checkpoint.txt").read_text().strip() == "2024-01-02T03:04:05Z"
 
 
+def test_upload_transport_error_is_retried_three_times(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Timeouts and other transport errors must be retried, not immediately fatal.
+
+    httpx.TransportError (covers TimeoutException, ConnectError, etc.) is not an
+    HTTPStatusError, so the previous bare `except Exception: break` path gave
+    zero retries.  A timed-out upload was permanently skipped.
+    """
+    state_dir = _make_state_dir(tmp_path, "upload-timeout-retry")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(376, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={376: []},
+    )
+
+    attempt_log: list[str] = []
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("oikb.sync.time.sleep", lambda d: sleep_calls.append(d))
+
+    class TimeoutAfterTwoClient(FakeClient):
+        def upload_file(self, file_content: bytes, filename: str, kb_id: str, file_hash: str, directory_id: str | None = None) -> dict:
+            attempt_log.append(filename)
+            if len(attempt_log) < 3:
+                raise httpx.TimeoutException(f"timed out on attempt {len(attempt_log)}")
+            # Third attempt succeeds.
+            return {}
+
+    result = run_sync(client=TimeoutAfterTwoClient(), connector=connector, kb_id="kb-1", quiet=True)
+
+    assert result.errors == []
+    assert result.added == 1
+    assert len(attempt_log) == 3   # two timeouts then success
+    assert sleep_calls == [1, 2]   # exponential back-off: 2^0, 2^1
+
+
 def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "carry-forward")
     (state_dir / "manifest_state.json").write_text(

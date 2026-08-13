@@ -394,7 +394,25 @@ def _run_sync_inner(
                 return ("warning", message)
             except httpx.HTTPStatusError as e:
                 if e.response.status_code >= 500 and attempt < 2:
-                    time.sleep(2 ** attempt)
+                    delay = 2 ** attempt
+                    if verbose and not progress:
+                        click.echo(click.style(f"  ↻ {display}: HTTP {e.response.status_code}, retry {attempt + 1}/3 in {delay}s", fg="yellow"), err=True)
+                    time.sleep(delay)
+                    check_stop()
+                    last_err = e
+                    continue
+                last_err = e
+                break
+            except httpx.TransportError as e:
+                # Covers timeouts, connection resets, and other network errors.
+                # These are always retried — unlike HTTPStatusError (which may
+                # indicate a permanent client error), transport errors are
+                # transient by nature.
+                if attempt < 2:
+                    delay = 2 ** attempt
+                    if verbose and not progress:
+                        click.echo(click.style(f"  ↻ {display}: {type(e).__name__}, retry {attempt + 1}/3 in {delay}s", fg="yellow"), err=True)
+                    time.sleep(delay)
                     check_stop()
                     last_err = e
                     continue
