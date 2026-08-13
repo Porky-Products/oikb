@@ -99,6 +99,9 @@ class ZendeskTicketsConnector(BaseConnector):
                     continue
 
                 comments = self._fetch_ticket_comments(ticket["id"])
+                if comments is None:
+                    excluded_ticket_ids.add(ticket_id)
+                    continue
                 entries, updated_at_value = self._build_ticket_entries(ticket, comments)
                 current_entries_by_ticket[ticket_id] = entries
                 current_updated_at_by_ticket[ticket_id] = updated_at_value
@@ -218,10 +221,28 @@ class ZendeskTicketsConnector(BaseConnector):
             if not next_page:
                 break
 
-    def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]]:
-        response = self._zendesk_get(f"/tickets/{ticket_id}/comments.json")
-        response.raise_for_status()
-        return response.json().get("comments", [])
+    def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]] | None:
+        """Fetch comments for a ticket, returning None on 404 or after exhausting retries."""
+        for attempt in range(self._max_retries + 1):
+            response = self._zendesk_get(f"/tickets/{ticket_id}/comments.json")
+            status = getattr(response, "status_code", None)
+            if status == 404:
+                if self._verbose_http:
+                    print(f"[zendesktickets] skipping inaccessible ticket {ticket_id} (404)")
+                return None
+            if status == _ZENDESK_RATE_LIMIT_STATUS or (status is not None and status >= 500):
+                if attempt == self._max_retries:
+                    if self._verbose_http:
+                        print(f"[zendesktickets] skipping ticket {ticket_id} after retries (status {status})")
+                    return None
+                delay = self._retry_delay_seconds(response, attempt)
+                if self._verbose_http:
+                    print(f"[zendesktickets] retry ticket {ticket_id} in {delay:.2f}s (attempt {attempt + 1}/{self._max_retries})")
+                time.sleep(delay)
+                continue
+            response.raise_for_status()
+            return response.json().get("comments", [])
+        return None
 
     def _render_ticket_markdown(self, ticket: dict[str, Any], comments: list[dict[str, Any]]) -> str:
         lines = [

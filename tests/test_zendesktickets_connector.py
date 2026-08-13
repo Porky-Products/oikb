@@ -36,10 +36,11 @@ class FakeResponse:
 
 
 class FakeHTTPClient:
-    def __init__(self, ticket_pages: list[dict], comments: dict[int, list[dict]] | None = None, attachments: dict[str, bytes] | None = None):
+    def __init__(self, ticket_pages: list[dict], comments: dict[int, list[dict]] | None = None, attachments: dict[str, bytes] | None = None, comment_status_codes: dict[int, list[int]] | None = None):
         self._ticket_pages = list(ticket_pages)
         self._comments = comments or {}
         self._attachments = attachments or {}
+        self._comment_status_codes: dict[int, list[int]] = comment_status_codes or {}
         self.calls: list[dict] = []
         self.is_closed = False
 
@@ -51,6 +52,9 @@ class FakeHTTPClient:
             return FakeResponse(self._ticket_pages.pop(0))
         if path.endswith("/comments.json"):
             ticket_id = int(path.split("/")[2])
+            if ticket_id in self._comment_status_codes and self._comment_status_codes[ticket_id]:
+                status = self._comment_status_codes[ticket_id].pop(0)
+                return FakeResponse({}, status_code=status)
             return FakeResponse({"comments": self._comments.get(ticket_id, [])})
         if path.startswith("https://attachments.example/") or path.startswith("https://acme.zendesk.com/attachments/"):
             name = path.rsplit("/", 1)[-1]
@@ -810,4 +814,70 @@ def test_rate_limited_ticket_fetch_retries_with_retry_after(monkeypatch: pytest.
 
     assert [entry.display_path for entry in manifest] == ["1001.md"]
     assert sleep_calls == [0.25]
+    connector.close()
+
+
+def test_inaccessible_ticket_comments_404_skips_ticket_without_aborting_sync(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "inaccessible-ticket-skip")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:04:05Z"),
+                    _ticket(1002, "2024-01-02T04:00:00Z"),
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: [_comment(501, "Accessible ticket comment.")], 1002: []},
+    )
+    connector._http = FakeHTTPClient(
+        ticket_pages=connector._http._ticket_pages,
+        comments={1001: [_comment(501, "Accessible ticket comment.")]},
+        comment_status_codes={1002: [404]},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    connector.close()
+
+
+def test_inaccessible_ticket_comments_5xx_retries_then_skips_without_aborting_sync(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "inaccessible-ticket-5xx-skip")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:04:05Z"),
+                    _ticket(1002, "2024-01-02T04:00:00Z"),
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: [], 1002: []},
+    )
+    connector._max_retries = 2
+    connector._backoff_base_seconds = 0.1
+    connector._backoff_max_seconds = 1.0
+
+    # ticket 1001 succeeds; ticket 1002 always returns 503
+    original_http = connector._http
+    connector._http = FakeHTTPClient(
+        ticket_pages=original_http._ticket_pages,
+        comments={1001: []},
+        comment_status_codes={1002: [503, 503, 503]},
+    )
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("oikb.connectors.zendesktickets.time.sleep", lambda d: sleep_calls.append(d))
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert len(sleep_calls) == 2  # two retries before giving up
     connector.close()
