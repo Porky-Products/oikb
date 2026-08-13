@@ -621,6 +621,22 @@ def test_attachments_with_same_name_use_content_hashes(monkeypatch: pytest.Monke
     connector.close()
 
 
+def test_no_attachment_directory_created_when_no_attachments(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "attachments-empty")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    connector.close()
+
+
 def test_page_size_defaults_to_ten_and_is_overrideable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("ZENDESKTICKET_SUBDOMAIN", "acme")
     monkeypatch.setenv("ZENDESKTICKET_USER", "agent@example.com")
