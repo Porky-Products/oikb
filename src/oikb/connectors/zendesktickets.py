@@ -222,7 +222,7 @@ class ZendeskTicketsConnector(BaseConnector):
                 break
 
     def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]] | None:
-        """Fetch comments for a ticket, returning None if the ticket is inaccessible."""
+        """Fetch comments for a ticket, returning None on 404 or after exhausting retries."""
         for attempt in range(self._max_retries + 1):
             response = self._zendesk_get(f"/tickets/{ticket_id}/comments.json")
             status = getattr(response, "status_code", None)
