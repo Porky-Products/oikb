@@ -174,7 +174,6 @@ class ZendeskTicketsConnector(BaseConnector):
 
         if self._download_attachments:
             attachments = self._collect_attachments(ticket, comments)
-            attachment_entries: list[ManifestEntry] = []
             for attachment in attachments:
                 content = self._download_attachment_with_retry(attachment["content_url"])
                 if content is None:
@@ -183,8 +182,7 @@ class ZendeskTicketsConnector(BaseConnector):
                     continue
                 short_hash = hashlib.sha1(content).hexdigest()[:6]  # noqa: S324
                 filename = f"{ticket_id}-{short_hash}-{self._sanitize_filename(attachment['file_name'])}"
-                attachment_entries.append(self._cache_entry(path=ticket_id, filename=filename, content=content))
-            entries.extend(attachment_entries)
+                entries.append(self._cache_entry(path=ticket_id, filename=filename, content=content))
 
         return entries, updated_at_value
 

@@ -630,10 +630,13 @@ def test_no_attachment_directory_created_when_no_attachments(monkeypatch: pytest
         pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1001: []},
     )
+    client = FakeClient(existing_files=[])
 
-    manifest = connector.build_manifest()
+    result = run_sync(client=client, connector=connector, kb_id="kb-1", quiet=True)
 
-    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert result.dirs_created == 0
+    assert client.directory_calls == []
+    assert [upload["filename"] for upload in client.upload_calls] == ["1001.md"]
     connector.close()
 
 
