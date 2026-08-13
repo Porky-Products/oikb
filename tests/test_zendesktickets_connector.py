@@ -300,7 +300,7 @@ def test_aggressive_checkpoint_keeps_run_cache_after_failure_for_resume(monkeypa
     connector2.close()
 
 
-def test_sync_run_advances_checkpoint_only_after_upload_success(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_sync_run_advances_checkpoint_after_completed_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "run-sync-checkpoint")
     connector = _build_connector(
         monkeypatch,
@@ -351,6 +351,33 @@ def test_sync_exception_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPa
         run_sync(client=FailingClient(), connector=connector, kb_id="kb-1", quiet=True)
 
     assert not (state_dir / "resume_checkpoint.txt").exists()
+
+
+def test_sync_advances_checkpoint_even_when_some_uploads_fail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Checkpoint must advance after a completed run even if individual uploads errored.
+
+    Upload errors are already retried 3× by the upload loop.  Blocking the
+    checkpoint on remaining errors would cause every subsequent run to
+    re-process the full ticket set from the same start_time, compounding the
+    problem instead of making forward progress.
+    """
+    state_dir = _make_state_dir(tmp_path, "checkpoint-despite-upload-error")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+
+    class UploadFailingClient(FakeClient):
+        def upload_file(self, file_content: bytes, filename: str, kb_id: str, file_hash: str, directory_id: str | None = None) -> dict:
+            raise httpx.HTTPStatusError("500", request=httpx.Request("POST", "https://example.com"), response=httpx.Response(500))
+
+    result = run_sync(client=UploadFailingClient(), connector=connector, kb_id="kb-1", quiet=True)
+
+    assert result.errors  # upload failed
+    # Checkpoint must still have advanced.
+    assert (state_dir / "resume_checkpoint.txt").read_text().strip() == "2024-01-02T03:04:05Z"
 
 
 def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

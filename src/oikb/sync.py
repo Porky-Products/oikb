@@ -166,7 +166,20 @@ def run_sync(
         return sync_result
     finally:
         mark_sync_complete = getattr(connector, "mark_sync_complete", None)
-        if completed and not dry_run and callable(mark_sync_complete) and not result.errors:
+        # Advance the checkpoint whenever the sync run completed (even if some
+        # uploads failed).  The upload loop already retries 3× for transient
+        # errors, so anything still in result.errors after that is likely a
+        # persistent problem with a specific file (e.g. an oversized attachment
+        # that always times out).  Blocking the checkpoint on those errors means
+        # every subsequent run re-processes the entire ticket set from the same
+        # start_time, compounding the problem rather than making progress.
+        #
+        # Trade-off: a ticket whose upload fails permanently will be silently
+        # skipped until Zendesk updates it (changing updated_at) and it re-enters
+        # the incremental window.  If that's unacceptable, revisit Option C:
+        # record failed ticket IDs in connector state and retry them specifically
+        # on the next run, independent of the checkpoint.
+        if completed and not dry_run and callable(mark_sync_complete):
             mark_sync_complete()
         connector.close()
 
