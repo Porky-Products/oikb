@@ -499,7 +499,7 @@ def test_filtered_ticket_is_removed_from_kb_on_next_sync(monkeypatch: pytest.Mon
     state_dir = _make_state_dir(tmp_path, "filtered-removal")
     existing_files = [
         {"path": "tickets", "filename": "1001.md", "checksum": "old", "file_id": "file-1"},
-        {"path": "attachments", "filename": "1001-screenshot.png", "checksum": "old2", "file_id": "file-2"},
+        {"path": "attachments/1001", "filename": "1001-screenshot.png", "checksum": "old2", "file_id": "file-2"},
     ]
     (state_dir / "manifest_state.json").write_text(
         json.dumps(
@@ -511,7 +511,7 @@ def test_filtered_ticket_is_removed_from_kb_on_next_sync(monkeypatch: pytest.Mon
                         "updated_at": "2024-01-01T00:00:00Z",
                         "entries": [
                             {"path": "tickets", "filename": "1001.md", "checksum": "old", "size": 10},
-                            {"path": "attachments", "filename": "1001-screenshot.png", "checksum": "old2", "size": 4},
+                            {"path": "attachments/1001", "filename": "1001-screenshot.png", "checksum": "old2", "size": 4},
                         ],
                     }
                 },
@@ -566,11 +566,11 @@ def test_attachments_are_added_when_enabled(monkeypatch: pytest.MonkeyPatch, tmp
     manifest = connector.build_manifest()
 
     assert sorted(entry.display_path for entry in manifest) == [
-        "attachments/1001-91561f-error-log.txt",
-        "attachments/1001-e39f8d-screenshot.png",
+        "attachments/1001/1001-91561f-error-log.txt",
+        "attachments/1001/1001-e39f8d-screenshot.png",
         "tickets/1001.md",
     ]
-    assert connector.read_file("attachments", "1001-e39f8d-screenshot.png") == b"image-bytes"
+    assert connector.read_file("attachments/1001", "1001-e39f8d-screenshot.png") == b"image-bytes"
     connector.close()
 
 
@@ -586,7 +586,7 @@ def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytes
                         "updated_at": "2024-01-01T00:00:00Z",
                         "entries": [
                             {"path": "tickets", "filename": "1001.md", "checksum": "md", "size": 10},
-                            {"path": "attachments", "filename": "1001-screenshot.png", "checksum": "img", "size": 5},
+                            {"path": "attachments/1001", "filename": "1001-screenshot.png", "checksum": "img", "size": 5},
                         ],
                     }
                 },
@@ -595,7 +595,7 @@ def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytes
     )
     existing_files = [
         {"path": "tickets", "filename": "1001.md", "checksum": "md", "file_id": "file-md"},
-        {"path": "attachments", "filename": "1001-screenshot.png", "checksum": "img", "file_id": "file-img"},
+        {"path": "attachments/1001", "filename": "1001-screenshot.png", "checksum": "img", "file_id": "file-img"},
     ]
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "false")
     connector = _build_connector(
@@ -641,8 +641,8 @@ def test_attachments_with_same_name_use_content_hashes(monkeypatch: pytest.Monke
     manifest = connector.build_manifest()
 
     assert sorted(entry.display_path for entry in manifest) == [
-        "attachments/1001-1fa9b9-screenshot.png",
-        "attachments/1001-4311eb-screenshot.png",
+        "attachments/1001/1001-1fa9b9-screenshot.png",
+        "attachments/1001/1001-4311eb-screenshot.png",
         "tickets/1001.md",
     ]
     connector.close()
@@ -726,7 +726,7 @@ def test_external_attachment_downloads_without_authenticated_client(monkeypatch:
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["attachments/1001-b5eb7d-external.png", "tickets/1001.md"]
+    assert [entry.display_path for entry in manifest] == ["attachments/1001/1001-b5eb7d-external.png", "tickets/1001.md"]
     assert external_calls == [{"url": "https://attachments.example/external.png", "timeout": 30.0}]
     assert all(call["path"] != "https://attachments.example/external.png" for call in connector._http.calls)
     connector.close()
@@ -775,7 +775,7 @@ def test_zendesk_attachment_redirect_is_followed(monkeypatch: pytest.MonkeyPatch
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["attachments/1001-6bd1d2-processing.pdf", "tickets/1001.md"]
+    assert [entry.display_path for entry in manifest] == ["attachments/1001/1001-6bd1d2-processing.pdf", "tickets/1001.md"]
     connector.close()
 
 

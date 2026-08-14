@@ -133,10 +133,11 @@ class ZendeskTicketsConnector(BaseConnector):
 
         if attachments_enabled_previously and not self._download_attachments:
             for ticket_id, entries in list(carried_forward.items()):
+                attachment_path = f"{_ATTACHMENT_PATH}/{ticket_id}"
                 carried_forward[ticket_id] = [
                     entry
                     for entry in entries
-                    if entry.path not in {_ATTACHMENT_PATH, ticket_id}
+                    if entry.path != attachment_path
                 ]
 
         combined_entries_by_ticket = carried_forward | current_entries_by_ticket
@@ -200,7 +201,7 @@ class ZendeskTicketsConnector(BaseConnector):
                     continue
                 short_hash = hashlib.sha1(content).hexdigest()[:6]  # noqa: S324
                 filename = f"{ticket_id}-{short_hash}-{self._sanitize_filename(attachment['file_name'])}"
-                entries.append(self._cache_entry(path=_ATTACHMENT_PATH, filename=filename, content=content))
+                entries.append(self._cache_entry(path=f"{_ATTACHMENT_PATH}/{ticket_id}", filename=filename, content=content))
 
         return entries, updated_at_value
 
