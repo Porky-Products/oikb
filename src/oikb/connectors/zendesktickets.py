@@ -19,6 +19,8 @@ from oikb.connectors import BaseConnector, ManifestEntry
 
 _ZENDESK_ATTACHMENT_REDIRECT_CODES = {301, 302, 303, 307, 308}
 _ZENDESK_RATE_LIMIT_STATUS = 429
+_TICKET_PATH = "tickets"
+_ATTACHMENT_PATH = "attachments"
 
 
 class ZendeskTicketsConnector(BaseConnector):
@@ -131,7 +133,11 @@ class ZendeskTicketsConnector(BaseConnector):
 
         if attachments_enabled_previously and not self._download_attachments:
             for ticket_id, entries in list(carried_forward.items()):
-                carried_forward[ticket_id] = [entry for entry in entries if not entry.path]
+                carried_forward[ticket_id] = [
+                    entry
+                    for entry in entries
+                    if entry.path not in {_ATTACHMENT_PATH, ticket_id}
+                ]
 
         combined_entries_by_ticket = carried_forward | current_entries_by_ticket
         manifest = [entry for entries in combined_entries_by_ticket.values() for entry in entries]
@@ -182,7 +188,7 @@ class ZendeskTicketsConnector(BaseConnector):
         ticket_id = str(ticket["id"])
         updated_at_value = str(ticket.get("updated_at") or "")
         markdown = self._render_ticket_markdown(ticket, comments).encode("utf-8")
-        entries = [self._cache_entry(path="", filename=f"{ticket_id}.md", content=markdown)]
+        entries = [self._cache_entry(path=_TICKET_PATH, filename=f"{ticket_id}.md", content=markdown)]
 
         if self._download_attachments:
             attachments = self._collect_attachments(ticket, comments)
@@ -194,7 +200,7 @@ class ZendeskTicketsConnector(BaseConnector):
                     continue
                 short_hash = hashlib.sha1(content).hexdigest()[:6]  # noqa: S324
                 filename = f"{ticket_id}-{short_hash}-{self._sanitize_filename(attachment['file_name'])}"
-                entries.append(self._cache_entry(path=ticket_id, filename=filename, content=content))
+                entries.append(self._cache_entry(path=_ATTACHMENT_PATH, filename=filename, content=content))
 
         return entries, updated_at_value
 
