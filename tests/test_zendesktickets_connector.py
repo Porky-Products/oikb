@@ -235,9 +235,9 @@ def test_build_manifest_renders_comments_and_persists_state_after_success(monkey
     )
 
     manifest = connector.build_manifest()
-    text = connector.read_file("", "1001.md").decode()
+    text = connector.read_file("tickets", "1001.md").decode()
 
-    assert manifest == [ManifestEntry(filename="1001.md", path="", checksum=manifest[0].checksum, size=len(text.encode("utf-8")))]
+    assert manifest == [ManifestEntry(filename="1001.md", path="tickets", checksum=manifest[0].checksum, size=len(text.encode("utf-8")))]
     assert "## Comments" in text
     assert "Investigating the printer queue." in text
     assert "Updated at: 2024-01-02T03:04:05Z" in text
@@ -393,7 +393,7 @@ def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch:
                         "entries": [
                             {
                                 "filename": "1001.md",
-                                "path": "",
+                                "path": "tickets",
                                 "checksum": "abc123",
                                 "size": 12,
                             }
@@ -412,7 +412,7 @@ def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch:
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md", "1002.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md"]
     connector.close()
 
 
@@ -438,7 +438,7 @@ def test_include_and_exclude_tags_filter_ticket_set(monkeypatch: pytest.MonkeyPa
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     connector.close()
 
 
@@ -466,7 +466,7 @@ def test_singular_tag_env_vars_are_supported_for_compatibility(monkeypatch: pyte
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     connector.close()
 
 
@@ -491,15 +491,15 @@ def test_status_filter_includes_only_configured_statuses(monkeypatch: pytest.Mon
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1002.md", "1003.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1002.md", "tickets/1003.md"]
     connector.close()
 
 
 def test_filtered_ticket_is_removed_from_kb_on_next_sync(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "filtered-removal")
     existing_files = [
-        {"path": "", "filename": "1001.md", "checksum": "old", "file_id": "file-1"},
-        {"path": "1001", "filename": "1001-screenshot.png", "checksum": "old2", "file_id": "file-2"},
+        {"path": "tickets", "filename": "1001.md", "checksum": "old", "file_id": "file-1"},
+        {"path": "attachments", "filename": "1001-screenshot.png", "checksum": "old2", "file_id": "file-2"},
     ]
     (state_dir / "manifest_state.json").write_text(
         json.dumps(
@@ -510,8 +510,8 @@ def test_filtered_ticket_is_removed_from_kb_on_next_sync(monkeypatch: pytest.Mon
                     "1001": {
                         "updated_at": "2024-01-01T00:00:00Z",
                         "entries": [
-                            {"path": "", "filename": "1001.md", "checksum": "old", "size": 10},
-                            {"path": "1001", "filename": "1001-screenshot.png", "checksum": "old2", "size": 4},
+                            {"path": "tickets", "filename": "1001.md", "checksum": "old", "size": 10},
+                            {"path": "attachments", "filename": "1001-screenshot.png", "checksum": "old2", "size": 4},
                         ],
                     }
                 },
@@ -566,11 +566,11 @@ def test_attachments_are_added_when_enabled(monkeypatch: pytest.MonkeyPatch, tmp
     manifest = connector.build_manifest()
 
     assert sorted(entry.display_path for entry in manifest) == [
-        "1001.md",
-        "1001/1001-91561f-error-log.txt",
-        "1001/1001-e39f8d-screenshot.png",
+        "attachments/1001-91561f-error-log.txt",
+        "attachments/1001-e39f8d-screenshot.png",
+        "tickets/1001.md",
     ]
-    assert connector.read_file("1001", "1001-e39f8d-screenshot.png") == b"image-bytes"
+    assert connector.read_file("attachments", "1001-e39f8d-screenshot.png") == b"image-bytes"
     connector.close()
 
 
@@ -585,8 +585,8 @@ def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytes
                     "1001": {
                         "updated_at": "2024-01-01T00:00:00Z",
                         "entries": [
-                            {"path": "", "filename": "1001.md", "checksum": "md", "size": 10},
-                            {"path": "1001", "filename": "1001-screenshot.png", "checksum": "img", "size": 5},
+                            {"path": "tickets", "filename": "1001.md", "checksum": "md", "size": 10},
+                            {"path": "attachments", "filename": "1001-screenshot.png", "checksum": "img", "size": 5},
                         ],
                     }
                 },
@@ -594,8 +594,8 @@ def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytes
         )
     )
     existing_files = [
-        {"path": "", "filename": "1001.md", "checksum": "md", "file_id": "file-md"},
-        {"path": "1001", "filename": "1001-screenshot.png", "checksum": "img", "file_id": "file-img"},
+        {"path": "tickets", "filename": "1001.md", "checksum": "md", "file_id": "file-md"},
+        {"path": "attachments", "filename": "1001-screenshot.png", "checksum": "img", "file_id": "file-img"},
     ]
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "false")
     connector = _build_connector(
@@ -641,9 +641,9 @@ def test_attachments_with_same_name_use_content_hashes(monkeypatch: pytest.Monke
     manifest = connector.build_manifest()
 
     assert sorted(entry.display_path for entry in manifest) == [
-        "1001.md",
-        "1001/1001-1fa9b9-screenshot.png",
-        "1001/1001-4311eb-screenshot.png",
+        "attachments/1001-1fa9b9-screenshot.png",
+        "attachments/1001-4311eb-screenshot.png",
+        "tickets/1001.md",
     ]
     connector.close()
 
@@ -661,8 +661,8 @@ def test_no_attachment_directory_created_when_no_attachments(monkeypatch: pytest
 
     result = run_sync(client=client, connector=connector, kb_id="kb-1", quiet=True)
 
-    assert result.dirs_created == 0
-    assert client.directory_calls == []
+    assert result.dirs_created == 1
+    assert client.directory_calls == [{"kb_id": "kb-1", "name": "tickets", "parent_id": None, "id": "dir-1"}]
     assert [upload["filename"] for upload in client.upload_calls] == ["1001.md"]
     connector.close()
 
@@ -726,7 +726,7 @@ def test_external_attachment_downloads_without_authenticated_client(monkeypatch:
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md", "1001/1001-b5eb7d-external.png"]
+    assert [entry.display_path for entry in manifest] == ["attachments/1001-b5eb7d-external.png", "tickets/1001.md"]
     assert external_calls == [{"url": "https://attachments.example/external.png", "timeout": 30.0}]
     assert all(call["path"] != "https://attachments.example/external.png" for call in connector._http.calls)
     connector.close()
@@ -775,7 +775,7 @@ def test_zendesk_attachment_redirect_is_followed(monkeypatch: pytest.MonkeyPatch
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md", "1001/1001-6bd1d2-processing.pdf"]
+    assert [entry.display_path for entry in manifest] == ["attachments/1001-6bd1d2-processing.pdf", "tickets/1001.md"]
     connector.close()
 
 
@@ -818,7 +818,7 @@ def test_missing_attachment_retries_then_skips_without_aborting_sync(monkeypatch
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     assert calls["count"] == 4
     assert sleep_calls == [30, 60, 90]
     connector.close()
@@ -858,7 +858,7 @@ def test_rate_limited_ticket_fetch_retries_with_retry_after(monkeypatch: pytest.
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     assert sleep_calls == [0.25]
     connector.close()
 
@@ -887,7 +887,7 @@ def test_inaccessible_ticket_comments_404_skips_ticket_without_aborting_sync(mon
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     connector.close()
 
 
@@ -924,7 +924,7 @@ def test_inaccessible_ticket_comments_5xx_retries_then_skips_without_aborting_sy
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     assert len(sleep_calls) == 2  # two retries before giving up
     connector.close()
 
@@ -954,7 +954,7 @@ def test_end_of_stream_true_stops_pagination_even_when_next_page_present(monkeyp
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     # Only one GET should have been made (no follow-up on next_page).
     ticket_calls = [c for c in connector._http.calls if "incremental/tickets.json" in (c["path"] or "")]
     assert len(ticket_calls) == 1
@@ -994,7 +994,7 @@ def test_stale_next_page_url_stops_pagination(monkeypatch: pytest.MonkeyPatch, t
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     # Exactly two incremental ticket fetches: initial + one follow (then stop).
     incremental_calls = [c for c in connector._http.calls if "incremental/tickets.json" in (c.get("path") or "")]
     assert len(incremental_calls) == 2
@@ -1032,7 +1032,7 @@ def test_max_tickets_per_run_stops_after_cap_and_saves_checkpoint(monkeypatch: p
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md", "1002.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md"]
     # Checkpoint reflects the max updated_at of tickets actually processed
     # (tickets 1001 and 1002). Ticket 1003 was not reached before the cap
     # fired, so the next run will resume from 1002's timestamp and re-fetch
@@ -1069,7 +1069,7 @@ def test_max_tickets_per_run_excluded_tickets_do_not_count_toward_cap(monkeypatc
     manifest = connector.build_manifest()
 
     # 1001 excluded, then 1002 and 1003 fill the 2-slot cap; 1004 never reached.
-    assert [entry.display_path for entry in manifest] == ["1002.md", "1003.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1002.md", "tickets/1003.md"]
     connector.close()
 
 
@@ -1096,7 +1096,7 @@ def test_max_tickets_per_run_zero_disables_cap(monkeypatch: pytest.MonkeyPatch, 
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md", "1002.md", "1003.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md"]
     connector.close()
 
 
@@ -1129,5 +1129,5 @@ def test_max_tickets_per_run_cap_spans_multiple_pages(monkeypatch: pytest.Monkey
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["1001.md", "1002.md", "1003.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md"]
     connector.close()
