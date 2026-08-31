@@ -71,6 +71,7 @@ class ZendeskTicketsConnector(BaseConnector):
         )
         self._file_cache: dict[tuple[str, str], Path] = {}
         self._manifest_snapshot: dict[str, Any] = {}
+        self._manifest_entries_by_key: dict[tuple[str, str], ManifestEntry] = {}
         self._pending_checkpoint: datetime | None = None
         self._run_cache_dir: Path | None = None
         self._aggressive_checkpoint = _parse_bool(os.environ.get("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "false"))
@@ -144,6 +145,7 @@ class ZendeskTicketsConnector(BaseConnector):
         manifest = [entry for entries in combined_entries_by_ticket.values() for entry in entries]
         manifest.sort(key=lambda entry: entry.display_path)
 
+        self._manifest_entries_by_key = {(entry.path, entry.filename): entry for entry in manifest}
         self._manifest_snapshot = {
             "attachments_enabled": self._download_attachments,
             "ticket_files": {
@@ -163,8 +165,42 @@ class ZendeskTicketsConnector(BaseConnector):
     def read_file(self, path: str, filename: str) -> bytes:
         content_path = self._file_cache.get((path, filename))
         if content_path is None:
+            content_path = self._restore_from_run_cache(path, filename)
+        if content_path is None:
             raise FileNotFoundError(f"Ticket file not found: {path}/{filename}" if path else f"Ticket file not found: {filename}")
         return content_path.read_bytes()
+
+    def _restore_from_run_cache(self, path: str, filename: str) -> Path | None:
+        """Fall back to a leftover .run-cache file from a prior run.
+
+        Carried-forward manifest entries never pass through _cache_entry(), so
+        _file_cache has no record of them. With aggressive checkpointing the
+        .run-cache directory persists across runs, allowing the bytes to be
+        restored here instead of failing the upload.
+        """
+        if self._run_cache_dir is None:
+            return None
+        key = f"{path}/{filename}" if path else filename
+        cache_file = self._run_cache_dir / hashlib.sha256(key.encode("utf-8")).hexdigest()
+        if not cache_file.is_file():
+            return None
+        try:
+            content = cache_file.read_bytes()
+        except OSError:
+            return None
+        if not self._matches_manifest(path, filename, content):
+            return None
+        self._file_cache[(path, filename)] = cache_file
+        return cache_file
+
+    def _matches_manifest(self, path: str, filename: str, content: bytes) -> bool:
+        expected = self._manifest_entries_by_key.get((path, filename))
+        if expected is None:
+            return False
+        return (
+            expected.size == len(content)
+            and expected.checksum == hashlib.sha256(content).hexdigest()[:16]
+        )
 
     def mark_sync_complete(self) -> None:
         if self._pending_checkpoint is not None:

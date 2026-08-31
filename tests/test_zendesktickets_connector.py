@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -414,6 +415,111 @@ def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch:
 
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md"]
     connector.close()
+
+
+def _write_prior_state(state_dir: Path, ticket_id: int, checksum: str, size: int, updated_at: str = "2024-01-01T00:00:00Z") -> None:
+    state_dir.joinpath("manifest_state.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "2024-01-01T00:00:00Z",
+                "attachments_enabled": False,
+                "ticket_files": {
+                    str(ticket_id): {
+                        "updated_at": updated_at,
+                        "entries": [
+                            {
+                                "filename": f"{ticket_id}.md",
+                                "path": "tickets",
+                                "checksum": checksum,
+                                "size": size,
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    # A prior completed run always leaves a checkpoint behind; the cache is
+    # only preserved when this file exists.
+    state_dir.joinpath("resume_checkpoint.txt").write_text("2024-01-01T00:00:00Z")
+
+
+def test_read_file_restores_carried_forward_entry_from_run_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "lazy-restore")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    content = b"# Ticket 1001\n\nPrinter down\n"
+
+    checksum = hashlib.sha256(content).hexdigest()[:16]
+    _write_prior_state(state_dir, 1001, checksum=checksum, size=len(content))
+
+    # Prior run wrote the ticket markdown into .run-cache; aggressive
+    # checkpointing preserved it after close().
+    run_cache = state_dir / ".run-cache"
+    run_cache.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(b"tickets/1001.md").hexdigest()
+    (run_cache / key).write_bytes(content)
+
+    # Current run sees only a newer ticket (1002); 1001 is carried forward
+    # from prior state without being re-downloaded.
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1002: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md"]
+    assert connector.read_file("tickets", "1001.md") == content
+    connector.close()
+
+
+def test_read_file_raises_when_run_cache_content_mismatches(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    state_dir = _make_state_dir(tmp_path, "lazy-restore-mismatch")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    stale_content = b"stale bytes that differ from manifest"
+    real_content = b"# Ticket 1001\n\nPrinter down\n"
+
+    checksum = hashlib.sha256(real_content).hexdigest()[:16]
+    _write_prior_state(state_dir, 1001, checksum=checksum, size=len(real_content))
+
+    run_cache = state_dir / ".run-cache"
+    run_cache.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(b"tickets/1001.md").hexdigest()
+    (run_cache / key).write_bytes(stale_content)  # corrupted / divergent leftover
+
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1002: []},
+    )
+
+    connector.build_manifest()
+
+    with pytest.raises(FileNotFoundError):
+        connector.read_file("tickets", "1001.md")
+    connector.close()
+
+
+def test_read_file_raises_when_run_cache_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "lazy-restore-missing-cache")
+    _write_prior_state(state_dir, 1001, checksum="deadbeefdeadbeef", size=10)
+
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1002: []},
+    )
+
+    connector.build_manifest()
+
+    with pytest.raises(FileNotFoundError):
+        connector.read_file("tickets", "1001.md")
+    connector.close()
+
 
 
 def test_include_and_exclude_tags_filter_ticket_set(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
