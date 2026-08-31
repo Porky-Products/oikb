@@ -472,6 +472,10 @@ def test_read_file_restores_carried_forward_entry_from_run_cache(monkeypatch: py
 
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md"]
     assert connector.read_file("tickets", "1001.md") == content
+    # Second read (e.g. upload retry) must hit the in-memory cache, not disk:
+    # delete the backing cache file and read again.
+    connector._run_cache_dir.joinpath(hashlib.sha256(b"tickets/1001.md").hexdigest()).unlink()
+    assert connector.read_file("tickets", "1001.md") == content
     connector.close()
 
 

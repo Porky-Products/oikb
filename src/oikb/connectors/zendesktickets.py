@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,8 @@ from urllib.parse import urlparse
 import httpx
 
 from oikb.connectors import BaseConnector, ManifestEntry
+
+log = logging.getLogger(__name__)
 
 _ZENDESK_ATTACHMENT_REDIRECT_CODES = {301, 302, 303, 307, 308}
 _ZENDESK_RATE_LIMIT_STATUS = 429
@@ -72,6 +75,7 @@ class ZendeskTicketsConnector(BaseConnector):
         self._file_cache: dict[tuple[str, str], Path] = {}
         self._manifest_snapshot: dict[str, Any] = {}
         self._manifest_entries_by_key: dict[tuple[str, str], ManifestEntry] = {}
+        self._restored_content: dict[tuple[str, str], bytes] = {}
         self._pending_checkpoint: datetime | None = None
         self._run_cache_dir: Path | None = None
         self._aggressive_checkpoint = _parse_bool(os.environ.get("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "false"))
@@ -166,6 +170,9 @@ class ZendeskTicketsConnector(BaseConnector):
         content_path = self._file_cache.get((path, filename))
         if content_path is not None:
             return content_path.read_bytes()
+        cached = self._restored_content.get((path, filename))
+        if cached is not None:
+            return cached
         content = self._restore_from_run_cache(path, filename)
         if content is None:
             raise FileNotFoundError(f"Ticket file not found: {path}/{filename}" if path else f"Ticket file not found: {filename}")
@@ -187,13 +194,22 @@ class ZendeskTicketsConnector(BaseConnector):
         key = f"{path}/{filename}" if path else filename
         cache_file = self._run_cache_dir / hashlib.sha256(key.encode("utf-8")).hexdigest()
         try:
-            if not cache_file.is_file() or cache_file.stat().st_size != expected.size:
+            if not cache_file.is_file():
                 return None
+            size = cache_file.stat().st_size
+        except OSError as e:
+            log.warning("Run-cache stat failed for %s/%s: %s", path, filename, e)
+            return None
+        if size != expected.size:
+            return None
+        try:
             content = cache_file.read_bytes()
-        except OSError:
+        except OSError as e:
+            log.warning("Run-cache read failed for %s/%s: %s", path, filename, e)
             return None
         if hashlib.sha256(content).hexdigest()[:16] != expected.checksum:
             return None
+        self._restored_content[(path, filename)] = content
         return content
 
     def mark_sync_complete(self) -> None:
