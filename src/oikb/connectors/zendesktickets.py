@@ -164,13 +164,14 @@ class ZendeskTicketsConnector(BaseConnector):
 
     def read_file(self, path: str, filename: str) -> bytes:
         content_path = self._file_cache.get((path, filename))
-        if content_path is None:
-            content_path = self._restore_from_run_cache(path, filename)
-        if content_path is None:
+        if content_path is not None:
+            return content_path.read_bytes()
+        content = self._restore_from_run_cache(path, filename)
+        if content is None:
             raise FileNotFoundError(f"Ticket file not found: {path}/{filename}" if path else f"Ticket file not found: {filename}")
-        return content_path.read_bytes()
+        return content
 
-    def _restore_from_run_cache(self, path: str, filename: str) -> Path | None:
+    def _restore_from_run_cache(self, path: str, filename: str) -> bytes | None:
         """Fall back to a leftover .run-cache file from a prior run.
 
         Carried-forward manifest entries never pass through _cache_entry(), so
@@ -190,8 +191,7 @@ class ZendeskTicketsConnector(BaseConnector):
             return None
         if not self._matches_manifest(path, filename, content):
             return None
-        self._file_cache[(path, filename)] = cache_file
-        return cache_file
+        return content
 
     def _matches_manifest(self, path: str, filename: str, content: bytes) -> bool:
         expected = self._manifest_entries_by_key.get((path, filename))

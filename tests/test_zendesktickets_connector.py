@@ -478,7 +478,7 @@ def test_read_file_restores_carried_forward_entry_from_run_cache(monkeypatch: py
 def test_read_file_raises_when_run_cache_content_mismatches(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     state_dir = _make_state_dir(tmp_path, "lazy-restore-mismatch")
     monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
-    stale_content = b"stale bytes that differ from manifest"
+    stale_content = b"# Ticket 1001\n\nPrinter jam \n"  # same length as real_content, different bytes
     real_content = b"# Ticket 1001\n\nPrinter down\n"
 
     checksum = hashlib.sha256(real_content).hexdigest()[:16]
