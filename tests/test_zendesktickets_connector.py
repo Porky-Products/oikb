@@ -503,6 +503,34 @@ def test_read_file_raises_when_run_cache_content_mismatches(monkeypatch: pytest.
     connector.close()
 
 
+def test_read_file_rejects_wrong_size_cache_file_without_reading(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    state_dir = _make_state_dir(tmp_path, "lazy-restore-oversized")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    real_content = b"# Ticket 1001\n\nPrinter down\n"
+    checksum = hashlib.sha256(real_content).hexdigest()[:16]
+    _write_prior_state(state_dir, 1001, checksum=checksum, size=len(real_content))
+
+    run_cache = state_dir / ".run-cache"
+    run_cache.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(b"tickets/1001.md").hexdigest()
+    # Oversized leftover (e.g. truncated write or a different entry's bytes).
+    oversized = real_content + b"x" * 1024
+    (run_cache / key).write_bytes(oversized)
+
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1002: []},
+    )
+
+    connector.build_manifest()
+
+    with pytest.raises(FileNotFoundError):
+        connector.read_file("tickets", "1001.md")
+    connector.close()
+
+
 def test_read_file_raises_when_run_cache_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "lazy-restore-missing-cache")
     _write_prior_state(state_dir, 1001, checksum="deadbeefdeadbeef", size=10)

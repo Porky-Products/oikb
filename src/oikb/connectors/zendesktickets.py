@@ -181,26 +181,20 @@ class ZendeskTicketsConnector(BaseConnector):
         """
         if self._run_cache_dir is None:
             return None
+        expected = self._manifest_entries_by_key.get((path, filename))
+        if expected is None:
+            return None
         key = f"{path}/{filename}" if path else filename
         cache_file = self._run_cache_dir / hashlib.sha256(key.encode("utf-8")).hexdigest()
-        if not cache_file.is_file():
-            return None
         try:
+            if not cache_file.is_file() or cache_file.stat().st_size != expected.size:
+                return None
             content = cache_file.read_bytes()
         except OSError:
             return None
-        if not self._matches_manifest(path, filename, content):
+        if hashlib.sha256(content).hexdigest()[:16] != expected.checksum:
             return None
         return content
-
-    def _matches_manifest(self, path: str, filename: str, content: bytes) -> bool:
-        expected = self._manifest_entries_by_key.get((path, filename))
-        if expected is None:
-            return False
-        return (
-            expected.size == len(content)
-            and expected.checksum == hashlib.sha256(content).hexdigest()[:16]
-        )
 
     def mark_sync_complete(self) -> None:
         if self._pending_checkpoint is not None:
