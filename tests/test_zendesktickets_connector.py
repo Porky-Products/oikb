@@ -1142,15 +1142,21 @@ def test_stale_next_page_url_stops_pagination(monkeypatch: pytest.MonkeyPatch, t
 # ── MAX_TICKETS_PER_RUN tests ──────────────────────────────────────────────
 
 def test_max_tickets_per_run_stops_after_cap_and_saves_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """build_manifest stops after ZENDESKTICKET_MAX_TICKETS_PER_RUN included tickets.
+    """ZENDESKTICKET_MAX_TICKETS_PER_RUN caps tickets per run, page-granular.
 
     Excluded tickets (tag/status filtered) do not count toward the cap.
-    The checkpoint must reflect the last ticket seen in the truncated run so
-    the next run resumes from the right place.
+    When the cap fires mid-page the connector finishes the current page —
+    the checkpoint is the page's end_time (Zendesk's own forward cursor,
+    = generated_timestamp of the page's last item), so stopping mid-page
+    would risk gaps (start_time is compared against generated_timestamp,
+    not updated_at) and overshoot is bounded by per_page - 1. The next run
+    resumes from end_time; same-timestamp duplicates at the boundary are
+    re-served by design.
     """
     state_dir = _make_state_dir(tmp_path, "max-tickets-cap")
     monkeypatch.setenv("ZENDESKTICKET_MAX_TICKETS_PER_RUN", "2")
-    # Three tickets on one page; cap of 2 should stop after the second included ticket.
+    # Three tickets on one page; cap of 2 fires on the second included ticket
+    # but the page is finished, so 1003 is also processed this run.
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -1161,6 +1167,8 @@ def test_max_tickets_per_run_stops_after_cap_and_saves_checkpoint(monkeypatch: p
                     _ticket(1002, "2024-01-02T02:00:00Z"),
                     _ticket(1003, "2024-01-02T03:00:00Z"),
                 ],
+                # end_time is generated_timestamp of the last page item.
+                "end_time": 1704164400,  # 2024-01-02T03:00:00Z
                 "next_page": None,
             }
         ],
@@ -1170,14 +1178,11 @@ def test_max_tickets_per_run_stops_after_cap_and_saves_checkpoint(monkeypatch: p
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md"]
-    # Checkpoint reflects the max updated_at of tickets actually processed
-    # (tickets 1001 and 1002). Ticket 1003 was not reached before the cap
-    # fired, so the next run will resume from 1002's timestamp and re-fetch
-    # from that point — ensuring 1003 is not skipped.
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md"]
+    # Checkpoint is the page's end_time — Zendesk's own resume cursor.
     connector.mark_sync_complete()
     checkpoint_text = (state_dir / "resume_checkpoint.txt").read_text().strip()
-    assert checkpoint_text == "2024-01-02T02:00:00Z"
+    assert checkpoint_text == "2024-01-02T03:00:00Z"
     connector.close()
 
 
@@ -1206,8 +1211,87 @@ def test_max_tickets_per_run_excluded_tickets_do_not_count_toward_cap(monkeypatc
 
     manifest = connector.build_manifest()
 
-    # 1001 excluded, then 1002 and 1003 fill the 2-slot cap; 1004 never reached.
-    assert [entry.display_path for entry in manifest] == ["tickets/1002.md", "tickets/1003.md"]
+    # 1001 excluded (does not consume a cap slot), then 1002 and 1003 fill
+    # the 2-slot cap; the page is finished so 1004 is also processed.
+    assert [entry.display_path for entry in manifest] == ["tickets/1002.md", "tickets/1003.md", "tickets/1004.md"]
+    connector.close()
+
+
+def test_max_tickets_per_run_cap_on_out_of_order_page_does_not_stall_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A cap firing on an out-of-order page must not stall or regress the checkpoint.
+
+    Live Zendesk data shows overlapping, non-monotonic incremental updated_at
+    values: a later page's max updated_at can be earlier than an earlier
+    page's — or equal to the incoming checkpoint. The checkpoint uses the
+    page's end_time (Zendesk generated_timestamp cursor) when present and
+    otherwise accumulates the max updated_at across pages, so it always makes
+    forward progress even when pages arrive out of updated_at order.
+    """
+    state_dir = _make_state_dir(tmp_path, "max-tickets-out-of-order")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T02:00:00Z")
+    next_page_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=2&start_time=1000"
+    # end_time epochs: page 1 -> 2024-01-02T03:10:00Z (1704165000) after its
+    # final ticket (1002, generated at 03:10), page 2 -> earlier — later page
+    # has EARLIER end_time, mirroring out-of-order observed live behavior.
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                # Page 1 max updated_at (04:00) is later than page 2 max (02:00).
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:00:00Z"),
+                    _ticket(1002, "2024-01-02T04:00:00Z"),
+                ],
+                "end_time": 1704165000,
+                "next_page": next_page_url,
+            },
+            {
+                # Page 2 max updated_at equals the incoming checkpoint — the
+                # exact fixed-point pattern observed in production. No
+                # end_time here exercises the accumulated-max fallback.
+                "tickets": [
+                    _ticket(1003, "2024-01-02T01:00:00Z"),
+                    _ticket(1004, "2024-01-02T02:00:00Z"),
+                ],
+                "next_page": None,
+            },
+        ],
+        comments={1001: [], 1002: [], 1003: [], 1004: []},
+    )
+    connector._max_tickets_per_run = 3
+
+    manifest = connector.build_manifest()
+
+    # Cap fires on page 2 after 1003, but the page is finished so 1004 is
+    # also processed; the checkpoint keeps the max (page 1's end_time).
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md", "tickets/1004.md"]
+    assert connector._pending_checkpoint is not None and connector._pending_checkpoint.strftime("%Y-%m-%dT%H:%M:%SZ") == "2024-01-02T03:10:00Z"
+    connector.mark_sync_complete()
+    assert checkpoint_path.read_text().strip() == "2024-01-02T03:10:00Z"
+    connector.close()
+
+
+def test_save_checkpoint_never_regresses_existing_value(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """_save_checkpoint must refuse to persist a value older than the existing one."""
+    state_dir = _make_state_dir(tmp_path, "checkpoint-no-regress")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+    )
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T04:00:00Z")
+
+    from datetime import UTC, datetime
+
+    connector._save_checkpoint(datetime(2024, 1, 2, 3, 0, 0, tzinfo=UTC))
+    assert checkpoint_path.read_text().strip() == "2024-01-02T04:00:00Z"
+
+    newer = datetime(2024, 1, 2, 5, 0, 0, tzinfo=UTC)
+    connector._save_checkpoint(newer)
+    assert checkpoint_path.read_text().strip() == "2024-01-02T05:00:00Z"
     connector.close()
 
 
@@ -1239,7 +1323,12 @@ def test_max_tickets_per_run_zero_disables_cap(monkeypatch: pytest.MonkeyPatch, 
 
 
 def test_max_tickets_per_run_cap_spans_multiple_pages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """Cap is enforced across page boundaries, not just within a single page."""
+    """Cap is enforced across page boundaries; current page finishes after cap fires.
+
+    The cap fires on 1003 (3rd ticket) mid-page-2; per the page-granular cap
+    rule the rest of the page (1004) is still processed so the checkpoint can
+    safely be that page's end_time.
+    """
     state_dir = _make_state_dir(tmp_path, "max-tickets-multipage")
     next_page_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=2&start_time=1000"
     connector = _build_connector(
@@ -1267,5 +1356,5 @@ def test_max_tickets_per_run_cap_spans_multiple_pages(monkeypatch: pytest.Monkey
 
     manifest = connector.build_manifest()
 
-    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md"]
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md", "tickets/1004.md"]
     connector.close()
