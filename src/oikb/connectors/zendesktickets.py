@@ -97,9 +97,9 @@ class ZendeskTicketsConnector(BaseConnector):
         tickets_processed = 0
         cap_reached = False
 
-        for page in self._iter_ticket_pages(checkpoint):
+        for page_tickets, page_end_time in self._iter_ticket_pages(checkpoint):
             page_max_updated_at: datetime | None = None
-            for ticket in page:
+            for ticket in page_tickets:
                 ticket_id = str(ticket["id"])
                 updated_at = self._parse_dt(ticket["updated_at"])
                 page_max_updated_at = updated_at if page_max_updated_at is None else max(page_max_updated_at, updated_at)
@@ -119,11 +119,31 @@ class ZendeskTicketsConnector(BaseConnector):
                 tickets_processed += 1
 
                 if self._max_tickets_per_run is not None and tickets_processed >= self._max_tickets_per_run:
+                    # Finish the current page before stopping: the checkpoint
+                    # for a capped run is the page's end_time (Zendesk's own
+                    # cursor). Stopping mid-page would either reuse this
+                    # page's end_time and re-serve the unprocessed remainder
+                    # of the page or skip it, and any updated_at-derived
+                    # value can jump past tickets that still need processing
+                    # (Zendesk compares start_time against
+                    # generated_timestamp, not updated_at). Overshoot is
+                    # bounded by per_page - 1 tickets.
                     cap_reached = True
-                    break
 
-            if page_max_updated_at is not None:
-                pending_checkpoint = page_max_updated_at
+            # Zendesk's documented resume strategy for time-based exports is
+            # to use the returned end_time (the next_page URL start_time) as
+            # the next export's start_time. end_time is the generated_timestamp
+            # of the last item on the page — the API's own forward cursor —
+            # and results are ordered by generated_timestamp, so it is
+            # gap-free AND stall-free even when pages carry out-of-order
+            # updated_at values (updated_at reflects ticket events only, while
+            # generated_timestamp reflects all updates). Fall back to the
+            # page's max updated_at only when the payload lacks end_time.
+            run_cursor = page_end_time or page_max_updated_at
+            if run_cursor is not None and (
+                pending_checkpoint is None or run_cursor > pending_checkpoint
+            ):
+                pending_checkpoint = run_cursor
                 if self._aggressive_checkpoint:
                     self._save_checkpoint(pending_checkpoint)
 
@@ -164,6 +184,35 @@ class ZendeskTicketsConnector(BaseConnector):
             },
         }
         self._pending_checkpoint = pending_checkpoint
+        checkpoint_advanced = pending_checkpoint > checkpoint
+        log.info(
+            "ZendeskTicketsConnector.run_summary: checkpoint_in=%s checkpoint_out=%s advanced=%s "
+            "tickets_seen=%d tickets_processed=%d cap_reached=%s manifest_entries=%d "
+            "carried_forward_tickets=%d new_tickets=%d",
+            self._format_dt(checkpoint),
+            self._format_dt(pending_checkpoint) if pending_checkpoint is not None else "none",
+            checkpoint_advanced,
+            len(seen_ticket_ids),
+            tickets_processed,
+            cap_reached,
+            len(manifest),
+            len(carried_forward),
+            len(current_entries_by_ticket),
+        )
+        if not checkpoint_advanced and pending_checkpoint is not None:
+            # Every ticket on the earliest incremental page shares the same
+            # updated_at (e.g. bulk import) and the run cap stopped inside that
+            # second — an inclusive >= boundary would refetch them forever.
+            log.warning(
+                "ZendeskTicketsConnector.checkpoint_stalled: checkpoint did not advance "
+                "(in=%s out=%s seen=%d processed=%d cap=%s) — check for duplicate "
+                "updated_at values at the inclusive start_time boundary",
+                self._format_dt(checkpoint),
+                self._format_dt(pending_checkpoint),
+                len(seen_ticket_ids),
+                tickets_processed,
+                cap_reached,
+            )
         return manifest
 
     def read_file(self, path: str, filename: str) -> bytes:
@@ -213,6 +262,11 @@ class ZendeskTicketsConnector(BaseConnector):
         return content
 
     def mark_sync_complete(self) -> None:
+        log.info(
+            "ZendeskTicketsConnector.mark_sync_complete: saving checkpoint=%s state_tickets=%d",
+            self._format_dt(self._pending_checkpoint) if self._pending_checkpoint is not None else "none",
+            len(self._manifest_snapshot.get("ticket_files") or {}),
+        )
         if self._pending_checkpoint is not None:
             self._save_checkpoint(self._pending_checkpoint)
         self._save_state(self._manifest_snapshot)
@@ -265,9 +319,10 @@ class ZendeskTicketsConnector(BaseConnector):
             size=len(content),
         )
 
-    def _iter_ticket_pages(self, checkpoint: datetime) -> Iterator[list[dict[str, Any]]]:
+    def _iter_ticket_pages(self, checkpoint: datetime) -> Iterator[tuple[list[dict[str, Any]], datetime | None]]:
         next_page: str | None = None
         seen_page_urls: set[str] = set()
+        page_count = 0
         while True:
             if next_page:
                 response = self._zendesk_get(next_page)
@@ -282,7 +337,33 @@ class ZendeskTicketsConnector(BaseConnector):
             response.raise_for_status()
             payload = response.json()
             tickets = payload.get("tickets", [])
-            yield tickets
+            page_count += 1
+            page_max = max(
+                (self._parse_dt(t["updated_at"]) for t in tickets if t.get("updated_at")),
+                default=None,
+            )
+            log.info(
+                "ZendeskTicketsConnector.page: page=%d tickets=%d page_max_updated_at=%s end_of_stream=%s end_time=%s",
+                page_count,
+                len(tickets),
+                self._format_dt(page_max) if page_max else "none",
+                bool(payload.get("end_of_stream")),
+                payload.get("end_time", "none"),
+            )
+            end_time_value = payload.get("end_time")
+            if end_time_value is None:
+                end_time = None
+            else:
+                # Zendesk returns end_time as an epoch-seconds integer.
+                try:
+                    end_time = datetime.fromtimestamp(int(end_time_value), tz=UTC)
+                except (TypeError, ValueError):
+                    log.warning(
+                        "ZendeskTicketsConnector.bad_end_time: value=%s",
+                        end_time_value,
+                    )
+                    end_time = None
+            yield tickets, end_time
 
             # Zendesk incremental API signals "caught up" via end_of_stream.
             # Always check this before following next_page — when end_of_stream
@@ -462,8 +543,21 @@ class ZendeskTicketsConnector(BaseConnector):
 
     def _save_checkpoint(self, value: datetime) -> None:
         path = self._checkpoint_path()
+        # Guard against checkpoint regression: Zendesk pages can arrive out of
+        # updated_at order, so never persist a value older than what is on
+        # disk. Otherwise a buggy or unlucky run would rewind the resume point.
+        if path.exists():
+            existing = self._parse_dt(path.read_text().strip())
+            if value <= existing:
+                log.info(
+                    "ZendeskTicketsConnector.checkpoint_not_saved: incoming=%s existing=%s (no advance)",
+                    self._format_dt(value),
+                    self._format_dt(existing),
+                )
+                return
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self._format_dt(value))
+        log.info("ZendeskTicketsConnector.checkpoint_saved: path=%s value=%s", path, self._format_dt(value))
 
     def _load_state(self) -> dict[str, Any]:
         path = self._state_path()
