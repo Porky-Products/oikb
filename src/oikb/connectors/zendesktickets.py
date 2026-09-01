@@ -96,6 +96,7 @@ class ZendeskTicketsConnector(BaseConnector):
         seen_ticket_ids: set[str] = set()
         tickets_processed = 0
         cap_reached = False
+        page_end_time_seen = False
 
         for page_tickets, page_end_time in self._iter_ticket_pages(checkpoint):
             page_max_updated_at: datetime | None = None
@@ -137,15 +138,36 @@ class ZendeskTicketsConnector(BaseConnector):
             # and results are ordered by generated_timestamp, so it is
             # gap-free AND stall-free even when pages carry out-of-order
             # updated_at values (updated_at reflects ticket events only, while
-            # generated_timestamp reflects all updates). Fall back to the
-            # page's max updated_at only when the payload lacks end_time.
-            run_cursor = page_end_time or page_max_updated_at
-            if run_cursor is not None and (
-                pending_checkpoint is None or run_cursor > pending_checkpoint
-            ):
-                pending_checkpoint = run_cursor
-                if self._aggressive_checkpoint:
-                    self._save_checkpoint(pending_checkpoint)
+            # generated_timestamp reflects all updates).
+            #
+            # Pages WITH end_time never fall back to updated_at: a self-built
+            # updated_at value could exceed Zendesk's cursor (updated_at does
+            # not bound generated_timestamp) and the no-regress guard would
+            # then lock the checkpoint past records that were never served —
+            # the exact gap mode this change eliminates. When some pages
+            # carry end_time, their cursor wins; a later page with only
+            # updated_at cannot regress the pending checkpoint beyond the
+            # retained max. The updated_at fallback exists solely for
+            # legacy/degraded payloads that lack end_time entirely, where
+            # stalling would be worse than the (unchanged) pre-existing risk.
+            if page_end_time is not None:
+                page_end_time_seen = True
+                if pending_checkpoint is None or page_end_time > pending_checkpoint:
+                    pending_checkpoint = page_end_time
+                    if self._aggressive_checkpoint:
+                        self._save_checkpoint(page_end_time)
+            elif page_max_updated_at is not None:
+                if pending_checkpoint is None or (
+                    not page_end_time_seen and page_max_updated_at > pending_checkpoint
+                ):
+                    # No end_time observed yet this run: retain
+                    # max-updated_at so out-of-order legacy pages cannot
+                    # stall the checkpoint.
+                    pending_checkpoint = page_max_updated_at
+                    if self._aggressive_checkpoint:
+                        self._save_checkpoint(page_max_updated_at)
+                # else: an end_time-cursor checkpoint is already ahead; a
+                # legacy updated_at value must NOT advance or regress it.
 
             if cap_reached:
                 break
@@ -199,19 +221,19 @@ class ZendeskTicketsConnector(BaseConnector):
             len(carried_forward),
             len(current_entries_by_ticket),
         )
-        if not checkpoint_advanced and pending_checkpoint is not None:
-            # Every ticket on the earliest incremental page shares the same
-            # updated_at (e.g. bulk import) and the run cap stopped inside that
-            # second — an inclusive >= boundary would refetch them forever.
+        if cap_reached and pending_checkpoint is not None and pending_checkpoint == checkpoint:
+            # The run cap stopped inside the very page the run started on and
+            # even its end_time did not move the cursor — every ticket
+            # including the boundary shares one generated_timestamp (bulk
+            # import). An inclusive >= boundary would refetch them forever.
             log.warning(
-                "ZendeskTicketsConnector.checkpoint_stalled: checkpoint did not advance "
-                "(in=%s out=%s seen=%d processed=%d cap=%s) — check for duplicate "
-                "updated_at values at the inclusive start_time boundary",
+                "ZendeskTicketsConnector.checkpoint_stalled: cap reached without advancing checkpoint "
+                "(in=%s out=%s seen=%d processed=%d) — check for duplicate "
+                "generated_timestamp values at the inclusive start_time boundary",
                 self._format_dt(checkpoint),
                 self._format_dt(pending_checkpoint),
                 len(seen_ticket_ids),
                 tickets_processed,
-                cap_reached,
             )
         return manifest
 
