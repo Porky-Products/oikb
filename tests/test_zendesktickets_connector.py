@@ -1273,6 +1273,51 @@ def test_max_tickets_per_run_cap_on_out_of_order_page_does_not_stall_checkpoint(
     connector.close()
 
 
+def test_legacy_page_updated_at_does_not_advance_past_end_time_cursor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A page without end_time must not push the checkpoint beyond an established end_time cursor.
+
+    updated_at does not bound generated_timestamp: a legacy/degraded page
+    whose max updated_at exceeds Zendesk's own end_time cursor could otherwise
+    advance the checkpoint past records that were never served, and the
+    no-regress guard would lock it in — the data-loss mode this change
+    eliminates. Pages WITH end_time never fall back to updated_at; the
+    updated_at fallback only applies before any end_time is observed.
+    """
+    state_dir = _make_state_dir(tmp_path, "legacy-page-no-override")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T02:00:00Z")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:00:00Z"),
+                ],
+                "end_time": 1704164400,  # 2024-01-02T03:00:00Z
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=1&start_time=1704164400",
+            },
+            {
+                # Legacy payload: no end_time, but max updated_at (05:00)
+                # beyond the end_time cursor (03:00).
+                "tickets": [
+                    _ticket(1002, "2024-01-02T04:00:00Z"),
+                    _ticket(1003, "2024-01-02T05:00:00Z"),
+                ],
+                "next_page": None,
+            },
+        ],
+        comments={1001: [], 1002: [], 1003: []},
+    )
+
+    connector.build_manifest()
+
+    assert connector._pending_checkpoint is not None and connector._pending_checkpoint.strftime("%Y-%m-%dT%H:%M:%SZ") == "2024-01-02T03:00:00Z"
+    connector.mark_sync_complete()
+    assert checkpoint_path.read_text().strip() == "2024-01-02T03:00:00Z"
+    connector.close()
+
+
 def test_save_checkpoint_never_regresses_existing_value(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """_save_checkpoint must refuse to persist a value older than the existing one."""
     state_dir = _make_state_dir(tmp_path, "checkpoint-no-regress")
