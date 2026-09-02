@@ -408,6 +408,60 @@ def test_state_write_is_atomic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     assert not (state_dir / "manifest_state.json.tmp").exists()
 
 
+def test_aggressive_first_end_time_state_save_stamps_run_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """First end_time page's state save must not stamp the updated_at fallback.
+
+    With no resume file, the state file holds the only durable checkpoint. A
+    legacy page (no end_time) raises pending to its updated_at — which can sit
+    beyond Zendesk's authoritative cursor. If the first end_time page's
+    aggressive state save stamped that fallback and the process died before
+    _save_checkpoint wrote the real cursor, the next run would resume from the
+    beyond-cursor fallback and permanently skip unserved records.
+    """
+    state_dir = _make_state_dir(tmp_path, "first-end-time-run-start")
+    resume_path = state_dir / "resume_checkpoint.txt"
+    state = {
+        "checkpoint": "2024-01-02T02:00:00Z",
+        "ticket_files": {},
+        "seen_ticket_ids": [],
+        "excluded_ticket_ids": [],
+        "attachments_enabled": False,
+    }
+    (state_dir / "manifest_state.json").write_text(json.dumps(state))
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            # Legacy page with no end_time: fallback pending = 05:05:05Z.
+            {
+                "tickets": [_ticket(1001, "2024-01-02T05:05:05Z")],
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?start_time=1704164645",
+            },
+            # First end_time page: 03:04:05Z — authoritative, below fallback.
+            {
+                "tickets": [_ticket(1002, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": None,
+            },
+        ],
+        comments={1001: [], 1002: []},
+    )
+
+    connector.build_manifest()
+
+    # Mid-run state (as of page 2's boundary) must carry the run-start
+    # checkpoint, not the 05:05:05Z updated_at fallback.
+    saved_state = json.loads((state_dir / "manifest_state.json").read_text())
+    assert saved_state["checkpoint"] == "2024-01-02T02:00:00Z"
+    assert "1002" in saved_state["ticket_files"]
+    resume_path_value = resume_path.read_text().strip()
+    assert resume_path_value == "2024-01-02T03:04:05Z"
+    connector.close()
+
+
 def test_sync_failure_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "checkpoint-on-success")
     connector = _build_connector(

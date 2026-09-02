@@ -169,6 +169,20 @@ class ZendeskTicketsConnector(BaseConnector):
                     # tolerance for non-advancing end_time keeps the cursor:
                     # those pages' entries are otherwise memory-only, and a
                     # crash would resume past them permanently.
+                    #
+                    # Checkpoint stamping: before the first authoritative
+                    # end_time is persisted, pending may still carry an
+                    # unsafe updated_at fallback raised by a legacy page.
+                    # With no resume file yet, the state file is the only
+                    # durable checkpoint — stamping the fallback there, then
+                    # crashing before _save_checkpoint writes the real
+                    # cursor, would make the next run resume from the
+                    # beyond-cursor fallback and permanently skip records.
+                    # So the first end_time page stamps run-start; once the
+                    # authoritative cursor is persisted, later pages stamp
+                    # the pending value (a clamped end_time that can never
+                    # lead the persisted cursor).
+                    stamp = checkpoint if not page_end_time_seen else self._pending_checkpoint_after(checkpoint, pending_checkpoint)
                     self._save_state(
                         self._build_midrun_state(
                             prior_entries,
@@ -179,7 +193,7 @@ class ZendeskTicketsConnector(BaseConnector):
                             current_entries_by_ticket,
                             current_updated_at_by_ticket,
                         ),
-                        checkpoint=self._pending_checkpoint_after(checkpoint, pending_checkpoint),
+                        checkpoint=stamp,
                     )
                 if not page_end_time_seen or page_end_time > pending_checkpoint:
                     if self._aggressive_checkpoint:
