@@ -376,15 +376,20 @@ class ZendeskTicketsConnector(BaseConnector):
             if end_time_value is None:
                 end_time = None
             else:
-                # Zendesk returns end_time as an epoch-seconds integer.
+                # Zendesk returns end_time as an epoch-seconds integer. A
+                # present-but-malformed value is a contract violation: the
+                # cursor is the only safe resume point, so fail the run
+                # rather than silently falling back to updated_at (which does
+                # not bound generated_timestamp and could skip records).
+                # The prior checkpoint stands and this page re-serves next
+                # run — duplicates are safe, skips are not. An ABSENT
+                # end_time (legacy/degraded payload) still falls back.
                 try:
                     end_time = datetime.fromtimestamp(int(end_time_value), tz=UTC)
-                except (TypeError, ValueError):
-                    log.warning(
-                        "ZendeskTicketsConnector.bad_end_time: value=%s",
-                        end_time_value,
-                    )
-                    end_time = None
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"ZendeskTicketsConnector: malformed end_time in Zendesk payload: {end_time_value!r}"
+                    ) from exc
             yield tickets, end_time
 
             # Zendesk incremental API signals "caught up" via end_of_stream.
