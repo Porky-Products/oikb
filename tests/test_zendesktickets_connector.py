@@ -47,7 +47,7 @@ class FakeHTTPClient:
 
     def get(self, path: str, params: dict | None = None) -> FakeResponse:
         self.calls.append({"path": path, "params": params})
-        if path == "/incremental/tickets/cursor.json":
+        if path == "/incremental/tickets.json" or "/incremental/tickets.json" in path:
             if not self._ticket_pages:
                 raise AssertionError("No more ticket pages configured")
             return FakeResponse(self._ticket_pages.pop(0))
@@ -215,7 +215,13 @@ def test_build_manifest_uses_min_datetime_when_checkpoint_missing(monkeypatch: p
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z", tags=["ops"])], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z", tags=["ops"])],
+                "end_time": 1704164645,
+                "next_page": None,
+            }
+        ],
         comments={1001: []},
     )
 
@@ -231,7 +237,13 @@ def test_build_manifest_renders_comments_and_persists_state_after_success(monkey
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z", tags=["ops"])], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z", tags=["ops"])],
+                "end_time": 1704164645,
+                "next_page": None,
+            }
+        ],
         comments={1001: [_comment(501, "Investigating the printer queue.")]},
     )
 
@@ -243,7 +255,7 @@ def test_build_manifest_renders_comments_and_persists_state_after_success(monkey
     assert "Investigating the printer queue." in text
     assert "Updated at: 2024-01-02T03:04:05Z" in text
     connector.mark_sync_complete()
-    assert (state_dir / "resume_cursor.txt").read_text().strip() == "cursor-1"
+    assert (state_dir / "resume_checkpoint.txt").read_text().strip() == "2024-01-02T03:04:05Z"
     connector.close()
 
 
@@ -258,7 +270,6 @@ def test_aggressive_checkpoint_saves_state_before_cursor(monkeypatch: pytest.Mon
     state_dir = _make_state_dir(tmp_path, "aggressive-state-before-cursor")
     checkpoint_path = state_dir / "resume_checkpoint.txt"
     checkpoint_path.write_text("2024-01-02T02:00:00Z")
-    cursor_path = state_dir / "resume_cursor.txt"
     monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
     connector = _build_connector(
         monkeypatch,
@@ -266,13 +277,13 @@ def test_aggressive_checkpoint_saves_state_before_cursor(monkeypatch: pytest.Mon
         pages=[
             {
                 "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
-                "end_of_stream": False,
-                "after_cursor": "cursor-A",
+                "end_time": 1704164645,
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?start_time=1704164645",
             },
             {
                 "tickets": [_ticket(1002, "2024-01-02T04:04:05Z")],
-                "end_of_stream": True,
-                "after_cursor": "cursor-B",
+                "end_time": 1704168245,
+                "next_page": None,
             },
         ],
         comments={1001: [], 1002: []},
@@ -281,29 +292,24 @@ def test_aggressive_checkpoint_saves_state_before_cursor(monkeypatch: pytest.Mon
     connector.build_manifest()
 
     # Simulate sync failure: entries for 1001 (page-1 boundary) must already be
-    # in manifest_state.json alongside the page-1 cursor.
+    # in manifest_state.json alongside the advanced checkpoint.
     saved_state = json.loads((state_dir / "manifest_state.json").read_text())
     assert "1001" in saved_state["ticket_files"]
-    assert saved_state["cursor"] == "cursor-B"
-    assert cursor_path.read_text().strip() == "cursor-B"
-    # The legacy datetime checkpoint is a bootstrap input only: never rewritten.
-    assert checkpoint_path.read_text().strip() == "2024-01-02T02:00:00Z"
+    assert checkpoint_path.read_text().strip() == "2024-01-02T04:04:05Z"
     connector.close()
 
 
-def test_aggressive_state_saved_on_non_advancing_cursor_page(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """A page whose after_cursor matches the previous page still saves state.
+def test_aggressive_state_saved_on_non_advancing_end_time_page(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Later pages whose end_time does not advance the cursor still save state.
 
-    Zendesk can re-serve the same opaque cursor on consecutive pages (e.g.
-    heavy update bursts around a boundary). The duplicate-cursor guard stops
-    pagination, but that page's manifest entries must still reach
+    The max-compare tolerance retains the cursor when a page reports an equal
+    or lower end_time, but that page's manifest entries must still reach
     manifest_state.json — otherwise a sync failure resumes past records that
     exist only in memory.
     """
     state_dir = _make_state_dir(tmp_path, "aggressive-non-advancing")
     checkpoint_path = state_dir / "resume_checkpoint.txt"
     checkpoint_path.write_text("2024-01-02T02:00:00Z")
-    cursor_path = state_dir / "resume_cursor.txt"
     monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
     connector = _build_connector(
         monkeypatch,
@@ -311,13 +317,13 @@ def test_aggressive_state_saved_on_non_advancing_cursor_page(monkeypatch: pytest
         pages=[
             {
                 "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
-                "end_of_stream": False,
-                "after_cursor": "cursor-A",
+                "end_time": 1704168245,
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?start_time=1704168245",
             },
             {
                 "tickets": [_ticket(1002, "2024-01-02T04:04:05Z")],
-                "end_of_stream": False,
-                "after_cursor": "cursor-A",
+                "end_time": 1704168245,
+                "next_page": None,
             },
         ],
         comments={1001: [], 1002: []},
@@ -325,31 +331,26 @@ def test_aggressive_state_saved_on_non_advancing_cursor_page(monkeypatch: pytest
 
     connector.build_manifest()
 
-    # Duplicate-cursor guard stopped pagination after page 2, but page 2's
-    # ticket 1002 must still be persisted, and the persisted cursor matched.
+    # Simulate sync failure: page 2's end_time (1704168245 = 04:04:05Z) did not
+    # advance the cursor, but its ticket 1002 must still be persisted.
     saved_state = json.loads((state_dir / "manifest_state.json").read_text())
     assert "1002" in saved_state["ticket_files"]
-    assert saved_state["cursor"] == "cursor-A"
-    assert cursor_path.read_text().strip() == "cursor-A"
-    # At-least-once semantic: the duplicate page is re-served next run and
-    # deduplicated by checksum — the guard only prevents an infinite loop.
-    assert checkpoint_path.read_text().strip() == "2024-01-02T02:00:00Z"
+    checkpoint_path_value = checkpoint_path.read_text().strip()
+    assert checkpoint_path_value == "2024-01-02T04:04:05Z"
     connector.close()
 
 
-def test_missing_after_cursor_on_end_of_stream_page_tolerated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """An absent after_cursor on an end_of_stream page must not fail the run.
+def test_first_end_time_below_run_start_does_not_rewind_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A first end_time at/below the run-start checkpoint must not rewind it.
 
-    Zendesk marks the final page with end_of_stream=true; its after_cursor has
-    no resume role. Some payloads omit it on the last page. Absence combined
-    with end_of_stream=true is therefore tolerated: the run completes, but no
-    cursor file is written (there is nothing to resume from). The legacy
-    datetime checkpoint file is never rewritten either — it is a bootstrap
-    input only.
+    The inclusive >= start_time boundary can serve a page whose end_time
+    equals (or, for a stale state-file checkpoint, sits below) run start.
+    Assigning it unconditionally would let mark_sync_complete persist an
+    older cursor once the file exists — rewinding the next export.
     """
-    state_dir = _make_state_dir(tmp_path, "end-of-stream-no-cursor")
+    state_dir = _make_state_dir(tmp_path, "end-time-below-run-start")
     checkpoint_path = state_dir / "resume_checkpoint.txt"
-    cursor_path = state_dir / "resume_cursor.txt"
+    # 2024-01-02T03:00:00Z run start; page reports 02:00:00Z end_time.
     checkpoint_path.write_text("2024-01-02T03:00:00Z")
     connector = _build_connector(
         monkeypatch,
@@ -357,18 +358,51 @@ def test_missing_after_cursor_on_end_of_stream_page_tolerated(monkeypatch: pytes
         pages=[
             {
                 "tickets": [_ticket(1001, "2024-01-02T02:30:00Z")],
-                "end_of_stream": True,
+                "end_time": 1704160800,
+                "next_page": None,
             },
         ],
         comments={1001: []},
     )
 
-    manifest = [entry.display_path for entry in connector.build_manifest()]
-    assert manifest == ["tickets/1001.md"]
+    connector.build_manifest()
     connector.mark_sync_complete()
 
-    assert not cursor_path.exists()
     assert checkpoint_path.read_text().strip() == "2024-01-02T03:00:00Z"
+    connector.close()
+
+
+def test_cap_continues_until_equal_boundary_cursor_advances(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Cap-limited run must cross an inclusive equal-timestamp boundary."""
+    state_dir = _make_state_dir(tmp_path, "cap-equal-boundary")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T03:00:00Z")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:00:00Z")],
+                "end_time": 1704164400,
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?start_time=1704164400&page=2",
+            },
+            {
+                "tickets": [_ticket(1002, "2024-01-02T03:00:00Z")],
+                "end_time": 1704164460,
+                "next_page": None,
+            },
+        ],
+        comments={1001: [], 1002: []},
+    )
+    connector._max_tickets_per_run = 1
+
+    manifest = connector.build_manifest()
+    connector.mark_sync_complete()
+
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md"]
+    assert checkpoint_path.read_text().strip() == "2024-01-02T03:01:00Z"
     connector.close()
 
 
@@ -385,7 +419,8 @@ def test_state_write_is_atomic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
     good_page = {
         "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
-        "end_of_stream": True, "after_cursor": "cursor-1",
+        "end_time": 1704164645,
+        "next_page": None,
     }
     connector = _build_connector(monkeypatch, state_dir, pages=[good_page], comments={1001: []})
     connector.build_manifest()
@@ -419,19 +454,12 @@ def test_state_write_is_atomic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     assert not (state_dir / "manifest_state.json.tmp").exists()
 
 
-def test_aggressive_state_save_stamps_run_start_and_carries_cursor(
+def test_aggressive_state_is_saved_before_first_checkpoint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
-    """Mid-run state saves stamp the run-start checkpoint and carry the cursor.
-
-    With no cursor file yet, a mid-run failure resumes via the state file's
-    cursor. The state's checkpoint stamp must remain the run-start value (a
-    later datetime could skip unserved records once the cursor file exists),
-    while the boundary cursor is written into state["cursor"] so the next
-    run resumes exactly at the page boundary.
-    """
-    state_dir = _make_state_dir(tmp_path, "first-cursor-run-start")
-    cursor_path = state_dir / "resume_cursor.txt"
+    """First aggressive checkpoint must persist page state before its cursor."""
+    state_dir = _make_state_dir(tmp_path, "first-end-time-run-start")
+    resume_path = state_dir / "resume_checkpoint.txt"
     state = {
         "checkpoint": "2024-01-02T02:00:00Z",
         "ticket_files": {},
@@ -446,28 +474,30 @@ def test_aggressive_state_save_stamps_run_start_and_carries_cursor(
         state_dir,
         pages=[
             {
-                "tickets": [_ticket(1001, "2024-01-02T05:05:05Z")],
-                "end_of_stream": False,
-                "after_cursor": "cursor-A",
-            },
-            {
-                "tickets": [_ticket(1002, "2024-01-02T03:04:05Z")],
-                "end_of_stream": True,
-                "after_cursor": "cursor-B",
-            },
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": None,
+            }
         ],
-        comments={1001: [], 1002: []},
+        comments={1001: []},
     )
 
-    connector.build_manifest()
+    class CrashAfterState(RuntimeError):
+        pass
 
-    # Mid-run state (as of page 2's boundary) must carry the run-start
-    # checkpoint and the boundary cursor.
+    def crash_before_checkpoint(value):
+        raise CrashAfterState
+
+    monkeypatch.setattr(connector, "_save_checkpoint", crash_before_checkpoint)
+    with pytest.raises(CrashAfterState):
+        connector.build_manifest()
+
+    # State is durable while checkpoint remains at run start. Restart therefore
+    # re-serves this page instead of skipping content absent from the manifest.
     saved_state = json.loads((state_dir / "manifest_state.json").read_text())
     assert saved_state["checkpoint"] == "2024-01-02T02:00:00Z"
-    assert saved_state["cursor"] == "cursor-B"
-    assert "1002" in saved_state["ticket_files"]
-    assert cursor_path.read_text().strip() == "cursor-B"
+    assert "1001" in saved_state["ticket_files"]
+    assert not resume_path.exists()
     connector.close()
 
 
@@ -476,20 +506,25 @@ def test_sync_failure_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatc
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": None,
+            }
+        ],
         comments={1001: []},
     )
 
-    connector._http._ticket_pages.append({"tickets": [], "end_of_stream": True, "after_cursor": "cursor-1"})
+    connector._http._ticket_pages.append({"tickets": [], "next_page": None})
     connector.build_manifest()
 
-    assert not (state_dir / "resume_cursor.txt").exists()
+    assert not (state_dir / "resume_checkpoint.txt").exists()
     connector.close()
 
 
 def test_aggressive_checkpoint_keeps_run_cache_after_failure_for_resume(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "aggressive-cache-preserve")
-    cursor_path = state_dir / "resume_cursor.txt"
     monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
     connector = _build_connector(
         monkeypatch,
@@ -497,7 +532,8 @@ def test_aggressive_checkpoint_keeps_run_cache_after_failure_for_resume(monkeypa
         pages=[
             {
                 "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "end_time": 1704164645,  # 2024-01-02T03:04:05Z
+                "next_page": None,
             }
         ],
         comments={1001: []},
@@ -506,9 +542,9 @@ def test_aggressive_checkpoint_keeps_run_cache_after_failure_for_resume(monkeypa
     connector.build_manifest()
 
     # Simulate failed sync: close() is always called (even on failure) by run_sync().
-    # With aggressive checkpointing and a cursor file present, close() should NOT
+    # With aggressive checkpointing and a checkpoint file present, close() should NOT
     # delete .run-cache so the next run can resume.
-    assert cursor_path.exists()
+    assert (state_dir / "resume_checkpoint.txt").exists()
     run_cache = state_dir / ".run-cache"
     assert run_cache.exists()
     sentinel = run_cache / "preserve.me"
@@ -519,24 +555,68 @@ def test_aggressive_checkpoint_keeps_run_cache_after_failure_for_resume(monkeypa
     # .run-cache must survive close() when aggressive checkpoint is active.
     assert sentinel.exists()
 
-    # A new connector instance picks up the preserved cache and resumes via cursor.
+
+def test_aggressive_checkpoint_keeps_run_cache_with_state_only_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Crash recovery must retain cache when checkpoint exists only in state."""
+    state_dir = _make_state_dir(tmp_path, "aggressive-state-only-cache")
+    (state_dir / "manifest_state.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "2024-01-02T03:04:05Z",
+                "ticket_files": {},
+                "attachments_enabled": False,
+            }
+        )
+    )
+    run_cache = state_dir / ".run-cache"
+    run_cache.mkdir()
+    sentinel = run_cache / "preserve.me"
+    sentinel.write_text("keep")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "end_time": 1704164645, "next_page": None}],
+    )
+
+    connector.build_manifest()
+    connector.close()
+
+    assert sentinel.exists()
+
+    # A new connector instance picks up the preserved cache and resumes from checkpoint.
     connector2 = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": None,
+            }
+        ],
         comments={1001: []},
     )
     connector2.build_manifest()
-    assert cursor_path.exists()
+    assert connector2._http.calls[0]["params"]["start_time"] == 1704164645
+    assert sentinel.exists()
     connector2.close()
 
 
-def test_sync_run_advances_cursor_after_completed_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_sync_run_advances_checkpoint_after_completed_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "run-sync-checkpoint")
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": None,
+            }
+        ],
         comments={1001: []},
     )
     client = FakeClient()
@@ -544,7 +624,7 @@ def test_sync_run_advances_cursor_after_completed_run(monkeypatch: pytest.Monkey
     result = run_sync(client=client, connector=connector, kb_id="kb-1", quiet=True)
 
     assert result.added == 1
-    assert (state_dir / "resume_cursor.txt").read_text().strip() == "cursor-1"
+    assert (state_dir / "resume_checkpoint.txt").read_text().strip() == "2024-01-02T03:04:05Z"
 
 
 def test_sync_dry_run_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -553,7 +633,13 @@ def test_sync_dry_run_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatc
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": None,
+            }
+        ],
         comments={1001: []},
     )
     client = FakeClient()
@@ -561,7 +647,7 @@ def test_sync_dry_run_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatc
     result = run_sync(client=client, connector=connector, kb_id="kb-1", quiet=True, dry_run=True)
 
     assert result.added == 1
-    assert not (state_dir / "resume_cursor.txt").exists()
+    assert not (state_dir / "resume_checkpoint.txt").exists()
 
 
 def test_sync_exception_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -570,7 +656,7 @@ def test_sync_exception_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPa
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1001: []},
     )
 
@@ -581,7 +667,7 @@ def test_sync_exception_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPa
     with pytest.raises(RuntimeError, match="boom"):
         run_sync(client=FailingClient(), connector=connector, kb_id="kb-1", quiet=True)
 
-    assert not (state_dir / "resume_cursor.txt").exists()
+    assert not (state_dir / "resume_checkpoint.txt").exists()
 
 
 def test_sync_advances_checkpoint_even_when_some_uploads_fail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -596,7 +682,13 @@ def test_sync_advances_checkpoint_even_when_some_uploads_fail(monkeypatch: pytes
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": None,
+            }
+        ],
         comments={1001: []},
     )
 
@@ -607,8 +699,8 @@ def test_sync_advances_checkpoint_even_when_some_uploads_fail(monkeypatch: pytes
     result = run_sync(client=UploadFailingClient(), connector=connector, kb_id="kb-1", quiet=True)
 
     assert result.errors  # upload failed
-    # Cursor must still have advanced.
-    assert (state_dir / "resume_cursor.txt").read_text().strip() == "cursor-1"
+    # Checkpoint must still have advanced.
+    assert (state_dir / "resume_checkpoint.txt").read_text().strip() == "2024-01-02T03:04:05Z"
 
 
 def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -637,7 +729,7 @@ def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch:
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1002: []},
     )
 
@@ -694,7 +786,7 @@ def test_read_file_restores_carried_forward_entry_from_run_cache(monkeypatch: py
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1002: []},
     )
 
@@ -726,7 +818,7 @@ def test_read_file_raises_when_run_cache_content_mismatches(monkeypatch: pytest.
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1002: []},
     )
 
@@ -754,7 +846,7 @@ def test_read_file_rejects_wrong_size_cache_file_without_reading(monkeypatch: py
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1002: []},
     )
 
@@ -772,7 +864,7 @@ def test_read_file_raises_when_run_cache_missing(monkeypatch: pytest.MonkeyPatch
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[{"tickets": [_ticket(1002, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1002: []},
     )
 
@@ -798,7 +890,7 @@ def test_include_and_exclude_tags_filter_ticket_set(monkeypatch: pytest.MonkeyPa
                     _ticket(1002, "2024-01-02T03:05:05Z", tags=["facilities"]),
                     _ticket(1003, "2024-01-02T03:06:05Z", tags=["urgent", "ignore-me"]),
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1001: []},
@@ -826,7 +918,7 @@ def test_singular_tag_env_vars_are_supported_for_compatibility(monkeypatch: pyte
                     _ticket(1002, "2024-01-02T03:05:05Z", tags=["facilities"]),
                     _ticket(1003, "2024-01-02T03:06:05Z", tags=["urgent", "ignore-me"]),
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1001: []},
@@ -851,7 +943,7 @@ def test_status_filter_includes_only_configured_statuses(monkeypatch: pytest.Mon
                     _ticket(1002, "2024-01-02T03:05:05Z", status="solved"),
                     _ticket(1003, "2024-01-02T03:06:05Z", status="closed"),
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1002: [], 1003: []},
@@ -890,7 +982,7 @@ def test_filtered_ticket_is_removed_from_kb_on_next_sync(monkeypatch: pytest.Mon
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z", tags=["facilities"])], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z", tags=["facilities"])], "next_page": None}],
         comments={},
     )
     client = FakeClient(existing_files=existing_files)
@@ -916,7 +1008,7 @@ def test_attachments_are_added_when_enabled(monkeypatch: pytest.MonkeyPatch, tmp
                         attachments=[_attachment("error-log.txt", url="https://acme.zendesk.com/attachments/error-log.txt")],
                     )
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={
@@ -969,7 +1061,7 @@ def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytes
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1001: []},
     )
     client = FakeClient(existing_files=existing_files)
@@ -999,7 +1091,7 @@ def test_attachments_with_same_name_use_content_hashes(monkeypatch: pytest.Monke
                         ],
                     )
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1001: []},
@@ -1022,7 +1114,7 @@ def test_no_attachment_directory_created_when_no_attachments(monkeypatch: pytest
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1001: []},
     )
     client = FakeClient(existing_files=[])
@@ -1079,7 +1171,7 @@ def test_external_attachment_downloads_without_authenticated_client(monkeypatch:
                         attachments=[_attachment("external.png")],
                     )
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1001: []},
@@ -1120,7 +1212,7 @@ def test_zendesk_attachment_redirect_is_followed(monkeypatch: pytest.MonkeyPatch
                         ],
                     )
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1001: []},
@@ -1162,7 +1254,7 @@ def test_missing_attachment_retries_then_skips_without_aborting_sync(monkeypatch
                         attachments=[_attachment("missing.pdf", url="https://acme.zendesk.com/attachments/missing.pdf")],
                     )
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1001: []},
@@ -1197,7 +1289,7 @@ def test_rate_limited_ticket_fetch_retries_with_retry_after(monkeypatch: pytest.
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "end_of_stream": True, "after_cursor": "cursor-1"}],
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1001: []},
     )
     monkeypatch.setenv("ZENDESKTICKET_MAX_RETRIES", "2")
@@ -1215,7 +1307,7 @@ def test_rate_limited_ticket_fetch_retries_with_retry_after(monkeypatch: pytest.
         sleep_calls.append(delay)
 
     def fake_get(path: str, params: dict | None = None):
-        if path == "/incremental/tickets/cursor.json":
+        if path == "/incremental/tickets.json":
             calls["count"] += 1
             if calls["count"] == 1:
                 return FakeResponse({}, status_code=429, headers={"retry-after": "0.25"})
@@ -1242,7 +1334,7 @@ def test_inaccessible_ticket_comments_404_skips_ticket_without_aborting_sync(mon
                     _ticket(1001, "2024-01-02T03:04:05Z"),
                     _ticket(1002, "2024-01-02T04:00:00Z"),
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1001: [_comment(501, "Accessible ticket comment.")], 1002: []},
@@ -1270,7 +1362,7 @@ def test_inaccessible_ticket_comments_5xx_retries_then_skips_without_aborting_sy
                     _ticket(1001, "2024-01-02T03:04:05Z"),
                     _ticket(1002, "2024-01-02T04:00:00Z"),
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1001: [], 1002: []},
@@ -1297,23 +1389,24 @@ def test_inaccessible_ticket_comments_5xx_retries_then_skips_without_aborting_sy
     connector.close()
 
 
-def test_end_of_stream_true_stops_pagination_even_when_after_cursor_present(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """end_of_stream=true must terminate iteration even when after_cursor is set.
+def test_end_of_stream_true_stops_pagination_even_when_next_page_present(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """end_of_stream=true must terminate iteration even when next_page is set.
 
-    The cursor-based incremental endpoint always returns an after_cursor.
-    The only reliable signal that pagination is done is end_of_stream=true;
-    the final after_cursor has no resume role. Without this guard the sync
-    would keep requesting cursors forever.
+    Zendesk always returns a next_page URL on the incremental endpoint, even
+    after all results have been delivered.  The only reliable signal that
+    pagination is done is end_of_stream=true.  Without this guard the sync
+    re-requests the same start_time forever.
     """
     state_dir = _make_state_dir(tmp_path, "end-of-stream")
+    next_page_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=100&start_time=1786648901"
     connector = _build_connector(
         monkeypatch,
         state_dir,
         pages=[
             {
                 "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "next_page": next_page_url,
                 "end_of_stream": True,
-                "after_cursor": "cursor-1",
             }
         ],
         comments={1001: []},
@@ -1322,34 +1415,38 @@ def test_end_of_stream_true_stops_pagination_even_when_after_cursor_present(monk
     manifest = connector.build_manifest()
 
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
-    # Only one GET should have been made (no cursor follow-up after end_of_stream).
-    ticket_calls = [c for c in connector._http.calls if "cursor.json" in (c["path"] or "")]
+    # Only one GET should have been made (no follow-up on next_page).
+    ticket_calls = [c for c in connector._http.calls if "incremental/tickets.json" in (c["path"] or "")]
     assert len(ticket_calls) == 1
     connector.close()
 
 
-def test_duplicate_after_cursor_stops_pagination(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """A repeated after_cursor must not be followed a second time.
+def test_stale_next_page_url_stops_pagination(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A repeated next_page URL (same cursor) must not be followed a second time.
 
-    Secondary safety guard: if end_of_stream never turns true but consecutive
-    pages return the same after_cursor, following it would loop forever (the
-    equal-timestamp fixed-point hazard generalized to cursors). The guard
-    tracks seen cursors and breaks when one repeats.
+    This is a secondary safety guard: if end_of_stream is missing or False but
+    next_page resolves back to the same URL on consecutive pages, following it
+    would loop forever.  The guard detects this by tracking seen URLs and
+    breaking when the same next_page appears again.
     """
-    state_dir = _make_state_dir(tmp_path, "stale-cursor")
+    state_dir = _make_state_dir(tmp_path, "stale-next-page")
+    same_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=100&start_time=1786648901"
+    # Two pages: both return the same next_page URL, simulating a stuck cursor.
+    # The connector should follow it once (first page → second page) and then
+    # stop when it would loop back to the same URL again.
     connector = _build_connector(
         monkeypatch,
         state_dir,
         pages=[
             {
                 "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "next_page": same_url,
                 "end_of_stream": False,
-                "after_cursor": "same-cursor",
             },
             {
                 "tickets": [],
-                "end_of_stream": False,  # never reports done
-                "after_cursor": "same-cursor",  # same cursor again — guard fires
+                "next_page": same_url,  # same URL again — guard must fire here
+                "end_of_stream": False,
             },
         ],
         comments={1001: []},
@@ -1358,26 +1455,27 @@ def test_duplicate_after_cursor_stops_pagination(monkeypatch: pytest.MonkeyPatch
     manifest = connector.build_manifest()
 
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
-    # Exactly two cursor fetches: initial + one follow (then guard breaks).
-    incremental_calls = [c for c in connector._http.calls if "cursor.json" in (c.get("path") or "")]
+    # Exactly two incremental ticket fetches: initial + one follow (then stop).
+    incremental_calls = [c for c in connector._http.calls if "incremental/tickets.json" in (c.get("path") or "")]
     assert len(incremental_calls) == 2
     connector.close()
 
 
 # ── MAX_TICKETS_PER_RUN tests ──────────────────────────────────────────────
 
-def test_max_tickets_per_run_stops_after_cap_and_saves_cursor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_max_tickets_per_run_stops_after_cap_and_saves_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """ZENDESKTICKET_MAX_TICKETS_PER_RUN caps tickets per run, page-granular.
 
     Excluded tickets (tag/status filtered) do not count toward the cap.
     When the cap fires mid-page the connector finishes the current page —
-    the resume point is the page's opaque after_cursor, so stopping mid-page
-    would risk gaps (the next cursor resumes strictly after the page) and
-    overshoot is bounded by per_page - 1. The next run resumes from that
-    cursor via ?cursor=, never from start_time.
+    the checkpoint is the page's end_time (Zendesk's own forward cursor,
+    = generated_timestamp of the page's last item), so stopping mid-page
+    would risk gaps (start_time is compared against generated_timestamp,
+    not updated_at) and overshoot is bounded by per_page - 1. The next run
+    resumes from end_time; same-timestamp duplicates at the boundary are
+    re-served by design.
     """
     state_dir = _make_state_dir(tmp_path, "max-tickets-cap")
-    cursor_path = state_dir / "resume_cursor.txt"
     monkeypatch.setenv("ZENDESKTICKET_MAX_TICKETS_PER_RUN", "2")
     # Three tickets on one page; cap of 2 fires on the second included ticket
     # but the page is finished, so 1003 is also processed this run.
@@ -1391,8 +1489,9 @@ def test_max_tickets_per_run_stops_after_cap_and_saves_cursor(monkeypatch: pytes
                     _ticket(1002, "2024-01-02T02:00:00Z"),
                     _ticket(1003, "2024-01-02T03:00:00Z"),
                 ],
-                "end_of_stream": True,
-                "after_cursor": "cursor-1",
+                # end_time is generated_timestamp of the last page item.
+                "end_time": 1704164400,
+                "next_page": None,
             }
         ],
         comments={1001: [], 1002: [], 1003: []},
@@ -1402,12 +1501,11 @@ def test_max_tickets_per_run_stops_after_cap_and_saves_cursor(monkeypatch: pytes
     manifest = connector.build_manifest()
 
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md"]
-    assert not (state_dir / "resume_checkpoint.txt").exists()
-    # Sync completes (uploads succeeded); the resume cursor is the capped
-    # page's after_cursor. The next run resumes via ?cursor=cursor-1.
+    # Checkpoint is the page's end_time — Zendesk's own resume cursor.
     connector.mark_sync_complete()
+    checkpoint_text = (state_dir / "resume_checkpoint.txt").read_text().strip()
+    assert checkpoint_text == "2024-01-02T03:00:00Z"
     connector.close()
-    assert cursor_path.read_text().strip() == "cursor-1"
 
 
 def test_max_tickets_per_run_excluded_tickets_do_not_count_toward_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1426,7 +1524,7 @@ def test_max_tickets_per_run_excluded_tickets_do_not_count_toward_cap(monkeypatc
                     _ticket(1003, "2024-01-02T03:00:00Z", tags=["ops"]),
                     _ticket(1004, "2024-01-02T04:00:00Z", tags=["ops"]),
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1002: [], 1003: [], 1004: []},
@@ -1441,41 +1539,46 @@ def test_max_tickets_per_run_excluded_tickets_do_not_count_toward_cap(monkeypatc
     connector.close()
 
 
-def test_max_tickets_per_run_cap_on_equal_timestamp_page_still_advances_cursor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """A cap firing on an all-equal-timestamp page must still advance the cursor.
+def test_max_tickets_per_run_cap_on_out_of_order_page_does_not_stall_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A cap firing on an out-of-order page must not stall or regress the checkpoint.
 
     Live Zendesk data shows overlapping, non-monotonic incremental updated_at
-    values, including pages where every record sits at the same timestamp —
-    the old start_time design stalled on such pages (the #20 fixed point).
-    The opaque after_cursor is immune: every page boundary yields a distinct
-    cursor, so each cap-limited run resumes strictly past the processed page
-    regardless of the updated_at values it carried.
+    values: a later page's max updated_at can be earlier than an earlier
+    page's — or equal to the incoming checkpoint. The checkpoint uses the
+    page's end_time (Zendesk generated_timestamp cursor) when present and
+    otherwise accumulates the max updated_at across pages, so it always makes
+    forward progress even when pages arrive out of updated_at order.
     """
-    state_dir = _make_state_dir(tmp_path, "max-tickets-equal-ts")
+    state_dir = _make_state_dir(tmp_path, "max-tickets-out-of-order")
     checkpoint_path = state_dir / "resume_checkpoint.txt"
     checkpoint_path.write_text("2024-01-02T02:00:00Z")
-    cursor_path = state_dir / "resume_cursor.txt"
+    next_page_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=2&start_time=1000"
+    # end_time epochs: page 1 -> 2024-01-02T03:10:00Z (1704165000) after its
+    # final ticket (1002, generated at 03:10), page 2 -> earlier — later page
+    # has EARLIER end_time, mirroring out-of-order observed live behavior.
     connector = _build_connector(
         monkeypatch,
         state_dir,
         pages=[
             {
-                # Page 1: every ticket sits at the identical updated_at —
-                # the exact pattern that stalled the start_time checkpoint.
+                # Page 1 max updated_at (04:00) is later than page 2 max (02:00).
                 "tickets": [
-                    _ticket(1001, "2024-01-02T02:00:00Z"),
-                    _ticket(1002, "2024-01-02T02:00:00Z"),
+                    _ticket(1001, "2024-01-02T03:00:00Z"),
+                    _ticket(1002, "2024-01-02T04:00:00Z"),
                 ],
-                "end_of_stream": False,
-                "after_cursor": "cursor-A",
+                "end_time": 1704165000,
+                "next_page": next_page_url,
             },
             {
+                # Page 2 max updated_at equals the incoming checkpoint — the
+                # exact fixed-point pattern observed in production. With no
+                # cursor on this terminal page, updated_at must not override
+                # the authoritative page-1 end_time.
                 "tickets": [
-                    _ticket(1003, "2024-01-02T02:00:00Z"),
+                    _ticket(1003, "2024-01-02T01:00:00Z"),
                     _ticket(1004, "2024-01-02T02:00:00Z"),
                 ],
-                "end_of_stream": True,
-                "after_cursor": "cursor-B",
+                "next_page": None,
             },
         ],
         comments={1001: [], 1002: [], 1003: [], 1004: []},
@@ -1485,64 +1588,170 @@ def test_max_tickets_per_run_cap_on_equal_timestamp_page_still_advances_cursor(m
     manifest = connector.build_manifest()
 
     # Cap fires on page 2 after 1003, but the page is finished so 1004 is
-    # also processed; the cursor advances to page 2's after_cursor even
-    # though every ticket in the run shares one timestamp.
+    # also processed; the checkpoint keeps the max (page 1's end_time).
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md", "tickets/1004.md"]
+    assert connector._pending_checkpoint is not None and connector._pending_checkpoint.strftime("%Y-%m-%dT%H:%M:%SZ") == "2024-01-02T03:10:00Z"
     connector.mark_sync_complete()
-    assert cursor_path.read_text().strip() == "cursor-B"
+    assert checkpoint_path.read_text().strip() == "2024-01-02T03:10:00Z"
     connector.close()
 
 
-def test_malformed_after_cursor_fails_run_without_advancing_cursor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """A malformed after_cursor must fail the run, not enable a fallback or loop.
+def test_legacy_page_updated_at_does_not_advance_past_end_time_cursor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A page without end_time must not push the checkpoint beyond an established end_time cursor.
 
-    The opaque cursor is the only safe resume point; an empty-string cursor
-    (or a missing cursor on a non-terminal page) previously crashed or
-    silently looped the sync after tickets had been processed, leaving the
-    resume point stuck. Validation now raises a normalized ValueError
-    synchronously BEFORE any ticket is processed, and — because no page
-    boundary is reached — no cursor file is written. The next run resumes
-    from the last safe point.
+    updated_at does not bound generated_timestamp: a legacy/degraded page
+    whose max updated_at exceeds Zendesk's own end_time cursor could otherwise
+    advance the checkpoint past records that were never served, and the
+    no-regress guard would lock it in — the data-loss mode this change
+    eliminates. Pages WITH end_time never fall back to updated_at; the
+    A terminal page without either cursor cannot advance the checkpoint.
     """
-    state_dir = _make_state_dir(tmp_path, "malformed-after-cursor")
+    state_dir = _make_state_dir(tmp_path, "legacy-page-no-override")
     checkpoint_path = state_dir / "resume_checkpoint.txt"
     checkpoint_path.write_text("2024-01-02T02:00:00Z")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:00:00Z"),
+                ],
+                "end_time": 1704164400,  # 2024-01-02T03:00:00Z
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=1&start_time=1704164400",
+            },
+            {
+                # Legacy payload: no end_time, but max updated_at (05:00)
+                # beyond the end_time cursor (03:00).
+                "tickets": [
+                    _ticket(1002, "2024-01-02T04:00:00Z"),
+                    _ticket(1003, "2024-01-02T05:00:00Z"),
+                ],
+                "next_page": None,
+            },
+        ],
+        comments={1001: [], 1002: [], 1003: []},
+    )
 
-    # Variant 1: empty-string after_cursor.
+    connector.build_manifest()
+
+    assert connector._pending_checkpoint is not None and connector._pending_checkpoint.strftime("%Y-%m-%dT%H:%M:%SZ") == "2024-01-02T03:00:00Z"
+    connector.mark_sync_complete()
+    assert checkpoint_path.read_text().strip() == "2024-01-02T03:00:00Z"
+    connector.close()
+
+
+@pytest.mark.parametrize("end_time", [None, True, 1704164645.9, "1704164645", 10**30])
+def test_malformed_end_time_fails_run_without_advancing_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, end_time
+):
+    """A present-but-malformed end_time must fail without advancing.
+
+    Strict validation rejects null, booleans, fractional numbers, numeric
+    strings, and out-of-range epochs instead of coercing them into cursors.
+    """
+    state_dir = _make_state_dir(tmp_path, f"malformed-end-time-{end_time!r}")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T02:00:00Z")
     connector = _build_connector(
         monkeypatch,
         state_dir,
         pages=[
             {
                 "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
-                "after_cursor": "",
-                "end_of_stream": True,
+                "end_time": end_time,
+                "next_page": None,
             }
         ],
         comments={1001: []},
     )
-    with pytest.raises(ValueError, match="malformed after_cursor"):
+
+    with pytest.raises(ValueError, match="malformed end_time"):
         connector.build_manifest()
+
     connector.close()
     assert checkpoint_path.read_text().strip() == "2024-01-02T02:00:00Z"
-    assert not (state_dir / "resume_cursor.txt").exists()
 
-    # Variant 2: after_cursor key absent while end_of_stream is False — the
-    # page is not terminal, so a missing cursor would silently loop; must fail.
-    state_dir2 = _make_state_dir(tmp_path, "malformed-after-cursor-nonterminal")
+def test_terminal_page_without_cursor_retains_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Missing terminal cursor may repeat tickets but must never skip them."""
+    state_dir2 = _make_state_dir(tmp_path, "missing-terminal-cursor")
     checkpoint_path2 = state_dir2 / "resume_checkpoint.txt"
     checkpoint_path2.write_text("2024-01-02T02:00:00Z")
     connector2 = _build_connector(
         monkeypatch,
         state_dir2,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "end_of_stream": False}],
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
         comments={1001: []},
     )
-    with pytest.raises(ValueError, match="malformed after_cursor"):
-        connector2.build_manifest()
-    connector2.close()
+    connector2.build_manifest()
+    connector2.mark_sync_complete()
     assert checkpoint_path2.read_text().strip() == "2024-01-02T02:00:00Z"
-    assert not (state_dir2 / "resume_cursor.txt").exists()
+    connector2.close()
+
+
+def test_missing_end_time_uses_next_page_start_time_not_updated_at(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """next_page start_time is authoritative when end_time is absent.
+
+    The page's updated_at is deliberately later than its generated-timestamp
+    cursor. Resuming from updated_at would skip tickets; next_page start_time
+    provides the same safe cursor Zendesk normally returns as end_time.
+    """
+    state_dir = _make_state_dir(tmp_path, "next-page-cursor")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T02:00:00Z")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1002, "2024-01-02T05:00:00Z"),
+                ],
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=1&start_time=1704164400",
+            },
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:00:00Z"),
+                ],
+                "end_time": 1704164400,  # 2024-01-02T03:00:00Z
+                "next_page": None,
+            },
+        ],
+        comments={1001: [], 1002: []},
+    )
+
+    connector.build_manifest()
+
+    assert connector._pending_checkpoint is not None and connector._pending_checkpoint.strftime("%Y-%m-%dT%H:%M:%SZ") == "2024-01-02T03:00:00Z"
+    connector.mark_sync_complete()
+    assert checkpoint_path.read_text().strip() == "2024-01-02T03:00:00Z"
+    connector.close()
+
+
+def test_save_checkpoint_never_regresses_existing_value(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """_save_checkpoint must refuse to persist a value older than the existing one."""
+    state_dir = _make_state_dir(tmp_path, "checkpoint-no-regress")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+    )
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T04:00:00Z")
+
+    from datetime import UTC, datetime
+
+    connector._save_checkpoint(datetime(2024, 1, 2, 3, 0, 0, tzinfo=UTC))
+    assert checkpoint_path.read_text().strip() == "2024-01-02T04:00:00Z"
+
+    newer = datetime(2024, 1, 2, 5, 0, 0, tzinfo=UTC)
+    connector._save_checkpoint(newer)
+    assert checkpoint_path.read_text().strip() == "2024-01-02T05:00:00Z"
+    connector.close()
 
 
 def test_max_tickets_per_run_zero_disables_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1559,7 +1768,7 @@ def test_max_tickets_per_run_zero_disables_cap(monkeypatch: pytest.MonkeyPatch, 
                     _ticket(1002, "2024-01-02T02:00:00Z"),
                     _ticket(1003, "2024-01-02T03:00:00Z"),
                 ],
-                "end_of_stream": True, "after_cursor": "cursor-1",
+                "next_page": None,
             }
         ],
         comments={1001: [], 1002: [], 1003: []},
@@ -1576,10 +1785,11 @@ def test_max_tickets_per_run_cap_spans_multiple_pages(monkeypatch: pytest.Monkey
     """Cap is enforced across page boundaries; current page finishes after cap fires.
 
     The cap fires on 1003 (3rd ticket) mid-page-2; per the page-granular cap
-    rule the rest of the page (1004) is still processed so the cursor can
-    safely be that page's after_cursor.
+    rule the rest of the page (1004) is still processed so the checkpoint can
+    safely be that page's end_time.
     """
     state_dir = _make_state_dir(tmp_path, "max-tickets-multipage")
+    next_page_url = "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=2&start_time=1000"
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -1589,16 +1799,14 @@ def test_max_tickets_per_run_cap_spans_multiple_pages(monkeypatch: pytest.Monkey
                     _ticket(1001, "2024-01-02T01:00:00Z"),
                     _ticket(1002, "2024-01-02T02:00:00Z"),
                 ],
-                "end_of_stream": False,
-                "after_cursor": "cursor-A",
+                "next_page": next_page_url,
             },
             {
                 "tickets": [
                     _ticket(1003, "2024-01-02T03:00:00Z"),
                     _ticket(1004, "2024-01-02T04:00:00Z"),
                 ],
-                "end_of_stream": True,
-                "after_cursor": "cursor-1",
+                "next_page": None,
             },
         ],
         comments={1001: [], 1002: [], 1003: [], 1004: []},
@@ -1609,67 +1817,3 @@ def test_max_tickets_per_run_cap_spans_multiple_pages(monkeypatch: pytest.Monkey
 
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md", "tickets/1004.md"]
     connector.close()
-
-
-def test_cap_limited_run_resumes_via_cursor_param_not_start_time(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """Equal-timestamp cap stall regression (Copilot review round 10).
-
-    The old start_time design could hit a fixed point: if every record on the
-    cap-limited page sat at the inclusive start boundary, end_time equaled
-    checkpoint and no run ever advanced. With the cursor-based export the
-    resume request must carry the page's opaque after_cursor via ?cursor=
-    and MUST NOT pass start_time — starting the next run is immune to the
-    tickets' updated_at values entirely.
-    """
-    state_dir = _make_state_dir(tmp_path, "cap-resume-cursor")
-    connector = _build_connector(
-        monkeypatch,
-        state_dir,
-        pages=[
-            {
-                # All tickets share one updated_at — the exact fixed-point
-                # pattern from the live sync. The cap must still let the next
-                # run resume past this page.
-                "tickets": [
-                    _ticket(1001, "2024-01-02T02:00:00Z"),
-                    _ticket(1002, "2024-01-02T02:00:00Z"),
-                    _ticket(1003, "2024-01-02T02:00:00Z"),
-                ],
-                "end_of_stream": False,
-                "after_cursor": "cursor-A",
-            }
-        ],
-        comments={1001: [], 1002: [], 1003: []},
-    )
-    connector._max_tickets_per_run = 2
-
-    manifest = connector.build_manifest()
-
-    # Page finishes after the cap; the page cursor is persisted.
-    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md"]
-    cursor_path = state_dir / "resume_cursor.txt"
-    connector.mark_sync_complete()
-    assert cursor_path.read_text().strip() == "cursor-A"
-    connector.close()
-
-    # Second run must resume via the cursor param — no start_time in request.
-    connector2 = _build_connector(
-        monkeypatch,
-        state_dir,
-        pages=[
-            {
-                "tickets": [_ticket(1004, "2024-01-02T02:00:00Z")],
-                "end_of_stream": True,
-                "after_cursor": "cursor-B",
-            }
-        ],
-        comments={1004: []},
-    )
-    connector2.build_manifest()
-    connector2.close()
-
-    fetch_calls = [c for c in connector2._http.calls if "cursor.json" in (c.get("path") or "")]
-    assert len(fetch_calls) == 1
-    params = fetch_calls[0].get("params") or {}
-    assert params.get("cursor") == "cursor-A"
-    assert "start_time" not in params
