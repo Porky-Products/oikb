@@ -406,6 +406,41 @@ def test_cap_continues_until_equal_boundary_cursor_advances(
     connector.close()
 
 
+def test_terminal_equal_boundary_writes_stall_sentinel_and_blocks_next_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Fail closed when time-based export cannot advance past capped records."""
+    state_dir = _make_state_dir(tmp_path, "cap-terminal-equal-boundary")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T03:00:00Z")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:00:00Z")],
+                "end_time": 1704164400,
+                "end_of_stream": True,
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+    connector._max_tickets_per_run = 1
+
+    connector.build_manifest()
+    connector.mark_sync_complete()
+    connector.close()
+
+    assert checkpoint_path.read_text().strip() == "STALLED_EQUAL_TIMESTAMP:2024-01-02T03:00:00Z"
+
+    connector2 = _build_connector(monkeypatch, state_dir, pages=[])
+    with pytest.raises(RuntimeError, match="Cursor-based incremental export is required"):
+        connector2.build_manifest()
+    assert connector2._http.calls == []
+    connector2.close()
+
+
 def test_state_write_is_atomic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Interrupted state writes must never corrupt on-disk JSON.
 
@@ -1603,8 +1638,8 @@ def test_legacy_page_updated_at_does_not_advance_past_end_time_cursor(monkeypatc
     whose max updated_at exceeds Zendesk's own end_time cursor could otherwise
     advance the checkpoint past records that were never served, and the
     no-regress guard would lock it in — the data-loss mode this change
-    eliminates. Pages WITH end_time never fall back to updated_at; the
-    A terminal page without either cursor cannot advance the checkpoint.
+    eliminates. Pages WITH end_time never fall back to updated_at; a terminal
+    page without either cursor cannot advance the checkpoint.
     """
     state_dir = _make_state_dir(tmp_path, "legacy-page-no-override")
     checkpoint_path = state_dir / "resume_checkpoint.txt"
