@@ -24,6 +24,7 @@ _ZENDESK_ATTACHMENT_REDIRECT_CODES = {301, 302, 303, 307, 308}
 _ZENDESK_RATE_LIMIT_STATUS = 429
 _TICKET_PATH = "tickets"
 _ATTACHMENT_PATH = "attachments"
+_STALLED_CHECKPOINT_PREFIX = "STALLED_EQUAL_TIMESTAMP:"
 
 
 class ZendeskTicketsConnector(BaseConnector):
@@ -77,6 +78,7 @@ class ZendeskTicketsConnector(BaseConnector):
         self._manifest_entries_by_key: dict[tuple[str, str], ManifestEntry] = {}
         self._restored_content: dict[tuple[str, str], bytes] = {}
         self._pending_checkpoint: datetime | None = None
+        self._checkpoint_stalled = False
         self._run_cache_dir: Path | None = None
         self._preserve_run_cache = False
         self._aggressive_checkpoint = _parse_bool(os.environ.get("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "false"))
@@ -196,6 +198,7 @@ class ZendeskTicketsConnector(BaseConnector):
         }
         self._pending_checkpoint = pending_checkpoint
         checkpoint_advanced = pending_checkpoint > checkpoint
+        self._checkpoint_stalled = cap_reached and not checkpoint_advanced
         log.info(
             "ZendeskTicketsConnector.run_summary: checkpoint_in=%s checkpoint_out=%s advanced=%s "
             "tickets_seen=%d tickets_processed=%d cap_reached=%s manifest_entries=%d "
@@ -210,15 +213,15 @@ class ZendeskTicketsConnector(BaseConnector):
             len(carried_forward),
             len(current_entries_by_ticket),
         )
-        if cap_reached and pending_checkpoint is not None and pending_checkpoint == checkpoint:
+        if self._checkpoint_stalled:
             # The run cap stopped inside the very page the run started on and
             # even its end_time did not move the cursor — every ticket
             # including the boundary shares one generated_timestamp (bulk
             # import). An inclusive >= boundary would refetch them forever.
             log.warning(
                 "ZendeskTicketsConnector.checkpoint_stalled: cap reached without advancing checkpoint "
-                "(in=%s out=%s seen=%d processed=%d) — check for duplicate "
-                "generated_timestamp values at the inclusive start_time boundary",
+                "(in=%s out=%s seen=%d processed=%d) — successful completion will block "
+                "future runs until cursor-based resume is implemented",
                 self._format_dt(checkpoint),
                 self._format_dt(pending_checkpoint),
                 len(seen_ticket_ids),
@@ -315,11 +318,14 @@ class ZendeskTicketsConnector(BaseConnector):
 
     def mark_sync_complete(self) -> None:
         log.info(
-            "ZendeskTicketsConnector.mark_sync_complete: saving checkpoint=%s state_tickets=%d",
+            "ZendeskTicketsConnector.mark_sync_complete: saving checkpoint=%s stalled=%s state_tickets=%d",
             self._format_dt(self._pending_checkpoint) if self._pending_checkpoint is not None else "none",
+            self._checkpoint_stalled,
             len(self._manifest_snapshot.get("ticket_files") or {}),
         )
-        if self._pending_checkpoint is not None:
+        if self._checkpoint_stalled and self._pending_checkpoint is not None:
+            self._save_stalled_checkpoint(self._pending_checkpoint)
+        elif self._pending_checkpoint is not None:
             self._save_checkpoint(self._pending_checkpoint)
         self._save_state(self._manifest_snapshot)
 
@@ -601,10 +607,24 @@ class ZendeskTicketsConnector(BaseConnector):
     def _load_checkpoint(self, state: dict[str, Any]) -> datetime:
         path = self._checkpoint_path()
         if path.exists():
-            return self._parse_dt(path.read_text().strip())
+            value = path.read_text().strip()
+            if value.startswith(_STALLED_CHECKPOINT_PREFIX):
+                stalled_at = value.removeprefix(_STALLED_CHECKPOINT_PREFIX)
+                raise RuntimeError(
+                    "Zendesk ticket sync blocked after an equal-timestamp checkpoint stall at "
+                    f"{stalled_at}. Cursor-based incremental export is required before resuming."
+                )
+            return self._parse_dt(value)
         if checkpoint := state.get("checkpoint"):
             return self._parse_dt(checkpoint)
         return datetime.min.replace(tzinfo=UTC)
+
+    def _save_stalled_checkpoint(self, value: datetime) -> None:
+        path = self._checkpoint_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(path, f"{_STALLED_CHECKPOINT_PREFIX}{self._format_dt(value)}")
+        if self._aggressive_checkpoint:
+            self._preserve_run_cache = True
 
     def _save_checkpoint(self, value: datetime) -> None:
         path = self._checkpoint_path()
