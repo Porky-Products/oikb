@@ -156,30 +156,34 @@ class ZendeskTicketsConnector(BaseConnector):
             # mid-run — a crash re-serves tickets (safe), whereas persisting
             # a beyond-cursor fallback skips them (unsafe).
             if page_end_time is not None:
+                if self._aggressive_checkpoint:
+                    # Persist the manifest state for tickets completed so
+                    # far BEFORE any cursor advance. If the process dies
+                    # between the two writes, the state leads the
+                    # checkpoint: the next run re-serves this page and each
+                    # already-saved ticket is deduplicated by checksum —
+                    # duplicates are safe. The reverse order (cursor ahead
+                    # of state) permanently omits the new entries: cache
+                    # restoration needs a manifest entry that was never
+                    # written. This runs at EVERY page boundary where the
+                    # tolerance for non-advancing end_time keeps the cursor:
+                    # those pages' entries are otherwise memory-only, and a
+                    # crash would resume past them permanently.
+                    self._save_state(
+                        self._build_midrun_state(
+                            prior_entries,
+                            state,
+                            seen_ticket_ids,
+                            excluded_ticket_ids,
+                            attachments_enabled_previously,
+                            current_entries_by_ticket,
+                            current_updated_at_by_ticket,
+                        ),
+                        checkpoint=self._pending_checkpoint_after(checkpoint, pending_checkpoint),
+                    )
                 if not page_end_time_seen or page_end_time > pending_checkpoint:
                     if self._aggressive_checkpoint:
-                        # Persist the manifest state for tickets completed so
-                        # far BEFORE advancing the resume cursor. If the
-                        # process dies between the two writes, the state leads
-                        # the checkpoint: the next run re-serves this page and
-                        # each already-saved ticket is deduplicated by
-                        # checksum — duplicates are safe. The reverse order
-                        # (cursor ahead of state) permanently omits the new
-                        # entries: cache restoration needs a manifest entry
-                        # that was never written.
                         new_checkpoint = self._pending_checkpoint_after(checkpoint, page_end_time)
-                        self._save_state(
-                            self._build_midrun_state(
-                                prior_entries,
-                                state,
-                                seen_ticket_ids,
-                                excluded_ticket_ids,
-                                attachments_enabled_previously,
-                                current_entries_by_ticket,
-                                current_updated_at_by_ticket,
-                            ),
-                            checkpoint=new_checkpoint,
-                        )
                         self._save_checkpoint(new_checkpoint)
                     page_end_time_seen = True
                     pending_checkpoint = page_end_time
@@ -259,12 +263,15 @@ class ZendeskTicketsConnector(BaseConnector):
             )
         return manifest
 
-    def _pending_checkpoint_after(self, checkpoint: datetime, page_end_time: datetime) -> datetime:
-        """Checkpoint value after accepting this page's end_time cursor.
+    def _pending_checkpoint_after(self, checkpoint: datetime, pending: datetime | None) -> datetime:
+        """Checkpoint value to stamp after this page; never regresses below run-start.
 
-        Never regresses below the run-start checkpoint.
+        Accepts None before any end_time is observed (or on a page whose
+        end_time does not advance the run cursor).
         """
-        return page_end_time if page_end_time > checkpoint else checkpoint
+        if pending is None or pending <= checkpoint:
+            return checkpoint
+        return pending
 
     def _build_midrun_state(
         self,

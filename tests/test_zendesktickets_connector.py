@@ -287,6 +287,47 @@ def test_aggressive_checkpoint_saves_state_before_cursor(monkeypatch: pytest.Mon
     connector.close()
 
 
+def test_aggressive_state_saved_on_non_advancing_end_time_page(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Later pages whose end_time does not advance the cursor still save state.
+
+    The max-compare tolerance retains the cursor when a page reports an equal
+    or lower end_time, but that page's manifest entries must still reach
+    manifest_state.json — otherwise a sync failure resumes past records that
+    exist only in memory.
+    """
+    state_dir = _make_state_dir(tmp_path, "aggressive-non-advancing")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T02:00:00Z")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704168245,
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?start_time=1704168245",
+            },
+            {
+                "tickets": [_ticket(1002, "2024-01-02T04:04:05Z")],
+                "end_time": 1704168245,
+                "next_page": None,
+            },
+        ],
+        comments={1001: [], 1002: []},
+    )
+
+    connector.build_manifest()
+
+    # Simulate sync failure: page 2's end_time (1704168245 = 04:04:05Z) did not
+    # advance the cursor, but its ticket 1002 must still be persisted.
+    saved_state = json.loads((state_dir / "manifest_state.json").read_text())
+    assert "1002" in saved_state["ticket_files"]
+    checkpoint_path_value = checkpoint_path.read_text().strip()
+    assert checkpoint_path_value == "2024-01-02T04:04:05Z"
+    connector.close()
+
+
 def test_sync_failure_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "checkpoint-on-success")
     connector = _build_connector(
