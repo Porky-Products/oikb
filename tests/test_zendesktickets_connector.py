@@ -328,6 +328,38 @@ def test_aggressive_state_saved_on_non_advancing_end_time_page(monkeypatch: pyte
     connector.close()
 
 
+def test_first_end_time_below_run_start_does_not_rewind_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A first end_time at/below the run-start checkpoint must not rewind it.
+
+    The inclusive >= start_time boundary can serve a page whose end_time
+    # equals (or, for a stale state-file checkpoint, sits below) run start.
+    Assigning it unconditionally would let mark_sync_complete persist an
+    older cursor once the file exists — rewinding the next export.
+    """
+    state_dir = _make_state_dir(tmp_path, "end-time-below-run-start")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    # 2024-01-02T03:00:00Z run start; page reports 02:00:00Z end_time.
+    checkpoint_path.write_text("2024-01-02T03:00:00Z")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T02:30:00Z")],
+                "end_time": 1704160800,
+                "next_page": None,
+            },
+        ],
+        comments={1001: []},
+    )
+
+    connector.build_manifest()
+    connector.mark_sync_complete()
+
+    assert checkpoint_path.read_text().strip() == "2024-01-02T03:00:00Z"
+    connector.close()
+
+
 def test_sync_failure_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "checkpoint-on-success")
     connector = _build_connector(
