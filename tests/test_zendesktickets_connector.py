@@ -1545,9 +1545,9 @@ def test_max_tickets_per_run_cap_on_out_of_order_page_does_not_stall_checkpoint(
     Live Zendesk data shows overlapping, non-monotonic incremental updated_at
     values: a later page's max updated_at can be earlier than an earlier
     page's — or equal to the incoming checkpoint. The checkpoint uses the
-    page's end_time (Zendesk generated_timestamp cursor) when present and
-    otherwise accumulates the max updated_at across pages, so it always makes
-    forward progress even when pages arrive out of updated_at order.
+    page's end_time (Zendesk generated_timestamp cursor) when present, recovers
+    the equivalent start_time from next_page when needed, and never advances
+    from updated_at, so out-of-order ticket timestamps cannot create gaps.
     """
     state_dir = _make_state_dir(tmp_path, "max-tickets-out-of-order")
     checkpoint_path = state_dir / "resume_checkpoint.txt"
