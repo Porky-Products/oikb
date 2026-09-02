@@ -272,7 +272,7 @@ def test_aggressive_checkpoint_keeps_run_cache_after_failure_for_resume(monkeypa
         pages=[
             {
                 "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
-                "end_time": 1704165845,  # 2024-01-02T03:04:05Z
+                "end_time": 1704164645,  # 2024-01-02T03:04:05Z
                 "next_page": None,
             }
         ],
