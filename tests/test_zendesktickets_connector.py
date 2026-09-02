@@ -1324,6 +1324,52 @@ def test_legacy_page_updated_at_does_not_advance_past_end_time_cursor(monkeypatc
     connector.close()
 
 
+def test_malformed_end_time_fails_run_without_advancing_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A present-but-malformed end_time must fail the run, not enable the fallback.
+
+    The cursor is the only safe resume point; silently treating a malformed
+    end_time as absent would route the page into the updated_at fallback,
+    which can advance the checkpoint beyond generated_timestamp and
+    permanently skip tickets. Checkpoint must stay at its prior value.
+    """
+    state_dir = _make_state_dir(tmp_path, "malformed-end-time")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T02:00:00Z")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": "not-a-number",
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    with pytest.raises(ValueError, match="malformed end_time"):
+        connector.build_manifest()
+
+    connector.close()
+    assert checkpoint_path.read_text().strip() == "2024-01-02T02:00:00Z"
+
+    # Absent end_time is unchanged behavior: legacy fallback, run succeeds.
+    state_dir2 = _make_state_dir(tmp_path, "malformed-end-time-legacy")
+    checkpoint_path2 = state_dir2 / "resume_checkpoint.txt"
+    checkpoint_path2.write_text("2024-01-02T02:00:00Z")
+    connector2 = _build_connector(
+        monkeypatch,
+        state_dir2,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+    connector2.build_manifest()
+    connector2.mark_sync_complete()
+    assert checkpoint_path2.read_text().strip() == "2024-01-02T03:04:05Z"
+    connector2.close()
+
+
 def test_first_end_time_replaces_updated_at_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """The first observed end_time must replace a prior updated_at fallback outright.
 
