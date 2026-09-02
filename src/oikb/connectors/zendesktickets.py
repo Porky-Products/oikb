@@ -666,8 +666,22 @@ class ZendeskTicketsConnector(BaseConnector):
                 )
                 return
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self._format_dt(value))
+        self._atomic_write(path, self._format_dt(value))
         log.info("ZendeskTicketsConnector.checkpoint_saved: path=%s value=%s", path, self._format_dt(value))
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        """Write via temp file + os.replace so interruption never corrupts state.
+
+        Both manifest_state.json and resume_checkpoint.txt are crash-recovery
+        inputs. A direct write_text can leave truncated JSON (or an empty
+        cursor) if the process dies mid-write; the next run then fails in
+        _load_state before it can use the preserved checkpoint and cache.
+        os.replace is atomic on POSIX and Windows.
+        """
+        tmp = path.with_name(f"{path.name}.tmp")
+        tmp.write_text(content)
+        os.replace(tmp, path)
 
     def _load_state(self) -> dict[str, Any]:
         path = self._state_path()
@@ -682,7 +696,7 @@ class ZendeskTicketsConnector(BaseConnector):
         effective = checkpoint if checkpoint is not None else self._pending_checkpoint
         if effective is not None:
             snapshot["checkpoint"] = self._format_dt(effective)
-        path.write_text(json.dumps(snapshot, indent=2, sort_keys=True))
+        self._atomic_write(path, json.dumps(snapshot, indent=2, sort_keys=True))
 
     def _state_entries_by_ticket(self, state: dict[str, Any]) -> dict[str, list[ManifestEntry]]:
         result: dict[str, list[ManifestEntry]] = {}

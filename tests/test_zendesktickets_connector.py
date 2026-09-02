@@ -360,6 +360,54 @@ def test_first_end_time_below_run_start_does_not_rewind_checkpoint(monkeypatch: 
     connector.close()
 
 
+def test_state_write_is_atomic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Interrupted state writes must never corrupt on-disk JSON.
+
+    manifest_state.json is a crash-recovery input. A truncated write (process
+    death mid-write_text) would make the next run fail in _load_state before
+    it can use the preserved checkpoint and run cache. The write goes through
+    temp-file + os.replace; killing write_text after the first partial byte
+    leaves the original state intact.
+    """
+    state_dir = _make_state_dir(tmp_path, "atomic-write")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    good_page = {
+        "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+        "end_time": 1704164645,
+        "next_page": None,
+    }
+    connector = _build_connector(monkeypatch, state_dir, pages=[good_page], comments={1001: []})
+    connector.build_manifest()
+    connector.mark_sync_complete()
+    connector.close()
+
+    state_path = state_dir / "manifest_state.json"
+    tmp_path = state_dir / "manifest_state.json.tmp"
+    good = state_path.read_text()
+
+    class Boom(RuntimeError):
+        pass
+
+    original = Path.write_text
+
+    def partial_write(self, data, *args, **kwargs):
+        if self == tmp_path:
+            # Simulate process death mid-write: partial bytes, no replace.
+            raise Boom
+        return original(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", partial_write)
+
+    connector2 = _build_connector(monkeypatch, state_dir, pages=[good_page], comments={1001: []})
+    with pytest.raises(Boom):
+        connector2.build_manifest()
+    connector2.close()
+
+    # The original good state survived the interrupted write.
+    assert json.loads(state_path.read_text()) == json.loads(good)
+    assert not (state_dir / "manifest_state.json.tmp").exists()
+
+
 def test_sync_failure_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "checkpoint-on-success")
     connector = _build_connector(
