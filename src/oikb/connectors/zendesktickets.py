@@ -12,7 +12,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -76,8 +76,9 @@ class ZendeskTicketsConnector(BaseConnector):
         self._manifest_snapshot: dict[str, Any] = {}
         self._manifest_entries_by_key: dict[tuple[str, str], ManifestEntry] = {}
         self._restored_content: dict[tuple[str, str], bytes] = {}
-        self._pending_cursor: str | None = None
+        self._pending_checkpoint: datetime | None = None
         self._run_cache_dir: Path | None = None
+        self._preserve_run_cache = False
         self._aggressive_checkpoint = _parse_bool(os.environ.get("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "false"))
         max_tickets_value = os.environ.get("ZENDESKTICKET_MAX_TICKETS_PER_RUN", "1000")
         self._max_tickets_per_run: int | None = _parse_optional_positive_int(max_tickets_value, "ZENDESKTICKET_MAX_TICKETS_PER_RUN")
@@ -88,17 +89,16 @@ class ZendeskTicketsConnector(BaseConnector):
         prior_entries = self._state_entries_by_ticket(state)
         attachments_enabled_previously = bool(state.get("attachments_enabled", False))
 
-        self._reset_run_cache()
+        self._reset_run_cache(state)
         current_entries_by_ticket: dict[str, list[ManifestEntry]] = {}
         current_updated_at_by_ticket: dict[str, str] = {}
         excluded_ticket_ids: set[str] = set()
-        run_cursor = self._load_cursor(state)
-        self._pending_cursor = run_cursor
+        pending_checkpoint = checkpoint
         seen_ticket_ids: set[str] = set()
         tickets_processed = 0
         cap_reached = False
 
-        for page_tickets, page_cursor in self._iter_ticket_pages(checkpoint, run_cursor):
+        for page_tickets, page_end_time in self._iter_ticket_pages(checkpoint):
             for ticket in page_tickets:
                 ticket_id = str(ticket["id"])
                 seen_ticket_ids.add(ticket_id)
@@ -117,34 +117,26 @@ class ZendeskTicketsConnector(BaseConnector):
                 tickets_processed += 1
 
                 if self._max_tickets_per_run is not None and tickets_processed >= self._max_tickets_per_run:
-                    # Finish the current page before stopping: the resume
-                    # point for a capped run is the page's after_cursor —
-                    # Zendesk's own opaque cursor, positioned exactly after
-                    # the last ticket of this page. Stopping mid-page would
-                    # reuse this page's cursor and re-serve the unprocessed
-                    # remainder of the page or skip it. Overshoot is bounded
-                    # by per_page - 1 tickets.
+                    # Finish the current page before stopping: the checkpoint
+                    # for a capped run is the page's end_time (Zendesk's own
+                    # cursor). Stopping mid-page would either reuse this
+                    # page's end_time and re-serve the unprocessed remainder
+                    # of the page or skip it, and any updated_at-derived
+                    # value can jump past tickets that still need processing
+                    # (Zendesk compares start_time against
+                    # generated_timestamp, not updated_at). Overshoot is
+                    # bounded by per_page - 1 tickets.
                     cap_reached = True
 
-            # Zendesk cursor-based incremental export: each page carries an
-            # opaque after_cursor that uniquely positions the stream after
-            # that page's last ticket, even inside equal-timestamp groups
-            # (time-based exports stall there — a documented limitation the
-            # cursor endpoint exists to fix). Persist the manifest state for
-            # tickets completed so far BEFORE persisting the cursor: if the
-            # process dies between the two writes, state leads the resume
-            # point, the next run re-serves this page, and each already-saved
-            # ticket is deduplicated by checksum — duplicates are safe. The
-            # reverse order (cursor ahead of state) permanently omits the new
-            # entries: cache restoration needs a manifest entry that was
-            # never written. This runs at EVERY page boundary: those pages'
-            # entries are otherwise memory-only, and a crash would resume
-            # past them permanently.
-            if page_cursor is not None:
-                # Set before the saves so the mid-run state snapshot carries
-                # this boundary's cursor, not the previous page's.
-                self._pending_cursor = page_cursor
+            # Zendesk's documented resume strategy for time-based exports is
+            # to use the returned end_time as the next export's start_time.
+            # Only that generated-timestamp cursor is safe: updated_at does
+            # not bound generated_timestamp and can skip unserved tickets.
+            if page_end_time is not None:
                 if self._aggressive_checkpoint:
+                    # Persist page state before advancing the checkpoint.
+                    # A crash can then re-serve saved entries, but cannot
+                    # resume past entries that exist only in memory.
                     self._save_state(
                         self._build_midrun_state(
                             prior_entries,
@@ -155,11 +147,18 @@ class ZendeskTicketsConnector(BaseConnector):
                             current_entries_by_ticket,
                             current_updated_at_by_ticket,
                         ),
-                        checkpoint=checkpoint,
+                        checkpoint=pending_checkpoint,
                     )
-                    self._save_cursor(page_cursor)
+                if page_end_time > pending_checkpoint:
+                    if self._aggressive_checkpoint:
+                        self._save_checkpoint(page_end_time)
+                    pending_checkpoint = page_end_time
 
-            if cap_reached:
+            # A cap reached on an inclusive boundary page must not stop at the
+            # same checkpoint forever. Continue page-by-page until Zendesk's
+            # cursor advances; normal capped runs still stop on the page where
+            # the cap fires.
+            if cap_reached and pending_checkpoint > checkpoint:
                 break
 
         carried_forward = {
@@ -195,14 +194,15 @@ class ZendeskTicketsConnector(BaseConnector):
                 for ticket_id, entries in combined_entries_by_ticket.items()
             },
         }
-        cursor_advanced = self._pending_cursor is not None and self._pending_cursor != run_cursor
+        self._pending_checkpoint = pending_checkpoint
+        checkpoint_advanced = pending_checkpoint > checkpoint
         log.info(
-            "ZendeskTicketsConnector.run_summary: cursor_in=%s cursor_out=%s advanced=%s "
+            "ZendeskTicketsConnector.run_summary: checkpoint_in=%s checkpoint_out=%s advanced=%s "
             "tickets_seen=%d tickets_processed=%d cap_reached=%s manifest_entries=%d "
             "carried_forward_tickets=%d new_tickets=%d",
-            run_cursor if run_cursor is not None else (self._format_dt(checkpoint) + " (start_time bootstrap)"),
-            self._pending_cursor if self._pending_cursor is not None else "none",
-            cursor_advanced,
+            self._format_dt(checkpoint),
+            self._format_dt(pending_checkpoint) if pending_checkpoint is not None else "none",
+            checkpoint_advanced,
             len(seen_ticket_ids),
             tickets_processed,
             cap_reached,
@@ -210,6 +210,20 @@ class ZendeskTicketsConnector(BaseConnector):
             len(carried_forward),
             len(current_entries_by_ticket),
         )
+        if cap_reached and pending_checkpoint is not None and pending_checkpoint == checkpoint:
+            # The run cap stopped inside the very page the run started on and
+            # even its end_time did not move the cursor — every ticket
+            # including the boundary shares one generated_timestamp (bulk
+            # import). An inclusive >= boundary would refetch them forever.
+            log.warning(
+                "ZendeskTicketsConnector.checkpoint_stalled: cap reached without advancing checkpoint "
+                "(in=%s out=%s seen=%d processed=%d) — check for duplicate "
+                "generated_timestamp values at the inclusive start_time boundary",
+                self._format_dt(checkpoint),
+                self._format_dt(pending_checkpoint),
+                len(seen_ticket_ids),
+                tickets_processed,
+            )
         return manifest
 
     def _build_midrun_state(
@@ -301,13 +315,13 @@ class ZendeskTicketsConnector(BaseConnector):
 
     def mark_sync_complete(self) -> None:
         log.info(
-            "ZendeskTicketsConnector.mark_sync_complete: saving cursor=%s state_tickets=%d",
-            self._pending_cursor if self._pending_cursor is not None else "none",
+            "ZendeskTicketsConnector.mark_sync_complete: saving checkpoint=%s state_tickets=%d",
+            self._format_dt(self._pending_checkpoint) if self._pending_checkpoint is not None else "none",
             len(self._manifest_snapshot.get("ticket_files") or {}),
         )
+        if self._pending_checkpoint is not None:
+            self._save_checkpoint(self._pending_checkpoint)
         self._save_state(self._manifest_snapshot)
-        if self._pending_cursor is not None:
-            self._save_cursor(self._pending_cursor)
 
     def has_content(self) -> bool:
         return bool(self._manifest_snapshot.get("ticket_files"))
@@ -316,8 +330,7 @@ class ZendeskTicketsConnector(BaseConnector):
         return bool(self._manifest_snapshot) and not self.has_content()
 
     def close(self) -> None:
-        preserve = self._aggressive_checkpoint and (self._checkpoint_path().exists() or self._cursor_path().exists())
-        if not preserve and self._run_cache_dir and self._run_cache_dir.exists():
+        if not self._preserve_run_cache and self._run_cache_dir and self._run_cache_dir.exists():
             shutil.rmtree(self._run_cache_dir, ignore_errors=True)
         self._run_cache_dir = None
         self._file_cache.clear()
@@ -357,29 +370,16 @@ class ZendeskTicketsConnector(BaseConnector):
             size=len(content),
         )
 
-    def _iter_ticket_pages(self, checkpoint: datetime, run_cursor: str | None) -> Iterator[tuple[list[dict[str, Any]], str | None]]:
-        """Yield (tickets, after_cursor) pages from the cursor-based incremental export.
-
-        Initial request bootstraps from start_time (derived from the legacy
-        datetime checkpoint) when no cursor is persisted; every subsequent
-        request and every subsequent export uses the opaque cursor returned
-        by the previous page — per Zendesk's cursor-based incremental export
-        contract this is the only supported resume mechanism, and unlike
-        time-based start_time it advances within equal-timestamp groups so
-        the stream can never stall.
-        """
-        after_cursor: str | None = run_cursor
-        seen_cursors: set[str] = set()
+    def _iter_ticket_pages(self, checkpoint: datetime) -> Iterator[tuple[list[dict[str, Any]], datetime | None]]:
+        next_page: str | None = None
+        seen_page_urls: set[str] = set()
         page_count = 0
         while True:
-            if after_cursor is not None:
-                response = self._zendesk_get(
-                    "/incremental/tickets/cursor.json",
-                    params={"cursor": after_cursor},
-                )
+            if next_page:
+                response = self._zendesk_get(next_page)
             else:
                 response = self._zendesk_get(
-                    "/incremental/tickets/cursor.json",
+                    "/incremental/tickets.json",
                     params={
                         "per_page": self._page_size,
                         "start_time": self._format_start_time(checkpoint),
@@ -394,51 +394,58 @@ class ZendeskTicketsConnector(BaseConnector):
                 default=None,
             )
             log.info(
-                "ZendeskTicketsConnector.page: page=%d tickets=%d page_max_updated_at=%s end_of_stream=%s",
+                "ZendeskTicketsConnector.page: page=%d tickets=%d page_max_updated_at=%s end_of_stream=%s end_time=%s",
                 page_count,
                 len(tickets),
                 self._format_dt(page_max) if page_max else "none",
                 bool(payload.get("end_of_stream")),
+                payload.get("end_time", "none"),
             )
+            end_time = self._extract_page_end_time(payload)
+            yield tickets, end_time
 
-            # after_cursor is the ONLY safe resume point (endpoint contract:
-            # opaque string). A present-but-malformed value or an absent
-            # cursor on a page that is not end_of_stream is a contract
-            # violation from Zendesk: silently continuing or stopping would
-            # either re-serve or skip records. Fail the run instead; the
-            # prior cursor stands and this page re-serves next run —
-            # duplicates are safe, skips are not. Only an absent cursor on
-            # an end_of_stream page is tolerated (nothing left to resume).
-            end_of_stream = bool(payload.get("end_of_stream"))
-            cursor_value = payload.get("after_cursor", None)
-            if cursor_value is None:
-                if end_of_stream:
-                    page_cursor = None
-                else:
-                    raise ValueError(
-                        "ZendeskTicketsConnector: malformed after_cursor in Zendesk payload: None"
-                    )
-            elif not isinstance(cursor_value, str) or not cursor_value:
-                raise ValueError(
-                    f"ZendeskTicketsConnector: malformed after_cursor in Zendesk payload: {cursor_value!r}"
-                )
-            else:
-                page_cursor = cursor_value
-
-            yield tickets, page_cursor
-
+            # Zendesk incremental API signals "caught up" via end_of_stream.
+            # Always check this before following next_page — when end_of_stream
+            # is true, next_page still exists but points back to the same cursor,
+            # which would cause an infinite loop.
             if payload.get("end_of_stream"):
                 break
 
-            next_cursor = page_cursor
-            if next_cursor is None:
+            next_page = payload.get("next_page")
+            if not next_page:
                 break
 
-            # Guard: if we have already seen this exact cursor the stream has
+            # Guard: if we have already fetched this exact URL the cursor has
             # not advanced and continuing would loop forever.
-            if next_cursor in seen_cursors:
+            if next_page in seen_page_urls:
                 break
-            seen_cursors.add(next_cursor)
+            seen_page_urls.add(next_page)
+
+    def _extract_page_end_time(self, payload: dict[str, Any]) -> datetime | None:
+        """Return Zendesk's generated-timestamp cursor without unsafe coercion."""
+        if "end_time" in payload:
+            end_time_value = payload["end_time"]
+        else:
+            next_page = payload.get("next_page")
+            if not isinstance(next_page, str) or not next_page:
+                return None
+            start_times = parse_qs(urlparse(next_page).query).get("start_time", [])
+            if len(start_times) != 1 or not start_times[0].isdigit():
+                raise ValueError(
+                    f"ZendeskTicketsConnector: malformed start_time in next_page: {next_page!r}"
+                )
+            end_time_value = int(start_times[0])
+
+        if isinstance(end_time_value, bool) or not isinstance(end_time_value, int) or end_time_value < 0:
+            raise ValueError(
+                f"ZendeskTicketsConnector: malformed end_time in Zendesk payload: {end_time_value!r}"
+            )
+        try:
+            return datetime.fromtimestamp(end_time_value, tz=UTC)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ValueError(
+                f"ZendeskTicketsConnector: malformed end_time in Zendesk payload: {end_time_value!r}"
+            ) from exc
 
     def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]] | None:
         """Fetch comments for a ticket, returning None on 404 or after exhausting retries."""
@@ -588,9 +595,6 @@ class ZendeskTicketsConnector(BaseConnector):
     def _checkpoint_path(self) -> Path:
         return self._state_dir / "resume_checkpoint.txt"
 
-    def _cursor_path(self) -> Path:
-        return self._state_dir / "resume_cursor.txt"
-
     def _state_path(self) -> Path:
         return self._state_dir / "manifest_state.json"
 
@@ -602,30 +606,25 @@ class ZendeskTicketsConnector(BaseConnector):
             return self._parse_dt(checkpoint)
         return datetime.min.replace(tzinfo=UTC)
 
-    def _save_cursor(self, cursor: str) -> None:
-        """Persist the opaque Zendesk cursor for the next export's start point.
-
-        Strict validation: a present-but-empty or non-string after_cursor is a
-        malformed response — failing the run is safer than silently treating
-        it as a resume point, which would either re-serve or skip records.
-        """
-        if not isinstance(cursor, str) or not cursor:
-            raise ValueError("malformed after_cursor: must be a non-empty string")
-        path = self._cursor_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._atomic_write(path, cursor)
-        log.info("ZendeskTicketsConnector.cursor_saved: path=%s value=%s", path, cursor)
-
-    def _load_cursor(self, state: dict[str, Any]) -> str | None:
-        path = self._cursor_path()
+    def _save_checkpoint(self, value: datetime) -> None:
+        path = self._checkpoint_path()
+        # Guard against checkpoint regression: Zendesk pages can arrive out of
+        # updated_at order, so never persist a value older than what is on
+        # disk. Otherwise a buggy or unlucky run would rewind the resume point.
         if path.exists():
-            cursor = path.read_text().strip()
-            if cursor:
-                return cursor
-        cursor = state.get("cursor")
-        if isinstance(cursor, str) and cursor:
-            return cursor
-        return None
+            existing = self._parse_dt(path.read_text().strip())
+            if value <= existing:
+                log.info(
+                    "ZendeskTicketsConnector.checkpoint_not_saved: incoming=%s existing=%s (no advance)",
+                    self._format_dt(value),
+                    self._format_dt(existing),
+                )
+                return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(path, self._format_dt(value))
+        if self._aggressive_checkpoint:
+            self._preserve_run_cache = True
+        log.info("ZendeskTicketsConnector.checkpoint_saved: path=%s value=%s", path, self._format_dt(value))
 
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
@@ -651,10 +650,9 @@ class ZendeskTicketsConnector(BaseConnector):
         path = self._state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         snapshot = dict(state)
-        if checkpoint is not None:
-            snapshot["checkpoint"] = self._format_dt(checkpoint)
-        if self._pending_cursor is not None:
-            snapshot["cursor"] = self._pending_cursor
+        effective = checkpoint if checkpoint is not None else self._pending_checkpoint
+        if effective is not None:
+            snapshot["checkpoint"] = self._format_dt(effective)
         self._atomic_write(path, json.dumps(snapshot, indent=2, sort_keys=True))
 
     def _state_entries_by_ticket(self, state: dict[str, Any]) -> dict[str, list[ManifestEntry]]:
@@ -663,9 +661,11 @@ class ZendeskTicketsConnector(BaseConnector):
             result[ticket_id] = [ManifestEntry(**entry) for entry in ticket_state.get("entries", [])]
         return result
 
-    def _reset_run_cache(self) -> None:
+    def _reset_run_cache(self, state: dict[str, Any]) -> None:
         cache_dir = self._state_dir / ".run-cache"
-        if self._aggressive_checkpoint and (self._checkpoint_path().exists() or self._cursor_path().exists()):
+        has_durable_checkpoint = self._checkpoint_path().exists() or bool(state.get("checkpoint"))
+        self._preserve_run_cache = self._aggressive_checkpoint and has_durable_checkpoint
+        if self._preserve_run_cache:
             cache_dir.mkdir(parents=True, exist_ok=True)
             self._run_cache_dir = cache_dir
             self._file_cache.clear()
