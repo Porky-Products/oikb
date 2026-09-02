@@ -247,6 +247,46 @@ def test_build_manifest_renders_comments_and_persists_state_after_success(monkey
     connector.close()
 
 
+def test_aggressive_checkpoint_saves_state_before_cursor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Aggressive in-run saves must persist manifest state, not just the cursor.
+
+    Persisting the cursor alone means a failed sync afterward resumes PAST the
+    newly built tickets whose entries were never in manifest_state.json —
+    permanent omission, since run-cache restoration needs an existing manifest
+    entry. State and cursor are now written together at the page boundary.
+    """
+    state_dir = _make_state_dir(tmp_path, "aggressive-state-before-cursor")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T02:00:00Z")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?start_time=1704164645",
+            },
+            {
+                "tickets": [_ticket(1002, "2024-01-02T04:04:05Z")],
+                "end_time": 1704168245,
+                "next_page": None,
+            },
+        ],
+        comments={1001: [], 1002: []},
+    )
+
+    connector.build_manifest()
+
+    # Simulate sync failure: entries for 1001 (page-1 boundary) must already be
+    # in manifest_state.json alongside the advanced checkpoint.
+    saved_state = json.loads((state_dir / "manifest_state.json").read_text())
+    assert "1001" in saved_state["ticket_files"]
+    assert checkpoint_path.read_text().strip() == "2024-01-02T04:04:05Z"
+    connector.close()
+
+
 def test_sync_failure_does_not_advance_checkpoint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "checkpoint-on-success")
     connector = _build_connector(

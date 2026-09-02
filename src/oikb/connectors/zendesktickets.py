@@ -157,10 +157,32 @@ class ZendeskTicketsConnector(BaseConnector):
             # a beyond-cursor fallback skips them (unsafe).
             if page_end_time is not None:
                 if not page_end_time_seen or page_end_time > pending_checkpoint:
+                    if self._aggressive_checkpoint:
+                        # Persist the manifest state for tickets completed so
+                        # far BEFORE advancing the resume cursor. If the
+                        # process dies between the two writes, the state leads
+                        # the checkpoint: the next run re-serves this page and
+                        # each already-saved ticket is deduplicated by
+                        # checksum — duplicates are safe. The reverse order
+                        # (cursor ahead of state) permanently omits the new
+                        # entries: cache restoration needs a manifest entry
+                        # that was never written.
+                        new_checkpoint = self._pending_checkpoint_after(checkpoint, page_end_time)
+                        self._save_state(
+                            self._build_midrun_state(
+                                prior_entries,
+                                state,
+                                seen_ticket_ids,
+                                excluded_ticket_ids,
+                                attachments_enabled_previously,
+                                current_entries_by_ticket,
+                                current_updated_at_by_ticket,
+                            ),
+                            checkpoint=new_checkpoint,
+                        )
+                        self._save_checkpoint(new_checkpoint)
                     page_end_time_seen = True
                     pending_checkpoint = page_end_time
-                    if self._aggressive_checkpoint:
-                        self._save_checkpoint(page_end_time)
                 # else: end_time cursor already at or past this page's value.
             elif page_max_updated_at is not None and not page_end_time_seen:
                 if pending_checkpoint is None or page_max_updated_at > pending_checkpoint:
@@ -236,6 +258,54 @@ class ZendeskTicketsConnector(BaseConnector):
                 tickets_processed,
             )
         return manifest
+
+    def _pending_checkpoint_after(self, checkpoint: datetime, page_end_time: datetime) -> datetime:
+        """Checkpoint value after accepting this page's end_time cursor.
+
+        Never regresses below the run-start checkpoint.
+        """
+        return page_end_time if page_end_time > checkpoint else checkpoint
+
+    def _build_midrun_state(
+        self,
+        prior_entries: dict[str, list[ManifestEntry]],
+        state: dict[str, Any],
+        seen_ticket_ids: set[str],
+        excluded_ticket_ids: set[str],
+        attachments_enabled_previously: bool,
+        page_entries: dict[str, list[ManifestEntry]],
+        page_updated_at: dict[str, str],
+    ) -> dict[str, Any]:
+        """Manifest state snapshot for an in-process aggressive save.
+
+        Mirrors the end-of-run snapshot logic: prior tickets not seen or
+        excluded this run carry forward, merged with tickets completed so
+        far. The caller persists it with the run-local pending checkpoint.
+        """
+        carried_forward = {
+            ticket_id: entries
+            for ticket_id, entries in prior_entries.items()
+            if ticket_id not in seen_ticket_ids and ticket_id not in excluded_ticket_ids
+        }
+        if attachments_enabled_previously and not self._download_attachments:
+            for ticket_id, entries in list(carried_forward.items()):
+                attachment_path = f"{_ATTACHMENT_PATH}/{ticket_id}"
+                carried_forward[ticket_id] = [entry for entry in entries if entry.path != attachment_path]
+        combined = carried_forward | page_entries
+        snapshot = {
+            "attachments_enabled": self._download_attachments,
+            "ticket_files": {
+                ticket_id: {
+                    "entries": [entry.to_dict() for entry in entries],
+                    "updated_at": page_updated_at.get(
+                        ticket_id,
+                        ((state.get("ticket_files") or {}).get(ticket_id, {})).get("updated_at", ""),
+                    ),
+                }
+                for ticket_id, entries in combined.items()
+            },
+        }
+        return snapshot
 
     def read_file(self, path: str, filename: str) -> bytes:
         content_path = self._file_cache.get((path, filename))
@@ -592,12 +662,13 @@ class ZendeskTicketsConnector(BaseConnector):
             return {}
         return json.loads(path.read_text())
 
-    def _save_state(self, state: dict[str, Any]) -> None:
+    def _save_state(self, state: dict[str, Any], checkpoint: datetime | None = None) -> None:
         path = self._state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         snapshot = dict(state)
-        if self._pending_checkpoint is not None:
-            snapshot["checkpoint"] = self._format_dt(self._pending_checkpoint)
+        effective = checkpoint if checkpoint is not None else self._pending_checkpoint
+        if effective is not None:
+            snapshot["checkpoint"] = self._format_dt(effective)
         path.write_text(json.dumps(snapshot, indent=2, sort_keys=True))
 
     def _state_entries_by_ticket(self, state: dict[str, Any]) -> dict[str, list[ManifestEntry]]:
