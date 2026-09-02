@@ -186,14 +186,20 @@ class ZendeskTicketsConnector(BaseConnector):
                         new_checkpoint = self._pending_checkpoint_after(checkpoint, page_end_time)
                         self._save_checkpoint(new_checkpoint)
                     page_end_time_seen = True
-                    pending_checkpoint = page_end_time
+                    # Never regress below the run-start checkpoint: a first
+                    # end_time at or below it (inclusive >= start_time
+                    # boundary, or a stale state-file checkpoint without a
+                    # resume file) must not rewind the cursor that
+                    # mark_sync_complete persists at run end.
+                    pending_checkpoint = self._pending_checkpoint_after(checkpoint, page_end_time)
                 # else: end_time cursor already at or past this page's value.
             elif page_max_updated_at is not None and not page_end_time_seen:
                 if pending_checkpoint is None or page_max_updated_at > pending_checkpoint:
                     # No end_time observed yet this run: retain
                     # max-updated_at so out-of-order legacy pages cannot
-                    # stall the checkpoint.
-                    pending_checkpoint = page_max_updated_at
+                    # stall the checkpoint. Same run-start clamp: the
+                    # fallback must never rewind the persisted cursor.
+                    pending_checkpoint = self._pending_checkpoint_after(checkpoint, page_max_updated_at)
 
             if cap_reached:
                 break
