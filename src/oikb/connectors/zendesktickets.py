@@ -140,34 +140,34 @@ class ZendeskTicketsConnector(BaseConnector):
             # updated_at values (updated_at reflects ticket events only, while
             # generated_timestamp reflects all updates).
             #
-            # Pages WITH end_time never fall back to updated_at: a self-built
-            # updated_at value could exceed Zendesk's cursor (updated_at does
-            # not bound generated_timestamp) and the no-regress guard would
-            # then lock the checkpoint past records that were never served —
-            # the exact gap mode this change eliminates. When some pages
-            # carry end_time, their cursor wins; a later page with only
-            # updated_at cannot regress the pending checkpoint beyond the
-            # retained max. The updated_at fallback exists solely for
-            # legacy/degraded payloads that lack end_time entirely, where
-            # stalling would be worse than the (unchanged) pre-existing risk.
+            # The FIRST end_time observed in the run replaces the pending
+            # checkpoint outright rather than max-comparing against it: a
+            # prior legacy page may have set a fallback from updated_at, and
+            # updated_at can sit beyond the true cursor (it does not bound
+            # generated_timestamp). Keeping such a fallback would advance the
+            # checkpoint past records that were never served, and once
+            # persisted the no-regress guard locks it in — the exact gap
+            # mode this change eliminates. After the first end_time, only
+            # end_time values participate; later end_time values normally
+            # increase (pages ordered by generated_timestamp) but are still
+            # max-compared defensively. The updated_at fallback exists solely
+            # for runs whose pages lack end_time entirely, where stalling
+            # would be worse; fallback values are never aggressively saved
+            # mid-run — a crash re-serves tickets (safe), whereas persisting
+            # a beyond-cursor fallback skips them (unsafe).
             if page_end_time is not None:
-                page_end_time_seen = True
-                if pending_checkpoint is None or page_end_time > pending_checkpoint:
+                if not page_end_time_seen or page_end_time > pending_checkpoint:
+                    page_end_time_seen = True
                     pending_checkpoint = page_end_time
                     if self._aggressive_checkpoint:
                         self._save_checkpoint(page_end_time)
-            elif page_max_updated_at is not None:
-                if pending_checkpoint is None or (
-                    not page_end_time_seen and page_max_updated_at > pending_checkpoint
-                ):
+                # else: end_time cursor already at or past this page's value.
+            elif page_max_updated_at is not None and not page_end_time_seen:
+                if pending_checkpoint is None or page_max_updated_at > pending_checkpoint:
                     # No end_time observed yet this run: retain
                     # max-updated_at so out-of-order legacy pages cannot
                     # stall the checkpoint.
                     pending_checkpoint = page_max_updated_at
-                    if self._aggressive_checkpoint:
-                        self._save_checkpoint(page_max_updated_at)
-                # else: an end_time-cursor checkpoint is already ahead; a
-                # legacy updated_at value must NOT advance or regress it.
 
             if cap_reached:
                 break
