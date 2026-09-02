@@ -269,7 +269,13 @@ def test_aggressive_checkpoint_keeps_run_cache_after_failure_for_resume(monkeypa
     connector = _build_connector(
         monkeypatch,
         state_dir,
-        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704165845,  # 2024-01-02T03:04:05Z
+                "next_page": None,
+            }
+        ],
         comments={1001: []},
     )
 
@@ -1308,6 +1314,48 @@ def test_legacy_page_updated_at_does_not_advance_past_end_time_cursor(monkeypatc
             },
         ],
         comments={1001: [], 1002: [], 1003: []},
+    )
+
+    connector.build_manifest()
+
+    assert connector._pending_checkpoint is not None and connector._pending_checkpoint.strftime("%Y-%m-%dT%H:%M:%SZ") == "2024-01-02T03:00:00Z"
+    connector.mark_sync_complete()
+    assert checkpoint_path.read_text().strip() == "2024-01-02T03:00:00Z"
+    connector.close()
+
+
+def test_first_end_time_replaces_updated_at_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """The first observed end_time must replace a prior updated_at fallback outright.
+
+    A legacy page (no end_time) can set the fallback from updated_at, which
+    may sit beyond Zendesk's true cursor. If the next page's authoritative
+    end_time merely max-compared against that fallback, the unsafe value
+    would survive. The first end_time replaces the fallback instead.
+    """
+    state_dir = _make_state_dir(tmp_path, "first-end-time-replaces-fallback")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T02:00:00Z")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                # Legacy payload: no end_time; updated_at (05:00) beyond the
+                # true cursor that page 2 will report.
+                "tickets": [
+                    _ticket(1002, "2024-01-02T05:00:00Z"),
+                ],
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?per_page=1&start_time=1704171600",
+            },
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:00:00Z"),
+                ],
+                "end_time": 1704164400,  # 2024-01-02T03:00:00Z
+                "next_page": None,
+            },
+        ],
+        comments={1001: [], 1002: []},
     )
 
     connector.build_manifest()
