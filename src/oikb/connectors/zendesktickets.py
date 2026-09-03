@@ -105,45 +105,55 @@ class ZendeskTicketsConnector(BaseConnector):
         cap_reached = False
 
         for page_tickets, page_end_time in self._iter_ticket_pages(checkpoint):
-            for ticket in page_tickets:
-                ticket_id = str(ticket["id"])
-                seen_ticket_ids.add(ticket_id)
+            # Once the cap has fired on an earlier page, an equal-boundary
+            # page (end_time == checkpoint) must not be processed again:
+            # doing so is exactly the unbounded-processing bug the cap
+            # exists to prevent (comment/attachment fetches for every
+            # ticket on every page sharing one generated timestamp). These
+            # pages are only scanned here for their end_time, so the run
+            # can detect when Zendesk's cursor has actually moved past the
+            # checkpoint; their tickets are left neither seen nor excluded,
+            # so they are safely re-served (and processed under a fresh
+            # cap) once the checkpoint truly advances on a later run.
+            deferred_by_cap = cap_reached
+            if not deferred_by_cap:
+                for ticket in page_tickets:
+                    ticket_id = str(ticket["id"])
+                    seen_ticket_ids.add(ticket_id)
 
-                if not self._should_include_ticket(ticket):
-                    excluded_ticket_ids.add(ticket_id)
-                    continue
+                    if not self._should_include_ticket(ticket):
+                        excluded_ticket_ids.add(ticket_id)
+                        continue
 
-                comments = self._fetch_ticket_comments(ticket["id"])
-                if comments is None:
-                    excluded_ticket_ids.add(ticket_id)
-                    continue
-                entries, updated_at_value = self._build_ticket_entries(ticket, comments)
-                current_entries_by_ticket[ticket_id] = entries
-                current_updated_at_by_ticket[ticket_id] = updated_at_value
-                tickets_processed += 1
+                    comments = self._fetch_ticket_comments(ticket["id"])
+                    if comments is None:
+                        excluded_ticket_ids.add(ticket_id)
+                        continue
+                    entries, updated_at_value = self._build_ticket_entries(ticket, comments)
+                    current_entries_by_ticket[ticket_id] = entries
+                    current_updated_at_by_ticket[ticket_id] = updated_at_value
+                    tickets_processed += 1
 
-                if self._max_tickets_per_run is not None and tickets_processed >= self._max_tickets_per_run:
-                    # Finish the current page before stopping: the checkpoint
-                    # for a capped run is the page's end_time (Zendesk's own
-                    # cursor). Stopping mid-page would either reuse this
-                    # page's end_time and re-serve the unprocessed remainder
-                    # of the page or skip it, and any updated_at-derived
-                    # value can jump past tickets that still need processing
-                    # (Zendesk compares start_time against
-                    # generated_timestamp, not updated_at). Per-page
-                    # overshoot is bounded by per_page - 1 tickets, BUT a
-                    # cap fired on an equal-boundary page (end_time ==
-                    # checkpoint) keeps consuming whole pages until
-                    # Zendesk's cursor advances, which can span arbitrarily
-                    # many pages sharing one generated timestamp. The cap
-                    # bounds ticket *processing*, not total pages fetched.
-                    cap_reached = True
+                    if self._max_tickets_per_run is not None and tickets_processed >= self._max_tickets_per_run:
+                        # Finish the current page before stopping: the checkpoint
+                        # for a capped run is the page's end_time (Zendesk's own
+                        # cursor). Stopping mid-page would either reuse this
+                        # page's end_time and re-serve the unprocessed remainder
+                        # of the page or skip it, and any updated_at-derived
+                        # value can jump past tickets that still need processing
+                        # (Zendesk compares start_time against
+                        # generated_timestamp, not updated_at). Per-page
+                        # overshoot is bounded by per_page - 1 tickets.
+                        cap_reached = True
 
             # Zendesk's documented resume strategy for time-based exports is
             # to use the returned end_time as the next export's start_time.
             # Only that generated-timestamp cursor is safe: updated_at does
             # not bound generated_timestamp and can skip unserved tickets.
-            if page_end_time is not None:
+            # While deferred_by_cap, the checkpoint must not advance: this
+            # page's tickets were not processed, so persisting its end_time
+            # would lose them.
+            if page_end_time is not None and not deferred_by_cap:
                 if self._aggressive_checkpoint:
                     # Persist page state before advancing the checkpoint.
                     # A crash can then re-serve saved entries, but cannot
@@ -165,11 +175,13 @@ class ZendeskTicketsConnector(BaseConnector):
                         self._save_checkpoint(page_end_time)
                     pending_checkpoint = page_end_time
 
-            # A cap reached on an inclusive boundary page must not stop at the
-            # same checkpoint forever. Continue page-by-page until Zendesk's
-            # cursor advances; normal capped runs still stop on the page where
-            # the cap fires.
-            if cap_reached and pending_checkpoint > checkpoint:
+            if deferred_by_cap:
+                # Scanning-only page: stop as soon as Zendesk's cursor has
+                # moved past the original checkpoint. Do not adopt this
+                # page's end_time (see above) -- simply stop looking.
+                if page_end_time is not None and page_end_time > checkpoint:
+                    break
+            elif cap_reached and pending_checkpoint > checkpoint:
                 break
 
         carried_forward = {
