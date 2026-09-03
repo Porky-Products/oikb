@@ -130,8 +130,13 @@ class ZendeskTicketsConnector(BaseConnector):
                     # of the page or skip it, and any updated_at-derived
                     # value can jump past tickets that still need processing
                     # (Zendesk compares start_time against
-                    # generated_timestamp, not updated_at). Overshoot is
-                    # bounded by per_page - 1 tickets.
+                    # generated_timestamp, not updated_at). Per-page
+                    # overshoot is bounded by per_page - 1 tickets, BUT a
+                    # cap fired on an equal-boundary page (end_time ==
+                    # checkpoint) keeps consuming whole pages until
+                    # Zendesk's cursor advances, which can span arbitrarily
+                    # many pages sharing one generated timestamp. The cap
+                    # bounds ticket *processing*, not total pages fetched.
                     cap_reached = True
 
             # Zendesk's documented resume strategy for time-based exports is
