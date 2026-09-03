@@ -14,12 +14,17 @@ each orphan (files NOT linked to any other KB):
 
 1. deletes its vectors from the KB collection (by ``file_id``) and from the
    per-file ``file-{id}`` collection,
-2. deletes the stored blob (row deletion is skipped if the blob delete
-   raises, so the orphan stays discoverable for a later re-run),
+2. deletes the stored blob, then the File row, committing each batch
+   immediately so a crash cannot strand File rows whose blobs are already
+   gone (a blob that is already missing, e.g. from a crashed earlier run,
+   is treated as deleted so the row cleanup can finish; any other blob
+   delete error retains the row for a later re-run),
 3. deletes the File row -- unless the file is linked to another knowledge
    base (then it keeps its File row and per-file collection, and only the
    vectors it may have partially indexed into THIS KB collection, filtered
-   by ``file_id``, are scrubbed).
+   by ``file_id``, are scrubbed). If the file was re-linked to THIS KB
+   mid-run (e.g. the sync daemon restarted during the purge), it is left
+   fully intact -- no vector scrub, no blob delete, no row delete.
 
 Default mode is DRY-RUN: it prints what it would do and changes nothing.
 Pass ``--apply`` to actually purge. ``--verbose`` prints every candidate.
@@ -65,6 +70,7 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
 
     removed_files = 0
     scrubbed_only = 0
+    relinked_to_target = 0
     failed = 0
 
     async with get_async_db_context() as db:
@@ -217,37 +223,54 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
 
         for i in range(0, total, BATCH):
             batch = orphans[i : i + BATCH]
-            # Re-check other-KB linkage per batch: the prefetch above is a
-            # point-in-time snapshot, and a link can appear mid-run (e.g.
-            # a sync daemon restarting). One EXISTS-free query per batch
-            # (BATCH bind params, well under PostgreSQL's 65535 limit).
-            # NOTE: linkage to ANY KB (not just other KBs) protects the
-            # row -- a re-link to this same KB mid-run must also survive,
-            # or the script would delete the blob of a live file.
+            # Re-check linkage per batch: the prefetch above is a point-in-
+            # time snapshot, and a link can appear mid-run (e.g. a sync
+            # daemon restarting). One query per batch (BATCH bind params,
+            # well under PostgreSQL's 65535 limit).
             batch_ids = [f.id for f in batch]
-            still_linked = set(
+            linked_pairs = set(
                 (await db.execute(
-                    select(KnowledgeFile.file_id).where(
-                        KnowledgeFile.file_id.in_(batch_ids),
-                    )
-                )).scalars().all()
+                    select(KnowledgeFile.file_id, KnowledgeFile.knowledge_id)
+                    .where(KnowledgeFile.file_id.in_(batch_ids)),
+                )).all()
             )
-            # Two survival cases are kept apart so each is handled correctly:
-            #   - still linked (to any KB): vector-scrub only, row survives
+            # A mid-run re-link to the TARGET KB is a fully legitimate
+            # current state: the file's vectors belong in this KB, so no
+            # scrub of any kind is run against it. (vscrub_kb would delete
+            # the vectors of a live KB member.)
+            target_linked = {
+                fid for fid, kid in linked_pairs if kid == kb_id
+            }
+            # Any other re-link (different KB) keeps the File row and gets
+            # a vector scrub of only this KB's collection.
+            other_linked = {
+                fid for fid, kid in linked_pairs if kid != kb_id
+            }
+            # Three survival cases are kept apart so each is handled correctly:
+            #   - re-linked to this KB: untouched entirely
+            #   - still linked (to another KB): vector-scrub only, row survives
             #   - hash-scrub failure: fully retained (skipped below) so a
             #     re-run can retry; the error was already counted above.
+            relinked = [f for f in batch if f.id in target_linked]
             doom_pending = [
                 f for f in batch
-                if f.id not in still_linked
+                if f.id not in target_linked
+                and f.id not in other_linked
                 and f.hash not in failed_hashes
             ]
             scrub_only = [
                 f for f in batch
-                if f.id in still_linked and f.hash not in failed_hashes
+                if f.id in other_linked and f.hash not in failed_hashes
             ]
 
+            if relinked:
+                relinked_to_target += len(relinked)
+                logging.info(
+                    "Batch %d: %d file(s) re-linked to this KB mid-run; left intact",
+                    i // BATCH + 1, len(relinked),
+                )
+
             if apply:
-                # Vector scrub: 16 concurrent Qdrant round-trip pairs.
                 # scrub_only (linked elsewhere) gets the KB-collection-only
                 # variant so other KBs' retrieval keeps working.
                 # hash_retained is skipped entirely: its rows survive on
@@ -294,11 +317,22 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                         await asyncio.to_thread(Storage.delete_file, f.path)
                         blob_ok.append(f)
                     except Exception as e:  # noqa: BLE001
-                        failed += 1
-                        print(
-                            f"  ERROR deleting blob {f.id}: {e}",
-                            file=sys.stderr,
-                        )
+                        msg = str(e).lower()
+                        if (
+                            "not found" in msg
+                            or "no such file" in msg
+                            or "404" in msg
+                        ):
+                            # Blob already gone (e.g. a crashed earlier run
+                            # deleted it before the row's commit): safe to
+                            # finish by removing the File row itself.
+                            blob_ok.append(f)
+                        else:
+                            failed += 1
+                            print(
+                                f"  ERROR deleting blob {f.id}: {e}",
+                                file=sys.stderr,
+                            )
                 # DB delete: one statement per batch (BATCH ids << 65535),
                 # only for rows whose blob (and vectors) are already gone.
                 if blob_ok:
@@ -312,7 +346,12 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                 for f in batch:
                     if not verbose:
                         continue
-                    if f.id in other_ids:
+                    if f.id in target_linked:
+                        print(
+                            f"  would leave intact {f.id} ({f.filename})"
+                            " -- re-linked to this KB mid-run"
+                        )
+                    elif f.id in other_linked:
                         print(
                             f"  would scrub vectors only {f.id} ({f.filename})"
                             " -- linked elsewhere"
@@ -326,11 +365,15 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
             scrubbed_only += len(scrub_only)
             done += len(batch)
 
+            if apply:
+                # Commit every batch (not just at progress thresholds):
+                # a crash between blob delete and row delete would
+                # otherwise leave rows whose blobs are already gone, and
+                # some storage providers raise on the missing blob in a
+                # later re-run.
+                await db.commit()
+
             if done >= next_progress or done >= total:
-                if apply:
-                    # Incremental commit: bounds WAL/transaction size and
-                    # makes progress visible to outside count queries.
-                    await db.commit()
                 elapsed = time.monotonic() - started
                 rate = done / elapsed
                 eta_min = (total - done) / rate / 60 if rate > 0 else float("inf")
@@ -354,6 +397,7 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
     print(
         f"\n{mode} {removed_files} orphaned file(s); "
         f"{scrubbed_only} vector-scrub only (linked elsewhere); "
+        f"{relinked_to_target} re-linked to this KB mid-run (left intact); "
         f"{failed} error(s)."
         + (f"  [vector {t_vec:.0f}s, db+blob {t_db:.0f}s]" if apply else "")
     )

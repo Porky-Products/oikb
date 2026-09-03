@@ -220,8 +220,9 @@ class ZendeskTicketsConnector(BaseConnector):
             # import). An inclusive >= boundary would refetch them forever.
             log.warning(
                 "ZendeskTicketsConnector.checkpoint_stalled: cap reached without advancing checkpoint "
-                "(in=%s out=%s seen=%d processed=%d) — successful completion will block "
-                "future runs until cursor-based resume is implemented",
+                "(in=%s out=%s seen=%d processed=%d) — next run will retry from the stalled "
+                "boundary (new/updated tickets at that exact timestamp may be skipped until "
+                "Zendesk's cursor window moves past it)",
                 self._format_dt(checkpoint),
                 self._format_dt(pending_checkpoint),
                 len(seen_ticket_ids),
@@ -610,10 +611,18 @@ class ZendeskTicketsConnector(BaseConnector):
             value = path.read_text().strip()
             if value.startswith(_STALLED_CHECKPOINT_PREFIX):
                 stalled_at = value.removeprefix(_STALLED_CHECKPOINT_PREFIX)
-                raise RuntimeError(
-                    "Zendesk ticket sync blocked after an equal-timestamp checkpoint stall at "
-                    f"{stalled_at}. Cursor-based incremental export is required before resuming."
+                stalled_dt = self._parse_dt(stalled_at)
+                log.warning(
+                    "ZendeskTicketsConnector.checkpoint_stalled: previous run stopped at an "
+                    "equal-t timestamp boundary at %s; retrying from there (new/updated tickets "
+                    "at that exact timestamp may be skipped until Zendesk's cursor window moves)",
+                    stalled_at,
                 )
+                # Retryable: return the stalled timestamp so the next run
+                # refetches the equal-t boundary page. Raising here would
+                # permanently block every future run, even once Zendesk's
+                # start_time window advances past the boundary.
+                return stalled_dt
             return self._parse_dt(value)
         if checkpoint := state.get("checkpoint"):
             return self._parse_dt(checkpoint)
