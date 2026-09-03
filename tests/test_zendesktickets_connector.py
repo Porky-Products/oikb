@@ -134,6 +134,14 @@ class FakeClient:
         self.cleanup_calls.append({"kb_id": kb_id, "file_ids": file_ids, "dir_ids": dir_ids})
         return {}
 
+    def list_kb_files(self, kb_id: str) -> list[dict]:
+        # Mirror OikbClient.list_kb_files: file dicts with meta.file_hash /
+        # hash, used by the duplicate-upload guard.
+        return [
+            {"hash": f["checksum"], "meta": {"file_hash": f["checksum"]}}
+            for f in self.existing_files
+        ]
+
     def create_directory(self, kb_id: str, name: str, parent_id: str | None = None) -> dict:
         dir_id = f"dir-{len(self.directory_calls) + 1}"
         self.directory_calls.append({"kb_id": kb_id, "name": name, "parent_id": parent_id, "id": dir_id})
