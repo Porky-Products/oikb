@@ -42,8 +42,10 @@ argv through):
         < scripts/purge_kb_orphans.py
 
 IMPORTANT: stop the oikb sync daemon first (``docker stop oikb`` or
-equivalent via your container manager), otherwise in-flight uploads in
-pending/processing state would be misidentified as orphans and killed.
+equivalent via your container manager). Uploads still in flight
+(``data.status`` pending/processing) are excluded from the purge, but a
+daemon left running keeps uploading new files that will re-accumulate
+orphans for the next run.
 """
 
 import argparse
@@ -61,7 +63,7 @@ for _backend in ("/app/backend",):
 
 async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
     # Imports are deliberately late so ``--help`` works outside the container.
-    from sqlalchemy import delete as sa_delete, func, select
+    from sqlalchemy import coalesce, delete as sa_delete, func, select
 
     from open_webui.internal.db import get_async_db_context
     from open_webui.models.files import File
@@ -72,6 +74,7 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
     removed_files = 0
     scrubbed_only = 0
     relinked_to_target = 0
+    inflight_skipped = 0
     failed = 0
 
     async with get_async_db_context() as db:
@@ -105,6 +108,13 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
         }
         print(f"Protected hashes: {len(protected_hashes)}")
 
+        # In-flight uploads must be excluded: open-webui writes
+        # File.meta.data.knowledge_id at upload time, but the KnowledgeFile
+        # link is only created when the background job finishes
+        # (data.status: pending -> processing -> completed/failed; a missing
+        # status means no background job was ever requested). Purging a
+        # pending/processing row would kill a legit upload mid-flight.
+        status = func.trim(func.lower(coalesce(File.data["status"].as_string(), "")))
         orphans = (await db.execute(
             select(File)
             .where(
@@ -113,6 +123,7 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                     KnowledgeFile.knowledge_id == kb_id,
                     KnowledgeFile.file_id == File.id,
                 )),
+                ~status.in_(("pending", "processing")),
             )
             .order_by(File.created_at)
         )).scalars().all()
@@ -203,13 +214,18 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                 return e
 
         async def vscrub_all(f):
-            """Full scrub: this KB's collection plus the per-file one."""
+            """Full scrub: this KB's collection plus the per-file one.
+            delete_collection is the only cross-backend way to clear a
+            per-file collection: Chroma's delete() without ids/filter is a
+            no-op, and Qdrant multitenancy keeps per-file vectors inside a
+            shared 'file' collection keyed by tenant id (delete_collection
+            tenant-filters there). Noops safely when nothing exists."""
             try:
                 async with vscrub_sem:
                     await ASYNC_VECTOR_DB_CLIENT.delete(
                         collection_name=kb_id, filter={"file_id": f.id}
                     )
-                    await ASYNC_VECTOR_DB_CLIENT.delete(
+                    await ASYNC_VECTOR_DB_CLIENT.delete_collection(
                         collection_name=f"file-{f.id}"
                     )
                 return None
@@ -235,6 +251,30 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                     .where(KnowledgeFile.file_id.in_(batch_ids)),
                 )).all()
             )
+            # In-flight status refresh (fresh DB read): the orphan list was
+            # a point-in-time snapshot, and a previously terminal/absent
+            # status cannot reappear -- but the row could have entered
+            # pending/processing between snapshot and now (e.g. oikb
+            # restarted against expectations). Never purge those.
+            status = func.trim(func.lower(coalesce(File.data["status"].as_string(), "")))
+            inflight_ids = set(
+                (await db.execute(
+                    select(File.id).where(
+                        File.id.in_(batch_ids),
+                        status.in_(("pending", "processing")),
+                    )
+                )).scalars().all()
+            )
+            if inflight_ids:
+                inflight_count = len([
+                    f for f in batch if f.id in inflight_ids
+                ])
+                inflight_skipped += inflight_count
+                logging.warning(
+                    "Batch %d: %d in-flight upload(s) skipped (status "
+                    "pending/processing)",
+                    i // BATCH + 1, inflight_count,
+                )
             # A mid-run re-link to the TARGET KB is a fully legitimate
             # current state: the file's vectors belong in this KB, so no
             # scrub of any kind is run against it. (vscrub_kb would delete
@@ -257,11 +297,14 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                 f for f in batch
                 if f.id not in target_linked
                 and f.id not in other_linked
+                and f.id not in inflight_ids
                 and f.hash not in failed_hashes
             ]
             scrub_only = [
                 f for f in batch
-                if f.id in other_linked and f.hash not in failed_hashes
+                if f.id in other_linked
+                and f.id not in inflight_ids
+                and f.hash not in failed_hashes
             ]
 
             if relinked:
@@ -399,6 +442,7 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
         f"\n{mode} {removed_files} orphaned file(s); "
         f"{scrubbed_only} vector-scrub only (linked elsewhere); "
         f"{relinked_to_target} re-linked to this KB mid-run (left intact); "
+        f"{inflight_skipped} in-flight skipped (pending/processing); "
         f"{failed} error(s)."
         + (f"  [vector {t_vec:.0f}s, db+blob {t_db:.0f}s]" if apply else "")
     )
