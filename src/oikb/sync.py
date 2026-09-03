@@ -35,6 +35,7 @@ class SyncResult:
     modified: int = 0
     deleted: int = 0
     unmodified: int = 0
+    duplicate_skipped: int = 0
     dirs_created: int = 0
     dirs_removed: int = 0
     errors: list[str] | None = None
@@ -54,6 +55,8 @@ class SyncResult:
             parts.append(f"{self.deleted} deleted")
         if self.unmodified:
             parts.append(f"{self.unmodified} unchanged")
+        if self.duplicate_skipped:
+            parts.append(f"{self.duplicate_skipped} duplicate skipped")
         if self.dirs_created:
             parts.append(f"{self.dirs_created} dirs created")
         if self.dirs_removed:
@@ -344,6 +347,35 @@ def _run_sync_inner(
     # ── 6. Upload files ────────────────────────────────────────
     manifest_by_key = {(e.path, e.filename): e for e in manifest}
 
+    # Dedup guard: open-webui rejects uploads whose content hash already
+    # exists in the KB (as a *different* file), leaving orphaned File rows
+    # that the diff cannot see.  Skip "added" entries whose checksum is
+    # already present in the KB, or duplicated within this run.
+    # "modified" entries are left alone: their stale file is cleaned up
+    # before upload, so the hash collision resolves itself.
+    if added:
+        kb_files = client.list_kb_files(kb_id)
+        existing_hashes = {
+            h for f in kb_files
+            for h in ((f.get("meta") or {}).get("file_hash"), f.get("hash"))
+            if h
+        }
+        added, skipped = filter_duplicate_uploads(
+            added, modified, manifest_by_key, existing_hashes
+        )
+        if skipped:
+            result.duplicate_skipped = len(skipped)
+            if verbose:
+                for display in skipped:
+                    click.echo(
+                        click.style(f"  ⏭ {display}: duplicate content, skipping", fg="yellow"),
+                        err=True,
+                    )
+            result.warnings.append(
+                f"Skipped {len(skipped)} duplicate upload(s) "
+                "(content hash already in KB or duplicated in this run)"
+            )
+
     files_to_upload = [
         *[(a, "added") for a in added],
         *[(m, "modified") for m in modified],
@@ -466,6 +498,48 @@ def _run_sync_inner(
                 _tally(_upload_one(i, entry, change_type, None, None))
 
     return result
+
+
+def filter_duplicate_uploads(
+    added: list[dict[str, Any]],
+    modified: list[dict[str, Any]],
+    manifest_by_key: dict[tuple[str, str], ManifestEntry],
+    existing_hashes: set[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Drop "added" entries whose content hash is already present in the KB
+    (or will be after this run's "modified" uploads, or is duplicated within
+    this run).
+
+    open-webui rejects an upload whose content hash exists as a *different*
+    file (``Duplicate content detected``), so such uploads can never succeed
+    and each attempt leaves an orphaned File row.  Content already lives in
+    the KB via the other copy, so skipping is retrievably equivalent.
+
+    Returns ``(filtered_added, skipped_display_names)``.
+    """
+    modified_hashes = {
+        me.checksum
+        for m in modified
+        if (me := manifest_by_key.get((m.get("path", ""), m["filename"])))
+    }
+    seen_in_run: set[str] = set()
+    filtered: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for a in added:
+        me = manifest_by_key.get((a.get("path", ""), a["filename"]))
+        checksum = me.checksum if me else None
+        display = f"{a.get('path', '')}/{a['filename']}"
+        if checksum and (
+            checksum in existing_hashes
+            or checksum in modified_hashes
+            or checksum in seen_in_run
+        ):
+            skipped.append(display)
+            continue
+        if checksum:
+            seen_in_run.add(checksum)
+        filtered.append(a)
+    return filtered, skipped
 
 
 def _echo_file_entry(entry: dict, prefix: str, color: str) -> None:
