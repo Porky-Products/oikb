@@ -63,7 +63,7 @@ for _backend in ("/app/backend",):
 
 async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
     # Imports are deliberately late so ``--help`` works outside the container.
-    from sqlalchemy import coalesce, delete as sa_delete, func, select
+    from sqlalchemy import coalesce, delete as sa_delete, func, or_, select
 
     from open_webui.internal.db import get_async_db_context
     from open_webui.models.files import File
@@ -175,12 +175,18 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
         failed_hashes: set[str] = set()
         if apply:
             # Refresh: links may have appeared since protected_hashes was
-            # computed (rows can be linked to this KB mid-run).
+            # computed (rows can be linked to this KB mid-run), and in-flight
+            # uploads excluded above still exist as File rows -- their
+            # freshly written vectors share the hash keyed in the KB
+            # collection, so their hashes must be protected too.
             protected_hashes = {
                 h for h in (await db.execute(
                     select(File.hash)
-                    .join(KnowledgeFile, KnowledgeFile.file_id == File.id)
-                    .where(KnowledgeFile.knowledge_id == kb_id)
+                    .outerjoin(KnowledgeFile, KnowledgeFile.file_id == File.id)
+                    .where(or_(
+                        KnowledgeFile.knowledge_id == kb_id,
+                        File.meta["data"]["knowledge_id"].as_string() == kb_id,
+                    ))
                 )).scalars().all() if h
             }
             for h in list(unprotected_orphan_hashes):
@@ -303,6 +309,7 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
             scrub_only = [
                 f for f in batch
                 if f.id in other_linked
+                and f.id not in target_linked
                 and f.id not in inflight_ids
                 and f.hash not in failed_hashes
             ]
