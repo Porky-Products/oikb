@@ -9,13 +9,17 @@ so those orphans are invisible and the sync re-uploads the same content on
 every run -- each failure adding another orphan.
 
 This script finds File rows whose ``meta.data.knowledge_id`` matches the KB
-but that are not present in the KB's ``knowledge_file`` link table, then:
+but that are not present in the KB's ``knowledge_file`` link table, then for
+each orphan (files NOT linked to any other KB):
 
-1. deletes their vectors from the KB collection (by ``file_id``, and by
-   ``hash`` only when that hash is NOT also used by a linked file),
-2. deletes vectors from the per-file ``file-{id}`` collection,
-3. deletes the File row and its stored blob -- unless the file is linked to
-   another knowledge base (then only the vector scrub happens).
+1. deletes its vectors from the KB collection (by ``file_id``) and from the
+   per-file ``file-{id}`` collection,
+2. deletes the stored blob (row deletion is skipped if the blob delete
+   raises, so the orphan stays discoverable for a later re-run),
+3. deletes the File row -- unless the file is linked to another knowledge
+   base (then it keeps its File row and per-file collection, and only the
+   vectors it may have partially indexed into THIS KB collection, filtered
+   by ``file_id``, are scrubbed).
 
 Default mode is DRY-RUN: it prints what it would do and changes nothing.
 Pass ``--apply`` to actually purge. ``--verbose`` prints every candidate.
@@ -64,6 +68,8 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
     failed = 0
 
     async with get_async_db_context() as db:
+        from sqlalchemy import exists as sa_exists
+
         result = await db.execute(
             select(Knowledge).filter(Knowledge.id == kb_id)
         )
@@ -73,13 +79,6 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
             return 2
         print(f"Knowledge base: {kb.name} ({kb.id})")
 
-        linked_ids = set(
-            (await db.execute(
-                select(KnowledgeFile.file_id).filter(
-                    KnowledgeFile.knowledge_id == kb_id
-                )
-            )).scalars().all()
-        )
         linked_count = await db.scalar(
             select(func.count())
             .select_from(KnowledgeFile)
@@ -103,7 +102,10 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
             select(File)
             .where(
                 File.meta["data"]["knowledge_id"].as_string() == kb_id,
-                File.id.notin_(linked_ids),
+                ~sa_exists(select(KnowledgeFile).where(
+                    KnowledgeFile.knowledge_id == kb_id,
+                    KnowledgeFile.file_id == File.id,
+                )),
             )
             .order_by(File.created_at)
         )).scalars().all()
@@ -159,8 +161,21 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
         VSCRUB_CONCURRENCY = 16
         vscrub_sem = asyncio.Semaphore(VSCRUB_CONCURRENCY)
 
-        async def vscrub(f):
-            """Scrub one orphan's vectors; return None on success."""
+        async def vscrub_kb(f):
+            """Scrub only this KB's collection (file_id filter). For orphans
+            that are linked to another KB: keep their per-file collection and
+            File row intact."""
+            try:
+                async with vscrub_sem:
+                    await ASYNC_VECTOR_DB_CLIENT.delete(
+                        collection_name=kb_id, filter={"file_id": f.id}
+                    )
+                return None
+            except Exception as e:  # noqa: BLE001
+                return e
+
+        async def vscrub_all(f):
+            """Full scrub: this KB's collection plus the per-file one."""
             try:
                 async with vscrub_sem:
                     await ASYNC_VECTOR_DB_CLIENT.delete(
@@ -186,33 +201,57 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
 
             if apply:
                 # Vector scrub: 16 concurrent Qdrant round-trip pairs.
+                # scrub_batch (linked elsewhere) gets the KB-collection-only
+                # variant so other KBs' retrieval keeps working.
                 t0 = time.monotonic()
-                results = await asyncio.gather(*(vscrub(f) for f in batch))
+                doomed_results = await asyncio.gather(
+                    *(vscrub_all(f) for f in doomed)
+                )
+                scrub_results = await asyncio.gather(
+                    *(vscrub_kb(f) for f in scrub_batch)
+                )
                 t_vec += time.monotonic() - t0
-                for f, e in zip(batch, results):
-                    if e:
-                        failed += 1
-                        print(f"  ERROR on {f.id}: {e}", file=sys.stderr)
+                vec_errors = [
+                    (f.id, e)
+                    for f, e in zip(doomed, doomed_results)
+                    if e
+                ] + [
+                    (f.id, e)
+                    for f, e in zip(scrub_batch, scrub_results)
+                    if e
+                ]
+                for fid, e in vec_errors:
+                    failed += 1
+                    print(f"  ERROR on {fid}: {e}", file=sys.stderr)
 
-                # DB delete: one statement per batch (BATCH ids << 65535).
+                # Vectors scrubbed; anything that failed keeps its error
+                # count and is treated as NOT purged below.
+                vec_failed_ids = {fid for fid, _ in vec_errors}
+
+                # Blob delete FIRST: if it raises, the File row is retained
+                # so a later re-run can still find and finish the cleanup.
                 t0 = time.monotonic()
-                if doomed:
+                blob_ok: list[File] = []
+                for f in doomed:
+                    if f.id in vec_failed_ids or not f.path:
+                        continue
+                    try:
+                        await asyncio.to_thread(Storage.delete_file, f.path)
+                        blob_ok.append(f)
+                    except Exception as e:  # noqa: BLE001
+                        failed += 1
+                        print(
+                            f"  ERROR deleting blob {f.id}: {e}",
+                            file=sys.stderr,
+                        )
+                # DB delete: one statement per batch (BATCH ids << 65535),
+                # only for rows whose blob (and vectors) are already gone.
+                if blob_ok:
                     await db.execute(
                         sa_delete(File).where(
-                            File.id.in_([f.id for f in doomed])
+                            File.id.in_([f.id for f in blob_ok])
                         )
                     )
-                    for f in doomed:
-                        if not f.path:
-                            continue
-                        try:
-                            await asyncio.to_thread(Storage.delete_file, f.path)
-                        except Exception as e:  # noqa: BLE001
-                            failed += 1
-                            print(
-                                f"  ERROR deleting blob {f.id}: {e}",
-                                file=sys.stderr,
-                            )
                 t_db += time.monotonic() - t0
             else:
                 for f in batch:
@@ -221,7 +260,7 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                             f"  would purge File row {f.id} ({f.filename})"
                         )
 
-            removed_files += len(doomed)
+            removed_files += len(blob_ok) if apply else len(doomed)
             scrubbed_only += len(scrub_batch)
             done += len(batch)
 
