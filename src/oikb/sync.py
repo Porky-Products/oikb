@@ -269,6 +269,40 @@ def _run_sync_inner(
             parts.append(f"[dim]{unmodified_count} unchanged[/dim]")
         _console.print(f"  Diff: {', '.join(parts)}" if parts else "  [dim]Nothing to do[/dim]")
 
+    # ── Dedup guard ────────────────────────────────────────────
+    # open-webui rejects uploads whose content hash already exists in
+    # the KB (as a *different* file), leaving orphaned File rows that
+    # the diff cannot see.  Filter such "added" entries before the
+    # dry-run return so dry runs report the same totals the real run
+    # would produce.  "modified" entries are left alone: their stale
+    # file is cleaned up before upload, so the hash collision resolves
+    # itself.
+    manifest_by_key = {(e.path, e.filename): e for e in manifest}
+
+    skipped: list[str] = []
+    if added:
+        kb_files = client.list_kb_files(kb_id)
+        existing_hashes = {
+            h for f in kb_files
+            for h in ((f.get("meta") or {}).get("file_hash"), f.get("hash"))
+            if h
+        }
+        added, skipped = filter_duplicate_uploads(
+            added, modified, manifest_by_key, existing_hashes
+        )
+        if skipped:
+            result.duplicate_skipped = len(skipped)
+            if verbose:
+                for display in skipped:
+                    click.echo(
+                        click.style(f"  ⏭ {display}: duplicate content, skipping", fg="yellow"),
+                        err=True,
+                    )
+            result.warnings.append(
+                f"Skipped {len(skipped)} duplicate upload(s) "
+                "(content hash already in KB or duplicated in this run)"
+            )
+
     # ── Dry run: just print what would happen ──────────────────
     if dry_run:
         result.added = len(added)
@@ -345,36 +379,6 @@ def _run_sync_inner(
         result.dirs_created += 1
 
     # ── 6. Upload files ────────────────────────────────────────
-    manifest_by_key = {(e.path, e.filename): e for e in manifest}
-
-    # Dedup guard: open-webui rejects uploads whose content hash already
-    # exists in the KB (as a *different* file), leaving orphaned File rows
-    # that the diff cannot see.  Skip "added" entries whose checksum is
-    # already present in the KB, or duplicated within this run.
-    # "modified" entries are left alone: their stale file is cleaned up
-    # before upload, so the hash collision resolves itself.
-    if added:
-        kb_files = client.list_kb_files(kb_id)
-        existing_hashes = {
-            h for f in kb_files
-            for h in ((f.get("meta") or {}).get("file_hash"), f.get("hash"))
-            if h
-        }
-        added, skipped = filter_duplicate_uploads(
-            added, modified, manifest_by_key, existing_hashes
-        )
-        if skipped:
-            result.duplicate_skipped = len(skipped)
-            if verbose:
-                for display in skipped:
-                    click.echo(
-                        click.style(f"  ⏭ {display}: duplicate content, skipping", fg="yellow"),
-                        err=True,
-                    )
-            result.warnings.append(
-                f"Skipped {len(skipped)} duplicate upload(s) "
-                "(content hash already in KB or duplicated in this run)"
-            )
 
     files_to_upload = [
         *[(a, "added") for a in added],
