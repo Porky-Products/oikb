@@ -71,6 +71,18 @@ class TestFilterDuplicateUploads:
         assert filtered == []
         assert skipped == ["tickets/2/a.txt"]
 
+    def test_full_length_kb_hash_prefix_matched(self):
+        # open-webui stores full 64-char digests; manifest checksums are
+        # 16-char prefixes. The guard must treat them as equal.
+        full = "a" * 64
+        manifest_by_key = {("tickets/1", "a.txt"): _me("a.txt", "tickets/1", full[:16])}
+        added = [_entry("a.txt", "tickets/1")]
+        filtered, skipped = filter_duplicate_uploads(
+            added, [], manifest_by_key, existing_hashes={full}
+        )
+        assert filtered == []
+        assert skipped == ["tickets/1/a.txt"]
+
     def test_entry_missing_from_manifest_kept(self):
         # A diff entry with no manifest record has no checksum; safest to
         # keep it and let the upload path report its own error.

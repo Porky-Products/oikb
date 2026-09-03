@@ -520,7 +520,17 @@ def filter_duplicate_uploads(
     the KB via the other copy, so skipping is retrievably equivalent.
 
     Returns ``(filtered_added, skipped_display_names)``.
+
+    ``existing_hashes`` come from open-webui (full 64-char SHA-256 digests);
+    manifest checksums are 16-char digests, so KB-side hashes are also
+    prefix-truncated when building the comparison set.
     """
+    # Prefix-truncate KB-side hashes: manifest checksums are 16-char
+    # digests (sha256/[:16] by convention) and would never equal the
+    # full-length digests open-webui stores.
+    prefix_hashes = {
+        h[:16] for h in existing_hashes if len(h) > 16
+    } | set(existing_hashes)
     modified_hashes = {
         me.checksum
         for m in modified
@@ -534,7 +544,7 @@ def filter_duplicate_uploads(
         checksum = me.checksum if me else None
         display = f"{a.get('path', '')}/{a['filename']}"
         if checksum and (
-            checksum in existing_hashes
+            checksum in prefix_hashes
             or checksum in modified_hashes
             or checksum in seen_in_run
         ):
