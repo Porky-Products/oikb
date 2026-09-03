@@ -57,6 +57,15 @@ class BaseConnector(ABC):
       - read_file(): return raw bytes for a specific file
     """
 
+    # Connectors whose manifest checksums are content hashes (checksum
+    # equality implies content equality) set this True so sync can apply
+    # the duplicate-upload guard. Connectors with change-detection-only
+    # checksums (e.g. bitbucket commit-hash prefixes, gdrive fallback
+    # tokens) leave it False: identical checksums there do not imply
+    # identical content, so skipping "duplicate" uploads would drop
+    # legitimately distinct files.
+    content_addressed_checksums: bool = False
+
     @abstractmethod
     def build_manifest(self) -> list[ManifestEntry]:
         """Scan the source and return a manifest of all files.

@@ -48,6 +48,7 @@ pending/processing state would be misidentified as orphans and killed.
 
 import argparse
 import asyncio
+import logging
 import sys
 from pathlib import Path
 

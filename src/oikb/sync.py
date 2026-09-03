@@ -282,10 +282,13 @@ def _run_sync_inner(
     # content-addressed; gdrive is only when md5Checksum is present —
     # its Google-native fallback token hashes id+modifiedTime, so
     # checksum equality there does NOT imply identical content.)
-    manifest_by_key = {(e.path, e.filename): e for e in manifest}
-
+    # Connectors without that guarantee must skip the guard entirely:
+    # identical checksums there do not imply identical content, so
+    # skipping "duplicate" uploads would drop legitimately distinct
+    # files.
     skipped: list[str] = []
-    if added:
+    manifest_by_key = {(e.path, e.filename): e for e in manifest}
+    if added and getattr(connector, "content_addressed_checksums", False):
         kb_files = client.list_kb_files(kb_id)
         # Files scheduled for deletion (directly or as the stale half of
         # a modification) do not count as retained content: a rename or
@@ -304,17 +307,17 @@ def _run_sync_inner(
         added, skipped = filter_duplicate_uploads(
             added, modified, manifest_by_key, existing_hashes
         )
-        if skipped:
-            result.duplicate_skipped = len(skipped)
-            if verbose:
-                for display in skipped:
-                    click.echo(
-                        click.style(f"  ⏭ {display}: duplicate content, skipping", fg="yellow"),
-                        err=True,
-                    )
-            result.warnings.append(
-                f"Skipped {len(skipped)} duplicate upload(s) "
-                "(content hash already in KB or duplicated in this run)"
+    if skipped:
+        result.duplicate_skipped = len(skipped)
+        if verbose:
+            for display in skipped:
+                click.echo(
+                    click.style(f"  ⏭ {display}: duplicate content, skipping", fg="yellow"),
+                    err=True,
+                )
+        result.warnings.append(
+            f"Skipped {len(skipped)} duplicate upload(s) "
+            "(content hash already in KB or duplicated in this run)"
             )
 
     # ── Dry run: just print what would happen ──────────────────

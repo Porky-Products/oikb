@@ -141,6 +141,18 @@ def test_rename_regression_guard_off_would_skip_upload():
     assert added == diff_added
 
 
+class TestDedupCapabilityGate:
+    def test_base_connector_gate_defaults_off(self):
+        from oikb.connectors import BaseConnector
+
+        assert BaseConnector.content_addressed_checksums is False
+
+    def test_zendesk_connector_gate_on(self):
+        from oikb.connectors.zendesktickets import ZendeskTicketsConnector
+
+        assert ZendeskTicketsConnector.content_addressed_checksums is True
+
+
 class TestSyncResultSummary:
     def test_duplicate_skipped_in_summary(self):
         result = SyncResult(added=2, duplicate_skipped=5)

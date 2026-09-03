@@ -28,6 +28,10 @@ _STALLED_CHECKPOINT_PREFIX = "STALLED_EQUAL_TIMESTAMP:"
 
 
 class ZendeskTicketsConnector(BaseConnector):
+    # Ticket attachments are checksummed by truncated SHA-256 of content,
+    # so checksum equality implies content equality.
+    content_addressed_checksums = True
+
     def __init__(
         self,
         subdomain: str | None = None,
@@ -640,8 +644,17 @@ class ZendeskTicketsConnector(BaseConnector):
         # Guard against checkpoint regression: Zendesk pages can arrive out of
         # updated_at order, so never persist a value older than what is on
         # disk. Otherwise a buggy or unlucky run would rewind the resume point.
-        if path.exists():
-            existing = self._parse_dt(path.read_text().strip())
+        # A stalled sentinel value must not block the write: it prefixes a
+        # timestamp rather than being one, and _load_checkpoint treats it as
+        # retryable-but-older, so a resumed run must be able to replace it.
+        existing_raw = path.read_text().strip() if path.exists() else None
+        if existing_raw is not None:
+            if existing_raw.startswith(_STALLED_CHECKPOINT_PREFIX):
+                existing = self._parse_dt(
+                    existing_raw.removeprefix(_STALLED_CHECKPOINT_PREFIX)
+                )
+            else:
+                existing = self._parse_dt(existing_raw)
             if value <= existing:
                 log.info(
                     "ZendeskTicketsConnector.checkpoint_not_saved: incoming=%s existing=%s (no advance)",
