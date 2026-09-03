@@ -135,10 +135,15 @@ class FakeClient:
         return {}
 
     def list_kb_files(self, kb_id: str) -> list[dict]:
-        # Mirror OikbClient.list_kb_files: file dicts with meta.file_hash /
-        # hash, used by the duplicate-upload guard.
+        # Mirror OikbClient.list_kb_files: file dicts with id (checked
+        # against stale ids by the duplicate-upload guard),
+        # meta.file_hash / hash.
         return [
-            {"hash": f["checksum"], "meta": {"file_hash": f["checksum"]}}
+            {
+                "id": f["file_id"],
+                "hash": f["checksum"],
+                "meta": {"file_hash": f["checksum"]},
+            }
             for f in self.existing_files
         ]
 

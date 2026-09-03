@@ -277,13 +277,27 @@ def _run_sync_inner(
     # would produce.  "modified" entries are left alone: their stale
     # file is cleaned up before upload, so the hash collision resolves
     # itself.
+    # Scope: only sound for content-addressed connectors, where
+    # checksum equality implies content equality.  (zendesktickets is
+    # content-addressed; gdrive is only when md5Checksum is present —
+    # its Google-native fallback token hashes id+modifiedTime, so
+    # checksum equality there does NOT imply identical content.)
     manifest_by_key = {(e.path, e.filename): e for e in manifest}
 
     skipped: list[str] = []
     if added:
         kb_files = client.list_kb_files(kb_id)
+        # Files scheduled for deletion (directly or as the stale half of
+        # a modification) do not count as retained content: a rename or
+        # move is an added path plus a deleted path carrying the same
+        # checksum, and treating that as a duplicate would skip the new
+        # path while cleanup removes the only indexed copy.  Exclude
+        # them before comparing.
+        stale_ids = {d["file_id"] for d in deleted if d.get("file_id")}
+        stale_ids |= {m["stale_file_id"] for m in modified if m.get("stale_file_id")}
         existing_hashes = {
             h for f in kb_files
+            if f.get("id") not in stale_ids
             for h in ((f.get("meta") or {}).get("file_hash"), f.get("hash"))
             if h
         }
@@ -524,6 +538,14 @@ def filter_duplicate_uploads(
     ``existing_hashes`` come from open-webui (full 64-char SHA-256 digests);
     manifest checksums are 16-char digests, so KB-side hashes are also
     prefix-truncated when building the comparison set.
+
+    Caller must exclude hashes of files being removed this run (deleted
+    entries and stale halves of modifications) from ``existing_hashes``;
+    otherwise a rename/move — an added path plus a deleted path sharing
+    a checksum — would be skipped while cleanup removes the only
+    indexed copy.  Callers must also only invoke this guard when the
+    connector's checksums are content hashes (not change-detection
+    tokens like gdrive's id+modifiedTime digest).
     """
     # Prefix-truncate KB-side hashes: manifest checksums are 16-char
     # digests (sha256/[:16] by convention) and would never equal the
