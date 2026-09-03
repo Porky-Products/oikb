@@ -136,6 +136,9 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
 
         # Orphan hashes that no linked file uses -- each needs exactly ONE
         # hash-delete across the whole KB collection, not one per orphan row.
+        # Computed AFTER the prefetch; protected_hashes is refreshed below,
+        # right before the scrub, so a file linked to this KB mid-run that
+        # shares a hash with an older upload is not scrubbed.
         unprotected_orphan_hashes = {
             f.hash for f in orphans if f.hash and f.hash not in protected_hashes
         }
@@ -147,14 +150,32 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
         t_vec = t_db = 0.0
 
         # One-time hash scrub (must not race the concurrent file deletes).
+        # A failed hash-delete is recorded in failed_hashes: vectors keyed
+        # only by that hash become unrecoverable once the File rows are
+        # gone, so orphans carrying a failed hash keep their File rows and
+        # are only counted as errors for a later re-run to finish.
+        failed_hashes: set[str] = set()
         if apply:
+            # Refresh: links may have appeared since protected_hashes was
+            # computed (rows can be linked to this KB mid-run).
+            protected_hashes = {
+                h for h in (await db.execute(
+                    select(File.hash)
+                    .join(KnowledgeFile, KnowledgeFile.file_id == File.id)
+                    .where(KnowledgeFile.knowledge_id == kb_id)
+                )).scalars().all() if h
+            }
             for h in list(unprotected_orphan_hashes):
+                if h in protected_hashes:
+                    unprotected_orphan_hashes.discard(h)
+                    continue
                 try:
                     await ASYNC_VECTOR_DB_CLIENT.delete(
                         collection_name=kb_id, filter={"hash": h}
                     )
                 except Exception as e:  # noqa: BLE001
                     failed += 1
+                    failed_hashes.add(h)
                     print(f"  ERROR scrubbing hash {h}: {e}", file=sys.stderr)
                 unprotected_orphan_hashes.discard(h)
 
@@ -200,37 +221,52 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
             # point-in-time snapshot, and a link can appear mid-run (e.g.
             # a sync daemon restarting). One EXISTS-free query per batch
             # (BATCH bind params, well under PostgreSQL's 65535 limit).
+            # NOTE: linkage to ANY KB (not just other KBs) protects the
+            # row -- a re-link to this same KB mid-run must also survive,
+            # or the script would delete the blob of a live file.
             batch_ids = [f.id for f in batch]
-            still_other = set(
+            still_linked = set(
                 (await db.execute(
                     select(KnowledgeFile.file_id).where(
                         KnowledgeFile.file_id.in_(batch_ids),
-                        KnowledgeFile.knowledge_id != kb_id,
                     )
                 )).scalars().all()
             )
-            doomed = [f for f in batch if f.id not in still_other]
-            scrub_batch = [f for f in batch if f.id in still_other]
+            # Two survival cases are kept apart so each is handled correctly:
+            #   - still linked (to any KB): vector-scrub only, row survives
+            #   - hash-scrub failure: fully retained (skipped below) so a
+            #     re-run can retry; the error was already counted above.
+            doom_pending = [
+                f for f in batch
+                if f.id not in still_linked
+                and f.hash not in failed_hashes
+            ]
+            scrub_only = [
+                f for f in batch
+                if f.id in still_linked and f.hash not in failed_hashes
+            ]
 
             if apply:
                 # Vector scrub: 16 concurrent Qdrant round-trip pairs.
-                # scrub_batch (linked elsewhere) gets the KB-collection-only
+                # scrub_only (linked elsewhere) gets the KB-collection-only
                 # variant so other KBs' retrieval keeps working.
+                # hash_retained is skipped entirely: its rows survive on
+                # purpose, and the scrub error was already tallied.
                 t0 = time.monotonic()
                 doomed_results = await asyncio.gather(
-                    *(vscrub_all(f) for f in doomed)
+                    *(vscrub_all(f) for f in doom_pending)
                 )
                 scrub_results = await asyncio.gather(
-                    *(vscrub_kb(f) for f in scrub_batch)
+                    *(vscrub_kb(f) for f in scrub_only)
                 )
                 t_vec += time.monotonic() - t0
                 vec_errors = [
                     (f.id, e)
-                    for f, e in zip(doomed, doomed_results)
+                    for f, e in zip(doom_pending, doomed_results)
                     if e
                 ] + [
                     (f.id, e)
-                    for f, e in zip(scrub_batch, scrub_results)
+                    for f, e in zip(scrub_only, scrub_results)
                     if e
                 ]
                 for fid, e in vec_errors:
@@ -245,7 +281,7 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                 # so a later re-run can still find and finish the cleanup.
                 t0 = time.monotonic()
                 blob_ok: list[File] = []
-                for f in doomed:
+                for f in doom_pending:
                     if f.id in vec_failed_ids:
                         continue
                     if not f.path:
@@ -286,8 +322,8 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                             f"  would purge File row {f.id} ({f.filename})"
                         )
 
-            removed_files += len(blob_ok) if apply else len(doomed)
-            scrubbed_only += len(scrub_batch)
+            removed_files += len(blob_ok) if apply else len(doom_pending)
+            scrubbed_only += len(scrub_only)
             done += len(batch)
 
             if done >= next_progress or done >= total:

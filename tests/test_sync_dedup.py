@@ -101,6 +101,46 @@ class TestFilterDuplicateUploads:
         assert skipped == []
 
 
+def test_rename_reuploads_file_sharing_hash_with_deleted_file():
+    """A moved file (same content, new path) must not be skipped as duplicate.
+
+    sync_diff reports the old path as deleted (removing the only KB copy) and
+    the new path as added. The guard must ignore hashes of files this run
+    deletes, or the added upload is skipped and the content lost.
+    """
+    kb_files = [{"id": "f1", "hash": "abc", "meta": {"file_hash": "abc"}}]
+    stale = {"f1"}
+    existing = {f["hash"] for f in kb_files if f.get("id") not in stale}
+    manifest_by_key = {("tickets/new", "1001.md"): _me("1001.md", "tickets/new", "abc")}
+    diff_added = [{"path": "tickets/new", "filename": "1001.md", "checksum": "abc", "size": 10}]
+
+    added, _dup = filter_duplicate_uploads(diff_added, [], manifest_by_key, existing)
+
+    assert added == diff_added
+
+
+def test_rename_regression_guard_off_would_skip_upload():
+    """Without stale-id exclusion the rename upload WOULD be skipped.
+
+    Documents the original bug: existing_hashes included the to-be-deleted
+    file's hash, so filter_duplicate_uploads dropped the added entry.
+    """
+    kb_files = [{"id": "f1", "hash": "abc", "meta": {"file_hash": "abc"}}]
+    manifest_by_key = {("tickets/new", "1001.md"): _me("1001.md", "tickets/new", "abc")}
+    diff_added = [{"path": "tickets/new", "filename": "1001.md", "checksum": "abc", "size": 10}]
+
+    # Buggy call site: no stale exclusion.
+    buggy_existing = {f["hash"] for f in kb_files}
+
+    added, _dup = filter_duplicate_uploads(diff_added, [], manifest_by_key, buggy_existing)
+    assert added == []
+
+    # Fixed call site: exclude stale ids.
+    fixed_existing = {f["hash"] for f in kb_files if f.get("id") not in {"f1"}}
+    added, _dup = filter_duplicate_uploads(diff_added, [], manifest_by_key, fixed_existing)
+    assert added == diff_added
+
+
 class TestSyncResultSummary:
     def test_duplicate_skipped_in_summary(self):
         result = SyncResult(added=2, duplicate_skipped=5)

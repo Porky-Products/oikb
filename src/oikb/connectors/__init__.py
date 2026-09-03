@@ -14,7 +14,13 @@ class ManifestEntry:
         filename: Basename of the file (e.g. "readme.md").
         path:     Directory path relative to source root (e.g. "docs/api").
                   Empty string for root-level files.
-        checksum: SHA-256 hex digest of the file content.
+        checksum: Change-detection token (see below). For most connectors this
+                  is a truncated SHA-256 hex digest of the file content, but
+                  connectors that cannot cheaply hash content may use another
+                  stable token (e.g. the gdrive connector uses
+                  md5Checksum when available and otherwise hashes
+                  id+modifiedTime). Callers must NOT assume two entries with
+                  equal checksums have identical content.
         size:     File size in bytes.
     """
 
