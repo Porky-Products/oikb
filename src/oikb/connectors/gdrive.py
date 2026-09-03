@@ -116,9 +116,11 @@ class GDriveConnector(BaseConnector):
                     if not filename.endswith(ext):
                         filename += ext
 
-                # Use md5 checksum for native files, hash modifiedTime for Google Docs.
+                # Use md5 checksum for native files; for Google-native docs
+                # hash id+modifiedTime so two docs touched at the same
+                # instant can't collide on the same checksum.
                 checksum = item.get("md5Checksum") or hashlib.sha256(
-                    item.get("modifiedTime", "").encode()
+                    f"{item['id']}:{item.get('modifiedTime', '')}".encode()
                 ).hexdigest()[:16]
 
                 entries.append(

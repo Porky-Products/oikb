@@ -196,8 +196,21 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
 
         for i in range(0, total, BATCH):
             batch = orphans[i : i + BATCH]
-            doomed = [f for f in batch if f.id not in other_ids]
-            scrub_batch = [f for f in batch if f.id in other_ids]
+            # Re-check other-KB linkage per batch: the prefetch above is a
+            # point-in-time snapshot, and a link can appear mid-run (e.g.
+            # a sync daemon restarting). One EXISTS-free query per batch
+            # (BATCH bind params, well under PostgreSQL's 65535 limit).
+            batch_ids = [f.id for f in batch]
+            still_other = set(
+                (await db.execute(
+                    select(KnowledgeFile.file_id).where(
+                        KnowledgeFile.file_id.in_(batch_ids),
+                        KnowledgeFile.knowledge_id != kb_id,
+                    )
+                )).scalars().all()
+            )
+            doomed = [f for f in batch if f.id not in still_other]
+            scrub_batch = [f for f in batch if f.id in still_other]
 
             if apply:
                 # Vector scrub: 16 concurrent Qdrant round-trip pairs.
@@ -233,7 +246,13 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                 t0 = time.monotonic()
                 blob_ok: list[File] = []
                 for f in doomed:
-                    if f.id in vec_failed_ids or not f.path:
+                    if f.id in vec_failed_ids:
+                        continue
+                    if not f.path:
+                        # No blob backing the row (e.g. its file was already
+                        # removed from storage): nothing to delete there, so
+                        # the row itself can be removed.
+                        blob_ok.append(f)
                         continue
                     try:
                         await asyncio.to_thread(Storage.delete_file, f.path)
@@ -255,7 +274,14 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                 t_db += time.monotonic() - t0
             else:
                 for f in batch:
-                    if verbose:
+                    if not verbose:
+                        continue
+                    if f.id in other_ids:
+                        print(
+                            f"  would scrub vectors only {f.id} ({f.filename})"
+                            " -- linked elsewhere"
+                        )
+                    else:
                         print(
                             f"  would purge File row {f.id} ({f.filename})"
                         )
