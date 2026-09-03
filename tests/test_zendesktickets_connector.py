@@ -419,10 +419,16 @@ def test_cap_continues_until_equal_boundary_cursor_advances(
     connector.close()
 
 
-def test_terminal_equal_boundary_writes_stall_sentinel_and_blocks_next_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_terminal_equal_boundary_writes_stall_sentinel_and_next_run_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ):
-    """Fail closed when time-based export cannot advance past capped records."""
+    """Stall sentinel must be retryable, not a permanent block.
+
+    When time-based export cannot advance past capped records, the sentinel
+    marks the condition on disk. A subsequent run must NOT raise (that
+    would block every future run forever) — it logs a warning and retries
+    from the stalled timestamp.
+    """
     state_dir = _make_state_dir(tmp_path, "cap-terminal-equal-boundary")
     checkpoint_path = state_dir / "resume_checkpoint.txt"
     checkpoint_path.write_text("2024-01-02T03:00:00Z")
@@ -447,10 +453,14 @@ def test_terminal_equal_boundary_writes_stall_sentinel_and_blocks_next_run(
 
     assert checkpoint_path.read_text().strip() == "STALLED_EQUAL_TIMESTAMP:2024-01-02T03:00:00Z"
 
+    # Next run must retry from the stalled timestamp, not raise.
     connector2 = _build_connector(monkeypatch, state_dir, pages=[])
-    with pytest.raises(RuntimeError, match="Cursor-based incremental export is required"):
-        connector2.build_manifest()
-    assert connector2._http.calls == []
+    state = connector2._load_state()
+    with caplog.at_level("WARNING"):
+        loaded = connector2._load_checkpoint(state)
+    assert loaded.strftime("%Y-%m-%dT%H:%M:%SZ") == "2024-01-02T03:00:00Z"
+    assert any("checkpoint_stalled" in rec.message for rec in caplog.records)
+    assert all(rec.levelname != "ERROR" for rec in caplog.records)
     connector2.close()
 
 
