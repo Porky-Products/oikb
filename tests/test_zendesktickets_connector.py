@@ -385,10 +385,20 @@ def test_first_end_time_below_run_start_does_not_rewind_checkpoint(monkeypatch: 
     connector.close()
 
 
-def test_cap_continues_until_equal_boundary_cursor_advances(
+def test_cap_defers_processing_on_pages_after_an_equal_boundary_cap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
-    """Cap-limited run must cross an inclusive equal-timestamp boundary."""
+    """Once the cap fires on an equal-boundary page, later pages must not
+    be fully processed just to find where the cursor advances.
+
+    Processing every ticket on every subsequent page (comment/attachment
+    fetches included) until Zendesk's cursor moves past the checkpoint
+    defeats the cap's purpose of bounding per-run ticket processing. Pages
+    scanned after the cap has already fired are checked for end_time only;
+    their tickets are deferred (neither seen nor excluded) and the
+    checkpoint is left unchanged so a later run re-serves and processes
+    them under a fresh cap.
+    """
     state_dir = _make_state_dir(tmp_path, "cap-equal-boundary")
     checkpoint_path = state_dir / "resume_checkpoint.txt"
     checkpoint_path.write_text("2024-01-02T03:00:00Z")
@@ -414,8 +424,11 @@ def test_cap_continues_until_equal_boundary_cursor_advances(
     manifest = connector.build_manifest()
     connector.mark_sync_complete()
 
-    assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md"]
-    assert checkpoint_path.read_text().strip() == "2024-01-02T03:01:00Z"
+    # Only 1001 (the page where the cap fired) is processed this run; 1002
+    # is deferred and the checkpoint stays put (marked stalled) so it is
+    # retried next run.
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
+    assert checkpoint_path.read_text().strip() == "STALLED_EQUAL_TIMESTAMP:2024-01-02T03:00:00Z"
     connector.close()
 
 

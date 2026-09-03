@@ -402,6 +402,11 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                             f"  would leave intact {f.id} ({f.filename})"
                             " -- re-linked to this KB mid-run"
                         )
+                    elif f.id in inflight_ids:
+                        print(
+                            f"  would skip {f.id} ({f.filename})"
+                            " -- in-flight (status pending/processing)"
+                        )
                     elif f.id in other_linked:
                         print(
                             f"  would scrub vectors only {f.id} ({f.filename})"
