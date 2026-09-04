@@ -410,7 +410,7 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
                 started_at=started_at,
                 error=str(e),
             )
-        log.error(f"Sync failed for {source}: {e}")
+        log.error(f"Sync failed for {source}: {e}", exc_info=True)
 
         await _send_notification(entry, {
             "source": source,

@@ -135,4 +135,7 @@ class OikbClient:
         resp = self._http.get(f"/knowledge/{kb_id}")
         resp.raise_for_status()
         data = resp.json()
-        return data.get("files", [])
+        # The server may return an explicit JSON null (e.g. a KB whose
+        # files were never linked) — .get's default only covers a
+        # missing key, not a null value.
+        return data.get("files") or []
