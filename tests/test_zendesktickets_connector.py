@@ -432,6 +432,70 @@ def test_cap_defers_processing_on_pages_after_an_equal_boundary_cap(
     connector.close()
 
 
+def test_stall_retry_makes_cumulative_progress_through_equal_timestamp_zone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Consecutive capped runs must converge through a >cap equal-timestamp zone.
+
+    A bulk import can share one generated timestamp across more tickets than
+    ZENDESKTICKET_MAX_TICKETS_PER_RUN allows per run. The stall sentinel makes
+    the retry loadable, but an absolute cap would re-process the same first
+    `cap` tickets on every retry and never advance the checkpoint (livelock).
+    Each retry must skip already-served tickets (stored state + unchanged
+    updated_at) without burning cap budget or dropping them from the
+    manifest, so progress through the zone is cumulative and a later run
+    advances the checkpoint past the zone.
+    """
+    state_dir = _make_state_dir(tmp_path, "stall-retry-converges")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("2024-01-02T03:00:00Z")
+    zone_tickets = [_ticket(2000 + i, "2024-01-02T03:00:00Z") for i in range(20)]
+    zone_page_1 = {
+        "tickets": zone_tickets[0:10],
+        "end_time": 1704164400,  # 2024-01-02T03:00:00Z == checkpoint
+        "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?start_time=1704164400&page=2",
+    }
+    zone_page_2 = {
+        "tickets": zone_tickets[10:20],
+        "end_time": 1704164400,
+        "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?start_time=1704164400&page=3",
+    }
+    after_zone_page = {
+        "tickets": [_ticket(3000, "2024-01-02T05:00:00Z")],
+        "end_time": 1704171600,  # 2024-01-02T05:00:00Z
+        "next_page": None,
+    }
+    comments = {tid: [] for tid in range(2000, 2020)}
+    comments[3000] = []
+    all_ids = [f"tickets/{2000 + i}.md" for i in range(20)]
+
+    for run in range(3):
+        connector = _build_connector(
+            monkeypatch,
+            state_dir,
+            pages=[dict(zone_page_1), dict(zone_page_2), dict(after_zone_page)],
+            comments=comments,
+        )
+        connector._max_tickets_per_run = 10
+        manifest = connector.build_manifest()
+        connector.mark_sync_complete()
+        ids = [entry.display_path for entry in manifest]
+        if run == 0:
+            # Cap fires inside the zone: first slice processed, stall.
+            assert ids == all_ids[0:10]
+            assert checkpoint_path.read_text().strip() == "STALLED_EQUAL_TIMESTAMP:2024-01-02T03:00:00Z"
+        elif run == 1:
+            # Retry skips already-served tickets and processes the next
+            # slice; prior entries are carried forward in the manifest.
+            assert ids == all_ids[0:20]
+            assert checkpoint_path.read_text().strip() == "STALLED_EQUAL_TIMESTAMP:2024-01-02T03:00:00Z"
+        else:
+            # Zone exhausted: checkpoint advances past it, ticket 3000 syncs.
+            assert ids == all_ids + ["tickets/3000.md"]
+            assert checkpoint_path.read_text().strip() == "2024-01-02T05:00:00Z"
+        connector.close()
+
+
 def test_terminal_equal_boundary_writes_stall_sentinel_and_next_run_retries(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ):

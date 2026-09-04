@@ -83,6 +83,7 @@ class ZendeskTicketsConnector(BaseConnector):
         self._restored_content: dict[tuple[str, str], bytes] = {}
         self._pending_checkpoint: datetime | None = None
         self._checkpoint_stalled = False
+        self._resuming_from_stall = False
         self._run_cache_dir: Path | None = None
         self._preserve_run_cache = False
         self._aggressive_checkpoint = _parse_bool(os.environ.get("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "false"))
@@ -94,6 +95,15 @@ class ZendeskTicketsConnector(BaseConnector):
         checkpoint = self._load_checkpoint(state)
         prior_entries = self._state_entries_by_ticket(state)
         attachments_enabled_previously = bool(state.get("attachments_enabled", False))
+        # updated_at stored at each ticket's last full processing; used by
+        # the stall-retry fast path below. Zendesk bumps updated_at on any
+        # content change, so an unchanged value means the stored entries are
+        # still current and need not be rebuilt (comment/attachment fetches).
+        prior_updated_at_by_ticket: dict[str, str] = {
+            ticket_id: str((ticket_state or {}).get("updated_at") or "")
+            for ticket_id, ticket_state in (state.get("ticket_files") or {}).items()
+        }
+        attachments_config_consistent = attachments_enabled_previously == self._download_attachments
 
         self._reset_run_cache(state)
         current_entries_by_ticket: dict[str, list[ManifestEntry]] = {}
@@ -119,6 +129,29 @@ class ZendeskTicketsConnector(BaseConnector):
             if not deferred_by_cap:
                 for ticket in page_tickets:
                     ticket_id = str(ticket["id"])
+
+                    # Stall-retry fast path: when resuming from a stall
+                    # sentinel, a re-served ticket already fully processed by
+                    # a prior capped run (stored entries + unchanged
+                    # updated_at + same attachments setting) is skipped
+                    # without fetching comments/attachments and WITHOUT
+                    # counting against the run cap or being marked seen.
+                    # Without this, each retry re-processes the same first
+                    # `cap` tickets of the equal-timestamp zone forever
+                    # (livelock) and the checkpoint can never advance.
+                    # Skipping without marking seen leaves the stored
+                    # entries carried forward, so the manifest and state
+                    # keep them: cap budget is spent only on tickets the
+                    # zone has not yet served, so every retry makes
+                    # cumulative progress through the zone.
+                    if (
+                        self._resuming_from_stall
+                        and attachments_config_consistent
+                        and ticket_id in prior_entries
+                        and str(ticket.get("updated_at") or "") == prior_updated_at_by_ticket.get(ticket_id, "")
+                    ):
+                        continue
+
                     seen_ticket_ids.add(ticket_id)
 
                     if not self._should_include_ticket(ticket):
@@ -643,6 +676,7 @@ class ZendeskTicketsConnector(BaseConnector):
                 # refetches the equal-t boundary page. Raising here would
                 # permanently block every future run, even once Zendesk's
                 # start_time window advances past the boundary.
+                self._resuming_from_stall = True
                 return stalled_dt
             return self._parse_dt(value)
         if checkpoint := state.get("checkpoint"):
