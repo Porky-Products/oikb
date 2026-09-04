@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Zendesk Tickets**: `ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS` filters downloaded ticket/comment attachments by filename extension, defaulting to a document-centric list so images, audio, and video are skipped. Previously synced attachments that no longer match are removed from the KB on the next run. Set the variable to an empty value to download every attachment.
+
 ## [0.4.0] - 2026-07-17
 
 ### Added

@@ -425,6 +425,7 @@ Optional settings:
 |---|---|
 | `ZENDESKTICKET_PAGE_SIZE` | Tickets per page, defaults to `10` |
 | `ZENDESKTICKET_DOWNLOAD_ATTACHMENTS` | Download ticket and comment attachments when true |
+| `ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS` | Comma-separated filename-extension allowlist for downloaded attachments; defaults to a document-centric list (`pdf,doc,docx,xls,xlsx,csv,tsv,md,rtf,txt,log,json,xml,yml,yaml,html,htm,eml,msg`); set to an empty value to allow every attachment |
 | `ZENDESKTICKET_STATUS` | Comma-separated statuses to include (for example `open,solved,closed`) |
 | `ZENDESKTICKET_INCLUDETAGS` | Comma-separated tags; include tickets matching any listed tag |
 | `ZENDESKTICKET_EXCLUDETAGS` | Comma-separated tags to skip |
@@ -440,6 +441,7 @@ Behavior notes:
 - Checkpoints advance only after a successful sync run.
 - Tickets filtered out by tags or removed from Zendesk are removed from the KB on later syncs.
 - Turning `ZENDESKTICKET_DOWNLOAD_ATTACHMENTS` off removes previously synced attachment files on the next run.
+- Attachments are matched against `ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS` by filename extension (not content type). Attachments without an extension are blocked while an allowlist is active. Tightening the allowlist removes previously synced attachment files that no longer match on the next run. Setting the variable to an empty value disables filtering and downloads every attachment.
 
 ### All Connectors
 

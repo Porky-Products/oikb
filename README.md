@@ -194,6 +194,7 @@ Options:
 |---|---|
 | `ZENDESKTICKET_PAGE_SIZE` | Tickets per page, defaults to `10` |
 | `ZENDESKTICKET_DOWNLOAD_ATTACHMENTS` | Download ticket and comment attachments when true |
+| `ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS` | Comma-separated filename-extension allowlist for downloaded attachments; defaults to a document-centric list (`pdf,doc,docx,xls,xlsx,csv,tsv,md,rtf,txt,log,json,xml,yml,yaml,html,htm,eml,msg`); set to an empty value to allow every attachment |
 | `ZENDESKTICKET_STATUS` | Comma-separated statuses to include (for example `open,solved,closed`) |
 | `ZENDESKTICKET_INCLUDETAGS` | Comma-separated tags; include tickets matching any listed tag |
 | `ZENDESKTICKET_EXCLUDETAGS` | Comma-separated tags to skip |
