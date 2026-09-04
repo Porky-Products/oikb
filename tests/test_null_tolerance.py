@@ -23,6 +23,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from oikb.client import OikbClient
+from oikb.connectors import BaseConnector, ManifestEntry
+from oikb.sync import SyncResult, _run_sync_inner
 
 
 class _FakeResponse:
@@ -74,41 +76,89 @@ class TestListKbFilesNullTolerance:
         assert client.list_kb_files("kb1") == files
 
 
+class _NullDiffClient(OikbClient):
+    """Fake client whose sync_diff returns explicit-null diff lists."""
+
+    def __init__(self, diff: dict[str, Any] | None):
+        self._diff = diff if diff is not None else {}
+
+    def sync_diff(self, kb_id: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        return self._diff
+
+    def sync_cleanup(self, kb_id: str, file_ids: list[str], rmdir: list[str] | None) -> Any:
+        return {}
+
+    def create_directory(self, kb_id: str, name: str, parent_id: str | None) -> dict[str, Any]:
+        return {"id": "new-dir"}
+
+    def list_kb_files(self, kb_id: str) -> list[dict[str, Any]]:
+        return []
+
+
+class _StubConnector(BaseConnector):
+    """Minimal content-addressed connector with a one-file manifest."""
+
+    content_addressed_checksums = True
+
+    def __init__(self, manifest: list[ManifestEntry] | None = None):
+        self._manifest = manifest if manifest is not None else [
+            ManifestEntry(filename="t.md", path="", checksum="c1", size=10)
+        ]
+
+    def build_manifest(self) -> list[ManifestEntry]:
+        return list(self._manifest)
+
+    def read_file(self, path: str, filename: str) -> bytes:
+        return b"content"
+
+    def upload_file(self, kb_id: str, filename: str, content: bytes,
+                     path: str = "", parent_id: str | None = None) -> dict[str, Any]:
+        return {"id": "new-file"}
+
+
+def _run_null_sync(diff: dict[str, Any] | None) -> SyncResult:
+    """Drive the real _run_sync_inner with a stub connector and null diff."""
+    return _run_sync_inner(
+        client=_NullDiffClient(diff),
+        connector=_StubConnector(),
+        kb_id="kb1",
+        dry_run=True,
+        verbose=False,
+        quiet=True,
+        manifest_filter=None,
+        concurrency=1,
+        result=SyncResult(),
+        cancel_requested=None,
+    )
+
+
 class TestSyncDiffNullTolerance:
     """sync_diff response lists may be explicit nulls; parsing must not crash."""
 
-    def _diff_fields(self, payload: dict[str, Any]) -> dict[str, Any]:
-        # Mirrors the parsing in sync._run_sync_inner.
-        return {
-            "added": payload.get("added") or [],
-            "modified": payload.get("modified") or [],
-            "deleted": payload.get("deleted") or [],
-            "unmodified_count": payload.get("unmodified_count", 0),
-            "mkdir": payload.get("mkdir") or [],
-            "rmdir": payload.get("rmdir") or [],
-            "directory_map": payload.get("directory_map") or {},
-        }
-
     def test_all_lists_null(self):
-        fields = self._diff_fields(
+        # Exact failure shape from the production incident: sync_diff
+        # responds 200 with all list fields as explicit JSON nulls.
+        # Drives the real _run_sync_inner; reverting sync.py's parsing
+        # to dict.get(key, default) must fail this test.
+        result = _run_null_sync(
             {"added": None, "modified": None, "deleted": None,
              "mkdir": None, "rmdir": None, "directory_map": None}
         )
-        assert fields["added"] == []
-        assert fields["modified"] == []
-        assert fields["deleted"] == []
-        assert fields["mkdir"] == []
-        assert fields["rmdir"] == []
-        assert fields["directory_map"] == {}
+        assert result.added == 0
+        assert result.modified == 0
+        assert result.deleted == 0
+        assert result.dirs_created == 0
+        assert result.dirs_removed == 0
 
     def test_lists_missing(self):
-        fields = self._diff_fields({})
-        assert fields["added"] == []
-        assert fields["directory_map"] == {}
+        result = _run_null_sync({})
+        assert result.added == 0
+        assert result.dirs_created == 0
 
     def test_lists_present_passed_through(self):
-        payload = {"added": [{"path": "x"}], "deleted": [{"file_id": "f1"}],
+        payload = {"added": [{"path": "", "filename": "t.md", "checksum": "c1", "size": 10}],
+                   "deleted": [{"file_id": "f1", "filename": "old.md", "path": ""}],
                    "directory_map": {"tickets": "dir1"}}
-        fields = self._diff_fields(payload)
-        assert fields["added"] == [{"path": "x"}]
-        assert fields["directory_map"] == {"tickets": "dir1"}
+        result = _run_null_sync(payload)
+        assert result.added == 1
+        assert result.deleted == 1
