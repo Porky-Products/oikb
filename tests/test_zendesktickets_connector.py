@@ -15,7 +15,13 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from oikb.connectors import ManifestEntry
-from oikb.connectors.zendesktickets import ZendeskTicketsConnector, parse_zendesktickets_source
+from oikb.connectors.zendesktickets import (
+    _DEFAULT_ATTACHMENT_EXTENSIONS,
+    _extensions_from_state,
+    _parse_attachment_extensions,
+    ZendeskTicketsConnector,
+    parse_zendesktickets_source,
+)
 from oikb.sync import run_sync
 
 
@@ -2156,3 +2162,148 @@ def test_max_tickets_per_run_cap_spans_multiple_pages(monkeypatch: pytest.Monkey
 
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md", "tickets/1002.md", "tickets/1003.md", "tickets/1004.md"]
     connector.close()
+
+
+def test_comma_only_allowed_extensions_parses_as_allow_all():
+    """A comma-only env value has no real entries, so it must behave like an
+    empty value (allow all), never an empty frozenset — an empty frozenset
+    would serialize as [] but load back as allow-all, breaking the state
+    round-trip and permanently disabling the stall fast path.
+    """
+    assert _parse_attachment_extensions(",,") is None
+    assert _parse_attachment_extensions(", ,") is None
+    assert _extensions_from_state({"attachment_extensions": []}) is None
+    assert _parse_attachment_extensions(".pdf, DOCX") == frozenset({"pdf", "docx"})
+    # Exact round trip for every representable configuration:
+    for configured in (frozenset({"pdf"}), _DEFAULT_ATTACHMENT_EXTENSIONS):
+        assert _extensions_from_state({"attachment_extensions": sorted(configured)}) == configured
+
+
+def test_stall_retry_repocesses_tickets_when_allowlist_changed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Resuming from a stall under a changed allowlist must NOT take the
+    stall fast path: stored entries were built under a different allowlist,
+    so the stalled ticket is re-processed under the current one. A following
+    run with a matching allowlist takes the fast path again.
+    """
+    state_dir = _make_state_dir(tmp_path, "stall-allowlist-changed")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("STALLED_EQUAL_TIMESTAMP:2024-01-02T03:00:00Z")
+    (state_dir / "manifest_state.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "2024-01-02T03:00:00Z",
+                "attachments_enabled": True,
+                # State predates the allowlist feature (no key): previously
+                # every attachment was downloaded.
+                "ticket_files": {
+                    "1001": {
+                        "updated_at": "2024-01-02T03:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "1001.md", "checksum": "md", "size": 10},
+                            {"path": "attachments/1001", "filename": "1001-screenshot.png", "checksum": "img", "size": 5},
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.delenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", raising=False)
+    stalled_page = {
+        "tickets": [_ticket(1001, "2024-01-02T03:00:00Z", attachments=[_attachment("screenshot.png", url="https://acme.zendesk.com/attachments/screenshot.png")])],
+        "end_time": 1704164400,  # equal to the stalled checkpoint
+        "next_page": None,
+    }
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[stalled_page],
+        comments={1001: []},
+        attachments={"screenshot.png": b"image-bytes"},
+    )
+    connector._max_tickets_per_run = 1
+
+    manifest = connector.build_manifest()
+    connector.mark_sync_complete()
+    connector.close()
+
+    # Allowlist changed (state has no key, now default list): the ticket is
+    # re-processed, so the png attachment is dropped from the manifest.
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
+    assert checkpoint_path.read_text().strip() == "STALLED_EQUAL_TIMESTAMP:2024-01-02T03:00:00Z"
+
+    # Next run: state now records the current allowlist, so the fast path
+    # skips re-processing (updated_at unchanged, entries carried forward).
+    connector2 = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[dict(stalled_page)],
+        comments={1001: []},
+    )
+    manifest2 = connector2.build_manifest()
+    connector2.close()
+
+    assert [entry.display_path for entry in manifest2] == ["tickets/1001.md"]
+    comment_fetches = [call for call in connector2._http.calls if str(call["path"]).endswith("/comments.json")]
+    assert comment_fetches == []  # fast path: no comment/attachment fetch
+
+    state = json.loads((state_dir / "manifest_state.json").read_text())
+    assert state["attachment_extensions"] is not None
+
+
+def test_stall_retry_fast_path_applies_when_allowlist_matches_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Resuming from a stall with the same allowlist recorded in state takes
+    the fast path: stored entries are current, so no comment/attachment
+    fetches are made for the stalled ticket.
+    """
+    state_dir = _make_state_dir(tmp_path, "stall-allowlist-matches")
+    checkpoint_path = state_dir / "resume_checkpoint.txt"
+    checkpoint_path.write_text("STALLED_EQUAL_TIMESTAMP:2024-01-02T03:00:00Z")
+    (state_dir / "manifest_state.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "2024-01-02T03:00:00Z",
+                "attachments_enabled": True,
+                "attachment_extensions": ["txt"],
+                "ticket_files": {
+                    "1001": {
+                        "updated_at": "2024-01-02T03:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "1001.md", "checksum": "md", "size": 10},
+                            {"path": "attachments/1001", "filename": "1001-error-log.txt", "checksum": "log", "size": 4},
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "txt")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:00:00Z")],
+                "end_time": 1704164400,
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+    connector._max_tickets_per_run = 1
+
+    manifest = connector.build_manifest()
+    connector.close()
+
+    # Fast path: stored entries carried forward without re-processing.
+    assert sorted(entry.display_path for entry in manifest) == [
+        "attachments/1001/1001-error-log.txt",
+        "tickets/1001.md",
+    ]
+    comment_fetches = [call for call in connector._http.calls if str(call["path"]).endswith("/comments.json")]
+    assert comment_fetches == []

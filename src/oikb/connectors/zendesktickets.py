@@ -874,23 +874,28 @@ def _parse_attachment_extensions(value: str | None) -> frozenset[str] | None:
     """Parse the attachment extension allowlist.
 
     Unset env var -> document-centric default list. Present but empty (or
-    whitespace-only) -> None, meaning allow every attachment (the previous
-    behavior). Otherwise a lowercase set of the comma-separated values,
-    tolerating a leading dot on each entry (".pdf,docx").
+    effectively empty, e.g. comma-only) -> None, meaning allow every
+    attachment (the previous behavior). Otherwise a lowercase set of the
+    comma-separated values, tolerating a leading dot on each entry
+    (".pdf,docx"). An empty frozenset is deliberately unrepresentable so
+    the value round-trips exactly through the persisted state.
     """
     if value is None:
         return _DEFAULT_ATTACHMENT_EXTENSIONS
-    stripped = value.strip()
-    if not stripped:
-        return None
-    return frozenset(part.strip().lower().lstrip(".") for part in stripped.split(",") if part.strip())
+    parts = [part.strip().lower().lstrip(".") for part in value.split(",")]
+    extensions = frozenset(part for part in parts if part)
+    return extensions or None
 
 
 def _extensions_from_state(state: dict[str, Any]) -> frozenset[str] | None:
     """Attachment allowlist stored in a prior run's state.
 
-    Absent key means the state predates the allowlist feature and every
-    attachment was downloaded, which is equivalent to allow-all (None).
+    Absent key (or legacy value formats) means the state predates the
+    allowlist feature and every attachment was downloaded, which is
+    equivalent to allow-all (None). A non-empty list is the stored
+    allowlist; an empty list is treated as allow-all for backward
+    compatibility (an empty frozenset is unrepresentable since the fix to
+    comma-only env values parsing as None).
     """
     stored = state.get("attachment_extensions")
     if not stored:
