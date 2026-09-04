@@ -247,13 +247,13 @@ def _run_sync_inner(
             click.echo("Computing diff...", err=True)
         diff = client.sync_diff(kb_id, [e.to_dict() for e in manifest])
 
-    added: list[dict[str, Any]] = diff.get("added", [])
-    modified: list[dict[str, Any]] = diff.get("modified", [])
-    deleted: list[dict[str, Any]] = diff.get("deleted", [])
+    added: list[dict[str, Any]] = diff.get("added") or []
+    modified: list[dict[str, Any]] = diff.get("modified") or []
+    deleted: list[dict[str, Any]] = diff.get("deleted") or []
     unmodified_count: int = diff.get("unmodified_count", 0)
-    mkdir: list[str] = diff.get("mkdir", [])
-    rmdir: list[str] = diff.get("rmdir", [])
-    directory_map: dict[str, str] = diff.get("directory_map", {})
+    mkdir: list[str] = diff.get("mkdir") or []
+    rmdir: list[str] = diff.get("rmdir") or []
+    directory_map: dict[str, str] = diff.get("directory_map") or {}
 
     result.unmodified = unmodified_count
 
