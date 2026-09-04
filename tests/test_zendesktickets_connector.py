@@ -1131,6 +1131,7 @@ def test_filtered_ticket_is_removed_from_kb_on_next_sync(monkeypatch: pytest.Mon
 def test_attachments_are_added_when_enabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "attachments-enabled")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "txt,png")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -1211,6 +1212,7 @@ def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytes
 def test_attachments_with_same_name_use_content_hashes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "attachments-same-name")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "png")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -1294,6 +1296,7 @@ def test_page_size_must_be_positive_integer(monkeypatch: pytest.MonkeyPatch, tmp
 def test_external_attachment_downloads_without_authenticated_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "external-attachments")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "png")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -1324,6 +1327,207 @@ def test_external_attachment_downloads_without_authenticated_client(monkeypatch:
     assert [entry.display_path for entry in manifest] == ["attachments/1001/1001-b5eb7d-external.png", "tickets/1001.md"]
     assert external_calls == [{"url": "https://attachments.example/external.png", "timeout": 30.0}]
     assert all(call["path"] != "https://attachments.example/external.png" for call in connector._http.calls)
+    connector.close()
+
+
+def test_default_attachment_allowlist_blocks_non_matching_extensions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "default-allowlist")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.delenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", raising=False)
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[_attachment("error-log.txt", url="https://acme.zendesk.com/attachments/error-log.txt")],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={
+            1001: [
+                _comment(
+                    501,
+                    "See screenshot",
+                    attachments=[_attachment("screenshot.png", url="https://acme.zendesk.com/attachments/screenshot.png")],
+                )
+            ]
+        },
+        attachments={"error-log.txt": b"log-bytes"},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert sorted(entry.display_path for entry in manifest) == [
+        "attachments/1001/1001-91561f-error-log.txt",
+        "tickets/1001.md",
+    ]
+    # The blocked png must never be fetched.
+    assert all("screenshot.png" not in call["path"] for call in connector._http.calls)
+    connector.close()
+
+
+def test_custom_attachment_allowed_extensions_enable_non_default_types(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "custom-allowlist")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "PNG, .jpg")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[
+                            _attachment("screenshot.png", url="https://acme.zendesk.com/attachments/screenshot.png"),
+                            _attachment("photo.jpg", url="https://acme.zendesk.com/attachments/photo.jpg"),
+                            _attachment("notes.docx", url="https://acme.zendesk.com/attachments/notes.docx"),
+                        ],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+        attachments={"screenshot.png": b"png-bytes", "photo.jpg": b"jpg-bytes"},
+    )
+
+    manifest = connector.build_manifest()
+
+    extensions = {entry.filename.rsplit("-", 1)[-1].rsplit(".", 1)[-1] for entry in manifest if entry.path == "attachments/1001"}
+    assert extensions == {"png", "jpg"}  # docx blocked by the custom list
+    connector.close()
+
+
+def test_empty_attachment_allowed_extensions_allows_all(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "allowlist-empty")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[_attachment("screenshot.png", url="https://acme.zendesk.com/attachments/screenshot.png")],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+        attachments={"screenshot.png": b"image-bytes"},
+    )
+    client = FakeClient(existing_files=[])
+
+    result = run_sync(client=client, connector=connector, kb_id="kb-1", quiet=True)
+
+    assert [entry for entry in [upload["filename"] for upload in client.upload_calls] if entry.endswith("screenshot.png")]
+    state = json.loads((state_dir / "manifest_state.json").read_text())
+    assert state["attachment_extensions"] is None
+    connector.close()
+
+
+def test_extensionless_attachment_blocked_when_allowlist_active(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "allowlist-no-extension")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.delenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", raising=False)
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[_attachment("README", url="https://acme.zendesk.com/attachments/README")],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
+    assert all("README" not in call["path"] for call in connector._http.calls)
+    connector.close()
+
+
+def test_tightened_allowlist_removes_prior_non_matching_attachments(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A prior run (state predating the allowlist) synced a png; the default
+    allowlist now blocks png, so the next run drops it from the KB."""
+    state_dir = _make_state_dir(tmp_path, "allowlist-tightened")
+    (state_dir / "manifest_state.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "2024-01-01T00:00:00Z",
+                "attachments_enabled": True,
+                "ticket_files": {
+                    "1001": {
+                        "updated_at": "2024-01-01T00:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "1001.md", "checksum": "md", "size": 10},
+                            {"path": "attachments/1001", "filename": "1001-screenshot.png", "checksum": "img", "size": 5},
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    existing_files = [
+        {"path": "tickets", "filename": "1001.md", "checksum": "md", "file_id": "file-md"},
+        {"path": "attachments/1001", "filename": "1001-screenshot.png", "checksum": "img", "file_id": "file-img"},
+    ]
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.delenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", raising=False)
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comments={},
+    )
+    client = FakeClient(existing_files=existing_files)
+
+    result = run_sync(client=client, connector=connector, kb_id="kb-1", quiet=True)
+
+    assert result.deleted == 1
+    assert client.cleanup_calls == [{"kb_id": "kb-1", "file_ids": ["file-img"], "dir_ids": None}]
+    state = json.loads((state_dir / "manifest_state.json").read_text())
+    filenames = [entry["filename"] for entry in state["ticket_files"]["1001"]["entries"]]
+    assert filenames == ["1001.md"]
+    connector.close()
+
+
+def test_attachment_extensions_persisted_in_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "allowlist-persisted")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "txt, pdf")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comments={1001: []},
+    )
+    client = FakeClient(existing_files=[])
+
+    run_sync(client=client, connector=connector, kb_id="kb-1", quiet=True)
+
+    state = json.loads((state_dir / "manifest_state.json").read_text())
+    assert state["attachment_extensions"] == ["pdf", "txt"]
     connector.close()
 
 

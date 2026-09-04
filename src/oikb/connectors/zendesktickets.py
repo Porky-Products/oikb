@@ -25,6 +25,16 @@ _ZENDESK_RATE_LIMIT_STATUS = 429
 _TICKET_PATH = "tickets"
 _ATTACHMENT_PATH = "attachments"
 _STALLED_CHECKPOINT_PREFIX = "STALLED_EQUAL_TIMESTAMP:"
+# Document-centric default allowlist: matches on the attachment's filename
+# extension (not content_type), so images/audio/video are skipped unless
+# explicitly allowed. Keep in sync with README.md and docs/guide.md.
+_DEFAULT_ATTACHMENT_EXTENSIONS = frozenset(
+    {
+        "pdf", "doc", "docx", "xls", "xlsx", "csv", "tsv", "md", "rtf",
+        "txt", "log", "json", "xml", "yml", "yaml", "html", "htm", "eml", "msg",
+    }
+)
+_ATTACHMENT_EXTENSIONS_ENV = "ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS"
 
 
 class ZendeskTicketsConnector(BaseConnector):
@@ -44,6 +54,7 @@ class ZendeskTicketsConnector(BaseConnector):
         self._token = token or os.environ.get("ZENDESKTICKET_TOKEN", "")
         self._page_size = _parse_page_size(os.environ.get("ZENDESKTICKET_PAGE_SIZE", "10"))
         self._download_attachments = _parse_bool(os.environ.get("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "false"))
+        self._attachment_extensions = _parse_attachment_extensions(os.environ.get(_ATTACHMENT_EXTENSIONS_ENV))
         self._verbose_http = _parse_bool(os.environ.get("ZENDESKTICKET_VERBOSE_HTTP", "false"))
         self._max_retries = _parse_non_negative_int(os.environ.get("ZENDESKTICKET_MAX_RETRIES", "5"), "ZENDESKTICKET_MAX_RETRIES")
         self._backoff_base_seconds = _parse_positive_float(
@@ -103,7 +114,10 @@ class ZendeskTicketsConnector(BaseConnector):
             ticket_id: str((ticket_state or {}).get("updated_at") or "")
             for ticket_id, ticket_state in (state.get("ticket_files") or {}).items()
         }
-        attachments_config_consistent = attachments_enabled_previously == self._download_attachments
+        attachments_config_consistent = (
+            attachments_enabled_previously == self._download_attachments
+            and self._attachment_config_matches_state(state)
+        )
 
         self._reset_run_cache(state)
         current_entries_by_ticket: dict[str, list[ManifestEntry]] = {}
@@ -231,6 +245,19 @@ class ZendeskTicketsConnector(BaseConnector):
                     for entry in entries
                     if entry.path != attachment_path
                 ]
+        elif self._attachment_extensions is not None:
+            # Allowlist tightened (or upgraded from a state saved before it
+            # existed): drop carried-forward attachment entries whose filename
+            # extension no longer matches, so the next sync removes them
+            # from the KB.
+            for ticket_id, entries in list(carried_forward.items()):
+                attachment_path = f"{_ATTACHMENT_PATH}/{ticket_id}"
+                kept = [
+                    entry
+                    for entry in entries
+                    if entry.path != attachment_path or self._filename_extension_allowed(entry.filename)
+                ]
+                carried_forward[ticket_id] = kept
 
         combined_entries_by_ticket = carried_forward | current_entries_by_ticket
         manifest = [entry for entries in combined_entries_by_ticket.values() for entry in entries]
@@ -239,6 +266,7 @@ class ZendeskTicketsConnector(BaseConnector):
         self._manifest_entries_by_key = {(entry.path, entry.filename): entry for entry in manifest}
         self._manifest_snapshot = {
             "attachments_enabled": self._download_attachments,
+            "attachment_extensions": self._state_extensions_value(),
             "ticket_files": {
                 ticket_id: {
                     "entries": [entry.to_dict() for entry in entries],
@@ -309,9 +337,20 @@ class ZendeskTicketsConnector(BaseConnector):
             for ticket_id, entries in list(carried_forward.items()):
                 attachment_path = f"{_ATTACHMENT_PATH}/{ticket_id}"
                 carried_forward[ticket_id] = [entry for entry in entries if entry.path != attachment_path]
+        elif self._attachment_extensions is not None:
+            # See build_manifest: drop carried-forward attachment entries that
+            # no longer match the current allowlist.
+            for ticket_id, entries in list(carried_forward.items()):
+                attachment_path = f"{_ATTACHMENT_PATH}/{ticket_id}"
+                carried_forward[ticket_id] = [
+                    entry
+                    for entry in entries
+                    if entry.path != attachment_path or self._filename_extension_allowed(entry.filename)
+                ]
         combined = carried_forward | page_entries
         snapshot = {
             "attachments_enabled": self._download_attachments,
+            "attachment_extensions": self._state_extensions_value(),
             "ticket_files": {
                 ticket_id: {
                     "entries": [entry.to_dict() for entry in entries],
@@ -566,7 +605,40 @@ class ZendeskTicketsConnector(BaseConnector):
         attachments = list(ticket.get("attachments") or [])
         for comment in comments:
             attachments.extend(comment.get("attachments") or [])
+        if self._attachment_extensions is not None:
+            attachments = [
+                attachment
+                for attachment in attachments
+                if self._filename_extension_allowed(str(attachment.get("file_name") or ""))
+            ]
         return attachments
+
+    def _filename_extension_allowed(self, filename: str) -> bool:
+        if self._attachment_extensions is None:
+            return True
+        extension = Path(filename).suffix.lstrip(".").lower()
+        if not extension:
+            # No extension cannot be matched against an allowlist; block it
+            # so unknown binary types cannot slip through.
+            return False
+        return extension in self._attachment_extensions
+
+    def _attachment_config_matches_state(self, state: dict[str, Any]) -> bool:
+        """Whether the stored attachment allowlist matches the current one.
+
+        Only relevant while downloads are enabled: when disabled, no
+        attachment entries exist for the allowlist to affect. A state saved
+        before the allowlist existed has no key; it allowed everything, so
+        it matches only an allow-all (None) configuration.
+        """
+        if not self._download_attachments:
+            return True
+        stored = _extensions_from_state(state)
+        return stored == self._attachment_extensions
+
+    def _state_extensions_value(self) -> list[str] | None:
+        """Serializable form of the allowlist for state snapshots."""
+        return sorted(self._attachment_extensions) if self._attachment_extensions is not None else None
 
     def _download_attachment(self, url: str) -> bytes:
         hostname = (urlparse(url).hostname or "").lower()
@@ -796,6 +868,34 @@ def _parse_bool(value: str) -> bool:
 
 def _parse_tags(value: str) -> set[str]:
     return {part.strip().lower() for part in value.split(",") if part.strip()}
+
+
+def _parse_attachment_extensions(value: str | None) -> frozenset[str] | None:
+    """Parse the attachment extension allowlist.
+
+    Unset env var -> document-centric default list. Present but empty (or
+    whitespace-only) -> None, meaning allow every attachment (the previous
+    behavior). Otherwise a lowercase set of the comma-separated values,
+    tolerating a leading dot on each entry (".pdf,docx").
+    """
+    if value is None:
+        return _DEFAULT_ATTACHMENT_EXTENSIONS
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return frozenset(part.strip().lower().lstrip(".") for part in stripped.split(",") if part.strip())
+
+
+def _extensions_from_state(state: dict[str, Any]) -> frozenset[str] | None:
+    """Attachment allowlist stored in a prior run's state.
+
+    Absent key means the state predates the allowlist feature and every
+    attachment was downloaded, which is equivalent to allow-all (None).
+    """
+    stored = state.get("attachment_extensions")
+    if not stored:
+        return None
+    return frozenset(str(extension).lower() for extension in stored)
 
 
 def _parse_statuses(value: str) -> set[str]:
