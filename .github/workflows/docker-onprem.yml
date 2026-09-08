@@ -69,33 +69,37 @@ jobs:
   build-release:
     needs: read-version
     environment: localdocker
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner_labels: [self-hosted, Linux, X64]
-            arch: amd64
-            flavor: default
-            dockerfile: Dockerfile
-          - platform: linux/amd64
-            runner_labels: [self-hosted, Linux, X64]
-            arch: amd64
-            flavor: alpine
-            dockerfile: Dockerfile.alpine
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     runs-on:
       group: onprem
-      labels: ${{ matrix.runner_labels }}
+      labels: [self-hosted, Linux, X64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Resolve build cache refs
+        id: cache
+        run: |
+          set -euo pipefail
+          branch="$(printf '%s' "${GITHUB_REF_NAME:-main}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')"
+          if [ "${#branch}" -gt 100 ]; then
+            branch="${branch:0:83}-$(printf '%s' "$branch" | sha256sum | cut -c1-16)"
+          fi
+          if [ "$branch" = "main" ]; then
+            fallback="develop"
+          else
+            fallback="main"
+          fi
+          echo "primary=${{ env.IMAGE }}:buildcache-${branch}" >> "$GITHUB_OUTPUT"
+          echo "fallback=${{ env.IMAGE }}:buildcache-${fallback}" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
-          # Unique builder name per job so parallel matrix jobs on the same
-          # host don't share a BuildKit daemon, which causes EOF/transport errors.
-          name: builder-${{ github.run_id }}-${{ matrix.flavor }}-${{ matrix.arch }}
+          # Unique builder name per job so parallel jobs on the same host don't
+          # share a BuildKit daemon, which causes EOF/transport errors.
+          name: builder-${{ github.run_id }}-default-amd64
 
       - name: Log in to on-prem registry
         uses: docker/login-action@v3
@@ -104,32 +108,73 @@ jobs:
           username: ${{ secrets.ONPREM_DOCKER_USERNAME }}
           password: ${{ secrets.ONPREM_DOCKER_PASSWORD }}
 
-      - name: Build and push ${{ matrix.platform }} release image by digest
+      - name: Build and push linux/amd64 release image by digest
         id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: ${{ matrix.platform }}
+          file: Dockerfile
+          platforms: linux/amd64
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=onprem-release-${{ matrix.flavor }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=onprem-release-${{ matrix.flavor }}-${{ matrix.arch }}
+          cache-from: |
+            type=registry,ref=${{ steps.cache.outputs.primary }}
+            type=registry,ref=${{ steps.cache.outputs.fallback }}
+          cache-to: type=registry,ref=${{ steps.cache.outputs.primary }},mode=max,oci-mediatypes=true,image-manifest=true
 
-      - name: Export digest
-        env:
-          DIGEST_DIR: /tmp/${{ runner.name }}/digests
+  build-release-alpine:
+    needs: read-version
+    environment: localdocker
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    runs-on:
+      group: onprem
+      labels: [self-hosted, Linux, X64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve build cache refs
+        id: cache
         run: |
-          rm -rf "$DIGEST_DIR" && mkdir -p "$DIGEST_DIR"
-          digest="${{ steps.build.outputs.digest }}"
-          touch "$DIGEST_DIR/${digest#sha256:}"
+          set -euo pipefail
+          branch="$(printf '%s' "${GITHUB_REF_NAME:-main}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')"
+          if [ "${#branch}" -gt 100 ]; then
+            branch="${branch:0:83}-$(printf '%s' "$branch" | sha256sum | cut -c1-16)"
+          fi
+          if [ "$branch" = "main" ]; then
+            fallback="develop"
+          else
+            fallback="main"
+          fi
+          echo "primary=${{ env.IMAGE }}:buildcache-${branch}" >> "$GITHUB_OUTPUT"
+          echo "fallback=${{ env.IMAGE }}:buildcache-${fallback}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
         with:
-          name: digests-release-${{ matrix.flavor }}-${{ matrix.arch }}
-          path: /tmp/${{ runner.name }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
+          # Unique builder name per job so parallel jobs on the same host don't
+          # share a BuildKit daemon, which causes EOF/transport errors.
+          name: builder-${{ github.run_id }}-alpine-amd64
+
+      - name: Log in to on-prem registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ONPREM_DOCKER_USERNAME }}
+          password: ${{ secrets.ONPREM_DOCKER_PASSWORD }}
+
+      - name: Build and push linux/amd64 Alpine release image by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.alpine
+          platforms: linux/amd64
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: |
+            type=registry,ref=${{ steps.cache.outputs.primary }}
+            type=registry,ref=${{ steps.cache.outputs.fallback }}
+          cache-to: type=registry,ref=${{ steps.cache.outputs.primary }},mode=max,oci-mediatypes=true,image-manifest=true
 
   merge-release:
     needs: [read-version, build-release]
@@ -138,19 +183,6 @@ jobs:
       group: onprem
       labels: [self-hosted, Linux, X64]
     steps:
-      - name: Clean digest staging directory
-        env:
-          DIGEST_DIR: /tmp/${{ runner.name }}/digests
-        run: |
-          rm -rf "$DIGEST_DIR" && mkdir -p "$DIGEST_DIR"
-
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/${{ runner.name }}/digests
-          pattern: digests-release-default-*
-          merge-multiple: true
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -163,38 +195,22 @@ jobs:
 
       - name: Create release multi-arch manifest
         env:
-          DIGEST_DIR: /tmp/${{ runner.name }}/digests
+          DIGEST_AMD64: ${{ needs.build-release.outputs.digest }}
         run: |
           VERSION="${{ needs.read-version.outputs.version }}"
           MAJOR_MINOR="${VERSION%.*}"
           tags=("${{ env.IMAGE }}:latest" "${{ env.IMAGE }}:${VERSION}" "${{ env.IMAGE }}:${MAJOR_MINOR}")
-          digests=()
-          for digest_path in "$DIGEST_DIR"/*; do
-            digests+=("${{ env.IMAGE }}@sha256:$(basename "$digest_path")")
-          done
+          digests=("${{ env.IMAGE }}@${DIGEST_AMD64}")
           docker buildx imagetools create $(printf -- '-t %s ' "${tags[@]}") \
             "${digests[@]}"
 
   merge-release-alpine:
-    needs: [read-version, build-release]
+    needs: [read-version, build-release-alpine]
     environment: localdocker
     runs-on:
       group: onprem
       labels: [self-hosted, Linux, X64]
     steps:
-      - name: Clean digest staging directory
-        env:
-          DIGEST_DIR: /tmp/${{ runner.name }}/digests
-        run: |
-          rm -rf "$DIGEST_DIR" && mkdir -p "$DIGEST_DIR"
-
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/${{ runner.name }}/digests
-          pattern: digests-release-alpine-*
-          merge-multiple: true
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -207,15 +223,12 @@ jobs:
 
       - name: Create release Alpine multi-arch manifest
         env:
-          DIGEST_DIR: /tmp/${{ runner.name }}/digests
+          DIGEST_AMD64: ${{ needs.build-release-alpine.outputs.digest }}
         run: |
           VERSION="${{ needs.read-version.outputs.version }}"
           MAJOR_MINOR="${VERSION%.*}"
           tags=("${{ env.IMAGE }}:alpine" "${{ env.IMAGE }}:latest-alpine" "${{ env.IMAGE }}:${VERSION}-alpine" "${{ env.IMAGE }}:${MAJOR_MINOR}-alpine")
-          digests=()
-          for digest_path in "$DIGEST_DIR"/*; do
-            digests+=("${{ env.IMAGE }}@sha256:$(basename "$digest_path")")
-          done
+          digests=("${{ env.IMAGE }}@${DIGEST_AMD64}")
           docker buildx imagetools create $(printf -- '-t %s ' "${tags[@]}") \
             "${digests[@]}"
 
