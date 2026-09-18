@@ -46,12 +46,23 @@ equivalent via your container manager). Uploads still in flight
 (``data.status`` pending/processing) are excluded from the purge, but a
 daemon left running keeps uploading new files that will re-accumulate
 orphans for the next run.
+
+Stuck uploads (``--stuck-min-age-hours N``): a background job that died
+mid-upload (daemon restart, embedding failure) leaves its File row at
+``data.status`` pending/processing forever -- open-webui never self-heals
+the field. Those rows are invisible to the default purge (which protects
+in-flight uploads) and show up in the GUI as endlessly pending files.
+With this flag, pending/processing rows older than N hours are treated as
+orphans too (created_at-based; a genuinely in-flight upload finishes in
+minutes, so hours-old pending rows are zombies by definition). Use a
+conservative N (e.g. 24) so a long queue cannot be purged mid-flight.
 """
 
 import argparse
 import asyncio
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Open WebUI runs from /app/backend; a bare `python /tmp/...` shell does not
@@ -61,7 +72,9 @@ for _backend in ("/app/backend",):
         sys.path.insert(0, _backend)
 
 
-async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
+async def purge(
+    kb_id: str, apply: bool, verbose: bool, stuck_min_age_hours: float | None
+) -> int:
     # Imports are deliberately late so ``--help`` works outside the container.
     from sqlalchemy import delete as sa_delete, func, or_, select
 
@@ -115,16 +128,36 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
         # status means no background job was ever requested). Purging a
         # pending/processing row would kill a legit upload mid-flight.
         status = func.trim(func.lower(func.coalesce(File.data["status"].as_string(), "")))
+        orphan_filters = [
+            File.meta["data"]["knowledge_id"].as_string() == kb_id,
+            ~sa_exists(select(KnowledgeFile).where(
+                KnowledgeFile.knowledge_id == kb_id,
+                KnowledgeFile.file_id == File.id,
+            )),
+        ]
+        stuck_purged = 0  # counted per-batch below
+        if stuck_min_age_hours is None:
+            orphan_filters.append(~status.in_(("pending", "processing")))
+        else:
+            # --stuck-min-age-hours: pending/processing rows are zombies when
+            # old enough (their background job died without ever finishing:
+            # open-webui never self-heals the field). Younger pending rows
+            # stay protected as genuinely in-flight uploads.
+            # NOTE: File.created_at is a BIGINT epoch (seconds), not a
+            # timestamp -- compare against an epoch cutoff.
+            cutoff_epoch = (
+                datetime.now(timezone.utc)
+                - timedelta(hours=stuck_min_age_hours)
+            ).timestamp()
+            orphan_filters.extend([
+                or_(
+                    ~status.in_(("pending", "processing")),
+                    File.created_at < cutoff_epoch,
+                ),
+            ])
         orphans = (await db.execute(
             select(File)
-            .where(
-                File.meta["data"]["knowledge_id"].as_string() == kb_id,
-                ~sa_exists(select(KnowledgeFile).where(
-                    KnowledgeFile.knowledge_id == kb_id,
-                    KnowledgeFile.file_id == File.id,
-                )),
-                ~status.in_(("pending", "processing")),
-            )
+            .where(*orphan_filters)
             .order_by(File.created_at)
         )).scalars().all()
         print(
@@ -261,14 +294,26 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
             # a point-in-time snapshot, and a previously terminal/absent
             # status cannot reappear -- but the row could have entered
             # pending/processing between snapshot and now (e.g. oikb
-            # restarted against expectations). Never purge those.
+            # restarted against expectations). Never purge those -- except
+            # in stuck mode, where rows old enough at snapshot time keep
+            # their zombie classification (a dead job's created_at cannot
+            # get younger).
             status = func.trim(func.lower(func.coalesce(File.data["status"].as_string(), "")))
+            inflight_where = [
+                File.id.in_(batch_ids),
+                status.in_(("pending", "processing")),
+            ]
+            if stuck_min_age_hours is not None:
+                cutoff_epoch = (
+                    datetime.now(timezone.utc)
+                    - timedelta(hours=stuck_min_age_hours)
+                ).timestamp()
+                inflight_where.append(
+                    File.created_at >= cutoff_epoch
+                )
             inflight_ids = set(
                 (await db.execute(
-                    select(File.id).where(
-                        File.id.in_(batch_ids),
-                        status.in_(("pending", "processing")),
-                    )
+                    select(File.id).where(*inflight_where)
                 )).scalars().all()
             )
             if inflight_ids:
@@ -306,6 +351,16 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
                 and f.id not in inflight_ids
                 and f.hash not in failed_hashes
             ]
+            if stuck_min_age_hours is not None:
+                # Rows that reached the doom list while still pending/
+                # processing: these are the stuck zombies this mode exists
+                # to clear (fresh in-flight ones were filtered out above).
+                stuck_purged += sum(
+                    1 for f in doom_pending
+                    if f.data and str(
+                        (f.data or {}).get("status", "")
+                    ).strip().lower() in ("pending", "processing")
+                )
             scrub_only = [
                 f for f in batch
                 if f.id in other_linked
@@ -450,8 +505,12 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
             await db.commit()
 
     mode = "Purged" if apply else "Would purge"
+    stuck_note = (
+        f"; {stuck_purged} of those stuck in-flight (pending/processing "
+        f"older than {stuck_min_age_hours}h)" if stuck_min_age_hours is not None else ""
+    )
     print(
-        f"\n{mode} {removed_files} orphaned file(s); "
+        f"\n{mode} {removed_files} orphaned file(s){stuck_note}; "
         f"{scrubbed_only} vector-scrub only (linked elsewhere); "
         f"{relinked_to_target} re-linked to this KB mid-run (left intact); "
         f"{inflight_skipped} in-flight skipped (pending/processing); "
@@ -476,8 +535,18 @@ def main() -> None:
     parser.add_argument(
         "--verbose", action="store_true", help="Print every candidate file."
     )
+    parser.add_argument(
+        "--stuck-min-age-hours",
+        type=float,
+        metavar="N",
+        help="Also purge unlinked pending/processing File rows older than "
+        "N hours (stuck uploads from dead background jobs). Without this "
+        "flag, pending/processing rows are always left alone.",
+    )
     args = parser.parse_args()
-    sys.exit(asyncio.run(purge(args.kb_id, args.apply, args.verbose)))
+    sys.exit(asyncio.run(purge(
+        args.kb_id, args.apply, args.verbose, args.stuck_min_age_hours
+    )))
 
 
 if __name__ == "__main__":
