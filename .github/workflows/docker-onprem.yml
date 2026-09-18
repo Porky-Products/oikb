@@ -116,15 +116,10 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-<<<<<<< Updated upstream
           cache-from: |
             type=registry,ref=${{ steps.cache.outputs.primary }}
             type=registry,ref=${{ steps.cache.outputs.fallback }}
           cache-to: type=registry,ref=${{ steps.cache.outputs.primary }},mode=max,oci-mediatypes=true,image-manifest=true
-=======
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.flavor }}-${{ matrix.arch }}
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.flavor }}-${{ matrix.arch }},mode=max,oci-mediatypes=true,image-manifest=true
->>>>>>> Stashed changes
 
   build-release-alpine:
     needs: read-version
