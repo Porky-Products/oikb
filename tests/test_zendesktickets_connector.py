@@ -19,6 +19,7 @@ from oikb.connectors.zendesktickets import (
     _DEFAULT_ATTACHMENT_EXTENSIONS,
     _extensions_from_state,
     _parse_attachment_extensions,
+    _parse_tags,
     ZendeskTicketsConnector,
     parse_zendesktickets_source,
 )
@@ -1030,6 +1031,42 @@ def test_include_and_exclude_tags_filter_ticket_set(monkeypatch: pytest.MonkeyPa
                     _ticket(1001, "2024-01-02T03:04:05Z", tags=["ops"]),
                     _ticket(1002, "2024-01-02T03:05:05Z", tags=["facilities"]),
                     _ticket(1003, "2024-01-02T03:06:05Z", tags=["urgent", "ignore-me"]),
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
+    connector.close()
+
+
+def test_parse_tags_strips_inner_quotes_and_adjacent_whitespace():
+    # Quoted env values (e.g. EXCLUDETAG="a, b") must not leak quote
+    # characters or whitespace adjacent to quotes into parsed tags.
+    assert _parse_tags('"a, b"') == {"a", "b"}
+    assert _parse_tags('" a, b "') == {"a", "b"}
+    assert _parse_tags("a,b") == {"a", "b"}
+    assert _parse_tags("  ") == set()
+
+
+def test_exclude_tag_env_var_with_inner_quotes_filters_tickets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "quoted-exclude-tag")
+    monkeypatch.delenv("ZENDESKTICKET_INCLUDETAGS", raising=False)
+    monkeypatch.delenv("ZENDESKTICKET_EXCLUDETAGS", raising=False)
+    # Deployed-compose style value: inner quotes plus spaces after commas.
+    monkeypatch.setenv("ZENDESKTICKET_EXCLUDETAG", '"ignore-me, sap:material_request "')
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:04:05Z", tags=["ops"]),
+                    _ticket(1002, "2024-01-02T03:05:05Z", tags=["sap:material_request"]),
                 ],
                 "next_page": None,
             }
