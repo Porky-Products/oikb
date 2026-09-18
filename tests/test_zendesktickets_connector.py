@@ -1051,6 +1051,11 @@ def test_parse_tags_strips_inner_quotes_and_adjacent_whitespace():
     assert _parse_tags('" a, b "') == {"a", "b"}
     assert _parse_tags("a,b") == {"a", "b"}
     assert _parse_tags("  ") == set()
+    # str.strip() semantics preserved: non-ASCII whitespace (NBSP, VT, FF)
+    # is stripped, not just ASCII space/tab/newline.
+    assert _parse_tags("\xa0ops\xa0") == {"ops"}
+    assert _parse_tags("\x0bops\x0c") == {"ops"}
+    assert _parse_tags('"\u2003wide\u202f"') == {"wide"}
 
 
 def test_exclude_tag_env_var_with_inner_quotes_filters_tickets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
