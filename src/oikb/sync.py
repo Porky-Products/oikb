@@ -453,6 +453,16 @@ def _run_sync_inner(
                     continue
                 last_err = e
                 break
+            except httpx.TimeoutException as e:
+                # Timeouts otherwise surface as generic errors and can leave an
+                # unlinked "pending" row on the server; retry like a 5xx.
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    check_stop()
+                    last_err = e
+                    continue
+                last_err = e
+                break
             except SyncCancelled:
                 raise
             except Exception as e:
