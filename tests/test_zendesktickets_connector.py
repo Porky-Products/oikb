@@ -844,6 +844,48 @@ def test_sync_advances_checkpoint_even_when_some_uploads_fail(monkeypatch: pytes
     assert (state_dir / "resume_checkpoint.txt").read_text().strip() == "2024-01-02T03:04:05Z"
 
 
+def test_sync_retries_upload_on_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Upload timeouts must be retried like 5xx errors, not abort the ticket.
+
+    Regression test for the unlinked "pending" row defect (#32): a timeout
+    that falls into the generic error path leaves the server-side row
+    dangling. Removing the TimeoutException handler makes this test fail.
+    """
+    state_dir = _make_state_dir(tmp_path, "timeout-retry")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    class UploadTimeoutClient(FakeClient):
+        attempts: list[int] = []
+
+        def upload_file(self, file_content: bytes, filename: str, kb_id: str, file_hash: str, directory_id: str | None = None) -> dict:
+            type(self).attempts.append(1)
+            raise httpx.ReadTimeout("timed out")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("oikb.sync.time.sleep", lambda s: sleeps.append(s))
+
+    client = UploadTimeoutClient()
+    result = run_sync(client=client, connector=connector, kb_id="kb-1", quiet=True)
+
+    # Three attempts, with exponential backoff between them.
+    assert len(client.attempts) == 3
+    assert sleeps == [1.0, 2.0]
+    assert result.errors  # still an error after retries are exhausted
+    # Checkpoint must still have advanced.
+    assert (state_dir / "resume_checkpoint.txt").read_text().strip() == "2024-01-02T03:04:05Z"
+
+
 def test_build_manifest_includes_previously_synced_unchanged_ticket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "carry-forward")
     (state_dir / "manifest_state.json").write_text(
