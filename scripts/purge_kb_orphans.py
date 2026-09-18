@@ -63,7 +63,7 @@ for _backend in ("/app/backend",):
 
 async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
     # Imports are deliberately late so ``--help`` works outside the container.
-    from sqlalchemy import coalesce, delete as sa_delete, func, or_, select
+    from sqlalchemy import delete as sa_delete, func, or_, select
 
     from open_webui.internal.db import get_async_db_context
     from open_webui.models.files import File
@@ -114,7 +114,7 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
         # (data.status: pending -> processing -> completed/failed; a missing
         # status means no background job was ever requested). Purging a
         # pending/processing row would kill a legit upload mid-flight.
-        status = func.trim(func.lower(coalesce(File.data["status"].as_string(), "")))
+        status = func.trim(func.lower(func.coalesce(File.data["status"].as_string(), "")))
         orphans = (await db.execute(
             select(File)
             .where(
@@ -262,7 +262,7 @@ async def purge(kb_id: str, apply: bool, verbose: bool) -> int:
             # status cannot reappear -- but the row could have entered
             # pending/processing between snapshot and now (e.g. oikb
             # restarted against expectations). Never purge those.
-            status = func.trim(func.lower(coalesce(File.data["status"].as_string(), "")))
+            status = func.trim(func.lower(func.coalesce(File.data["status"].as_string(), "")))
             inflight_ids = set(
                 (await db.execute(
                     select(File.id).where(
