@@ -869,13 +869,13 @@ def _parse_bool(value: str) -> bool:
 def _parse_tags(value: str) -> set[str]:
     # Tolerate quoted env values (e.g. EXCLUDETAG="a, b") where the inner
     # quotes would otherwise become part of each tag and never match. Strip
-    # whitespace and quotes in one set so the order never matters: a token
-    # like ' ach_request' (no quotes) and ' sap:other "' (quote after space)
-    # both reduce to their clean tag.
+    # quotes first, then let str.strip() remove *all* whitespace (including
+    # non-ASCII spaces like NBSP that env values pasted from documents can
+    # carry), so ' ach_request' and ' sap:other "' both reduce cleanly.
     return {
         tag
         for part in value.split(",")
-        if (tag := part.strip(" \t\r\n\"'").lower())
+        if (tag := part.strip("\"'").strip().lower())
     }
 
 
