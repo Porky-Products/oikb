@@ -928,12 +928,18 @@ def _load_denylist_files(value: str) -> set[str]:
             entry = line.strip()
             if not entry or entry.startswith("#"):
                 continue
-            if not entry.isdigit():
+            # ASCII-only digits: str.isdigit() alone also accepts non-ASCII
+            # decimal digits (fullwidth, Arabic-Indic, superscripts) that can
+            # never compare equal to the ASCII str(ticket_id), and storing
+            # raw would let a non-canonical-but-accepted entry like '045748'
+            # silently match nothing. Canonicalize so every accepted entry is
+            # provably equal to the ASCII string form of a ticket ID.
+            if not (entry.isascii() and entry.isdigit()):
                 raise ValueError(
                     f"Malformed denylist line {raw_path}:{line_number}: "
                     f"expected a numeric ticket ID, got {entry!r}"
                 )
-            denied.add(entry)
+            denied.add(str(int(entry)))
     return denied
 
 

@@ -75,17 +75,27 @@ def _die(message: str) -> None:
 def _load_deny_ids(paths: list[str]) -> set[str]:
     denied: set[str] = set()
     for raw_path in paths:
-        with open(raw_path, encoding="utf-8") as fh:
-            for line_number, line in enumerate(fh, start=1):
-                entry = line.strip()
-                if not entry or entry.startswith("#"):
-                    continue
-                if not entry.isdigit():
-                    _die(
-                        f"malformed denylist line {raw_path}:{line_number}: "
-                        f"expected numeric ticket ID, got {entry!r}"
-                    )
-                denied.add(entry)
+        try:
+            with open(raw_path, encoding="utf-8") as fh:
+                for line_number, line in enumerate(fh, start=1):
+                    entry = line.strip()
+                    if not entry or entry.startswith("#"):
+                        continue
+                    # ASCII-only + canonicalized, matching the connector's
+                    # _load_denylist_files exactly: non-ASCII digits pass
+                    # str.isdigit() but never match an ASCII ticket id, and
+                    # raw storage would let '045748' silently match nothing.
+                    if not (entry.isascii() and entry.isdigit()):
+                        _die(
+                            f"malformed denylist line {raw_path}:{line_number}: "
+                            f"expected a numeric ticket ID, got {entry!r}"
+                        )
+                    denied.add(str(int(entry)))
+        except UnicodeDecodeError as exc:
+            # Not an OSError subclass: without this, a non-UTF-8 denylist
+            # would crash with an uncaught traceback exiting 1 — the code
+            # documented as LEAKED — instead of a clean ERROR exit 2.
+            _die(f"denylist file {raw_path!r} is not valid UTF-8: {exc}")
     return denied
 
 

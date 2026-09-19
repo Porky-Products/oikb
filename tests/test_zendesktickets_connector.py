@@ -1135,6 +1135,41 @@ def test_denylist_files_are_merged_and_deduplicated(monkeypatch: pytest.MonkeyPa
     connector.close()
 
 
+def test_leading_zero_denylist_entry_still_denies_ticket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Non-canonical-but-numeric entries ('045748' from CSV/Excel round-trips)
+    must canonicalize on load so they actually match the ticket id."""
+    state_dir = _make_state_dir(tmp_path, "denylist-leading-zero")
+    denylist = tmp_path / "deny.txt"
+    denylist.write_text("045748\n")
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comments={},
+    )
+
+    assert connector._denied_ticket_ids == {"45748"}
+    assert connector._denied("45748") is True
+    connector.close()
+
+
+def test_non_ascii_digit_denylist_entry_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Fullwidth/Arabic-Indic digits pass str.isdigit() but can never equal
+    the ASCII str(ticket id); they must be rejected, not accepted-and-silent."""
+    state_dir = _make_state_dir(tmp_path, "denylist-non-ascii")
+    denylist = tmp_path / "deny.txt"
+    denylist.write_text("４５７４８\n")  # fullwidth digits
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+
+    with pytest.raises(ValueError, match="Malformed denylist line"):
+        ZendeskTicketsConnector(state_dir=str(state_dir))
+
+
 def test_missing_denylist_file_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "denylist-missing")
     missing = tmp_path / "does-not-exist.txt"
