@@ -457,6 +457,11 @@ def main() -> None:
 
     classified_this_run = 0
     per_ticket_failures = 0
+    # Last ID this run actually processed (classified or confirmed missing).
+    # The persisted cursor derives from it, never from batch_ids[-1]: a cap
+    # hit mid-batch leaves the batch tail unvisited, and advancing past it
+    # would silently never scan those IDs (fail-open for a denylist).
+    last_processed_id: int | None = None
 
     print(
         f"Scanning tickets 1..{stop_id} starting at ID {next_id} "
@@ -478,6 +483,7 @@ def main() -> None:
                 if ticket is None:
                     # Deleted/never-existed IDs are simply not served.
                     stats["skipped_missing"] = int(stats.get("skipped_missing") or 0) + 1
+                    last_processed_id = ticket_id
                     continue
                 requester_email = str(users.get(ticket.get("requester_id"), {}).get("email") or "")
                 block, truncated = _format_ticket_block(ticket, requester_email, desc_cap)
@@ -503,10 +509,20 @@ def main() -> None:
                 elif verdict == "unsure":
                     _append_review(review_path, ticket_id, reason, reviewed)
                 classified_this_run += 1
+                last_processed_id = ticket_id
                 if classified_this_run % 100 == 0:
                     print(f"  … {classified_this_run} classified this run (at ID {ticket_id})")
 
-            next_id = batch_ids[-1] + 1
+            # Cursor from the last ID actually processed. When the cap hit
+            # mid-batch (break above), last_processed_id stays just below the
+            # unvisited tail, so the next run re-serves those IDs. When the
+            # whole batch was consumed, this equals batch_ids[-1].
+            if last_processed_id is None:
+                # Whole batch skipped by the outer-loop condition (cap already
+                # met before the batch started): rewind to the batch start.
+                next_id = batch_ids[0]
+            else:
+                next_id = last_processed_id + 1
             _save_state(
                 state_path,
                 {"next_id": next_id, "stop_id": stop_id, "prompt_sha256": prompt_sha, "stats": stats},

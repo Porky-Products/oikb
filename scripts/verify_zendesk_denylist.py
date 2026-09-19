@@ -6,35 +6,50 @@ Purpose (issue #38)
 The connector denies tickets listed in ``ZENDESKTICKET_DENYLIST_FILES`` and
 the *next normal sync* purges them from the Open WebUI knowledge base via the
 deleted-diff. This script never mutates anything: it reads the denylist and
-the KB listing and reports drift:
+the KB file listing and reports drift.
 
-  CLEAN    every denylisted ticket is absent from the KB            (exit 0)
-  LEAKED   denylisted ticket files still exist in the KB             (exit 1)
-  ERROR    cannot read the denylist or reach the KB                  (exit 2)
+Which endpoint and why
+----------------------
+GET /api/v1/knowledge/{id} does NOT work for this: its ``files`` entries are
+FileMetadataResponse objects ({id, hash, meta, created_at, updated_at}) with
+no filename, and this deployment has been observed to return an explicit
+``"files": null`` (see oikb tests/test_null_tolerance.py). Matching against
+that shape would always report CLEAN.
 
-Run it after a sync that follows a denylist change; also useful as a
-periodic safety net. It does NOT delete leaked files: if LEAKED is reported,
-re-run/rerun the oikb sync (the connector's carried-forward filter removes
-them) — do not hand-delete KB files, which would desync manifest_state.json.
+The verifier therefore uses GET /api/v1/knowledge/{id}/files (open-webui
+get_knowledge_files_by_id -> KnowledgeFileListResponse: items are
+FileUserResponse objects carrying ``filename``, plus id/hash/meta; ``total``
+is the full count). Pagination is the 1-based ``page`` query parameter with
+the server's PAGE_ITEM_COUNT per page (30 by default).
 
-Matching: ticket files are stored as ``tickets/<id>.md`` and attachments as
-``attachments/<id>/<id>-<hash>-<name>`` (see the connector's
-_build_ticket_entries). A denylisted ID "leaks" when any KB file's path
-matches ``tickets/<id>/<id>.md`` or ``attachments/<id>/...``.
+Matching
+--------
+The connector uploads ticket docs as ``<id>.md`` (KB directory "tickets")
+and attachments as ``<id>-<hash>-<name>`` (KB directory "attachments/<id>").
+Endpoint items do not carry their directory path, so the verifier matches on
+filename alone: a denylisted ID leaks if any item's filename is exactly
+``<id>.md`` or starts with ``<id>-``. The trailing separator binds the
+numeric prefix (45748- cannot false-match 457480-).
+
+Verdicts
+--------
+  CLEAN   exit 0 — full KB listing retrieved and no denylisted match
+  LEAKED  exit 1 — denylisted ticket files still exist in the KB
+  ERROR   exit 2 — unreadable denylist, unreachable/invalid KB response, or
+          an INDETERMINATE listing: an empty/zero-total payload is not
+          evidence of purge (wrong kb id, credentials, or a KB that never
+          synced zendesktickets)
+
+Run after a sync that follows a denylist change; also useful as a periodic
+safety net. It does NOT delete leaked files: if LEAKED is reported, re-run
+the oikb sync (the connector's carried-forward filter purges them) — do not
+hand-delete KB files, which would desync manifest_state.json.
 
 Usage
 -----
-Denylist file: same plaintext format the connector consumes (one numeric
-ticket ID per line, ``#`` comments).
-
     export OPEN_WEBUI_URL=https://openwebui.example.com
     export OPEN_WEBUI_API_KEY=<key>          # same vars oikb uses
     python scripts/verify_zendesk_denylist.py <kb_id> <denylist-file> [...]
-
-Multiple denylist files (the union is verified):
-    python scripts/verify_zendesk_denylist.py <kb_id> denylist1.txt denylist2.txt
-
-Stdlib only; reads GET /api/v1/knowledge/{id} for the file list.
 """
 
 from __future__ import annotations
@@ -43,10 +58,17 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
 _TIMEOUT_DEFAULT = 60.0
+_MAX_PAGES = 10000  # hard stop against a misbehaving server
+
+
+def _die(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(2)
 
 
 def _load_deny_ids(paths: list[str]) -> set[str]:
@@ -58,54 +80,101 @@ def _load_deny_ids(paths: list[str]) -> set[str]:
                 if not entry or entry.startswith("#"):
                     continue
                 if not entry.isdigit():
-                    print(
-                        f"error: malformed denylist line {raw_path}:{line_number}: "
-                        f"expected numeric ticket ID, got {entry!r}",
-                        file=sys.stderr,
+                    _die(
+                        f"malformed denylist line {raw_path}:{line_number}: "
+                        f"expected numeric ticket ID, got {entry!r}"
                     )
-                    sys.exit(2)
                 denied.add(entry)
     return denied
 
 
 def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> list[dict[str, Any]]:
-    url = base_url.rstrip("/") + f"/api/v1/knowledge/{kb_id}"
-    request = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {api_key}", "User-Agent": "oikb-deny-verify/1"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        print(f"error: KB request failed with HTTP {exc.code}", file=sys.stderr)
-        sys.exit(2)
-    except urllib.error.URLError as exc:
-        print(f"error: cannot reach Open WebUI at {base_url}: {exc}", file=sys.stderr)
-        sys.exit(2)
-    # Null-tolerant: the KB response's "files" may be an explicit JSON null
-    # (see oikb client.py list_kb_files for the same normalization).
-    return payload.get("files") or []
+    """Page through GET /knowledge/{id}/files and return every item.
+
+    Exits 2 on failure or an indeterminate (empty/zero-total/partial)
+    listing: only a complete, non-empty listing can support a CLEAN verdict.
+    """
+    items: list[dict[str, Any]] = []
+    seen_total: int | None = None
+    for page in range(1, _MAX_PAGES + 1):
+        qs = urllib.parse.urlencode({"page": page})
+        url = (
+            base_url.rstrip("/")
+            + f"/api/v1/knowledge/{urllib.parse.quote(str(kb_id))}/files?{qs}"
+        )
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "oikb-deny-verify/1",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            _die(f"KB request failed with HTTP {exc.code}: {url}")
+        except urllib.error.URLError as exc:
+            _die(f"cannot reach Open WebUI at {base_url}: {exc}")
+        except json.JSONDecodeError as exc:
+            _die(f"KB response was not JSON: {exc}")
+        if not isinstance(payload, dict):
+            _die(f"KB response was not a JSON object: {str(payload)[:200]}")
+        # Null-tolerant parse (this server has served explicit nulls).
+        page_items = payload.get("items") or []
+        total = payload.get("total")
+        if not isinstance(page_items, list):
+            _die(f"KB response 'items' was not a list: {type(page_items).__name__}")
+        if not isinstance(total, int) or total < 0:
+            _die(f"KB response 'total' missing/invalid: {total!r}")
+        items.extend(entry for entry in page_items if isinstance(entry, dict))
+        seen_total = total
+        if len(items) >= total:
+            break
+    if seen_total is None or seen_total == 0 or not items:
+        _die(
+            "INDETERMINATE: KB file listing is empty (total="
+            f"{seen_total!r}). An empty listing is not evidence that "
+            "denylisted tickets were purged — check the kb id, credentials, "
+            "and that this KB actually synced the zendesktickets source."
+        )
+    if len(items) < (seen_total or 0):
+        _die(
+            f"listing incomplete: fetched {len(items)} of {seen_total} files; "
+            "refusing to report CLEAN on a partial listing"
+        )
+    return items
 
 
-def _leaked_files(denied: set[str], kb_files: list[dict[str, Any]]) -> dict[str, list[str]]:
-    """Map denylisted ticket ID -> KB file display paths still present."""
+def _items_from_response(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Null-tolerant item extraction shared with tests."""
+    page_items = payload.get("items") or []
+    return [entry for entry in page_items if isinstance(entry, dict)]
+
+
+def _item_filename(item: dict[str, Any]) -> str:
+    """Best filename for a KB file item, mirroring oikb's own display logic:
+    meta.name is the upload filename; filename is the FileModelResponse field."""
+    meta = item.get("meta") or {}
+    name = meta.get("name") if isinstance(meta, dict) else None
+    return str(name or item.get("filename") or "")
+
+
+def _leaked_files(denied: set[str], items: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Map denylisted ticket ID -> KB item filenames still present."""
     leaked: dict[str, list[str]] = {}
-    for file_entry in kb_files:
-        path = str(file_entry.get("path") or "")
-        filename = str(file_entry.get("filename") or "")
-        # Connector layout: tickets/<id>/<id>.md and attachments/<id>/<file>.
-        parts = path.split("/")
-        ticket_id: str | None = None
-        if parts == ["tickets"]:
-            stem = filename.rsplit(".", 1)[0] if "." in filename else filename
-            if stem in denied:
-                ticket_id = stem
-        elif len(parts) == 2 and parts[0] == "attachments" and parts[1] in denied:
-            ticket_id = parts[1]
-        if ticket_id is not None:
-            leaked.setdefault(ticket_id, []).append(f"{path}/{filename}" if path else filename)
+    for item in items:
+        filename = _item_filename(item)
+        if not filename:
+            continue
+        for ticket_id in denied:
+            if filename == f"{ticket_id}.md" or filename.startswith(f"{ticket_id}-"):
+                leaked.setdefault(ticket_id, []).append(filename)
     return leaked
+
+
+def _auth_header(api_key: str) -> str:
+    return "Bearer " + api_key
 
 
 def main() -> None:
@@ -131,25 +200,24 @@ def main() -> None:
     try:
         denied = _load_deny_ids(denylist_paths)
     except OSError as exc:
-        print(f"error: cannot read denylist: {exc}", file=sys.stderr)
-        sys.exit(2)
+        _die(f"cannot read denylist: {exc}")
     if not denied:
         print("Denylist is empty; nothing to verify.")
         return
 
-    kb_files = _list_kb_files(base_url, api_key, kb_id, timeout)
-    leaked = _leaked_files(denied, kb_files)
+    items = _list_kb_files(base_url, api_key, kb_id, timeout)
+    leaked = _leaked_files(denied, items)
 
     print(f"Denylisted ticket IDs: {len(denied)} (from {', '.join(denylist_paths)})")
-    print(f"KB files listed:       {len(kb_files)}")
+    print(f"KB files listed:       {len(items)}")
     if not leaked:
         print("\nVERDICT: CLEAN — no denylisted ticket has files in the KB. (exit 0)")
         return
     print(f"\nVERDICT: LEAKED — {len(leaked)} denylisted ticket(s) still have KB files: (exit 1)")
     for ticket_id in sorted(leaked, key=lambda v: int(v)):
         print(f"  ticket {ticket_id}:")
-        for display in leaked[ticket_id]:
-            print(f"    - {display}")
+        for filename in leaked[ticket_id]:
+            print(f"    - {filename}")
     print(
         "\nDo NOT hand-delete these: run the oikb sync (the connector's "
         "carried-forward denylist filter purges them and keeps "
