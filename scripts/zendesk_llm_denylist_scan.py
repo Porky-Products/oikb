@@ -199,6 +199,16 @@ class ZendeskClient:
                 out[ticket["id"]] = ticket
         return out
 
+    def fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]]:
+        """Fetch a ticket's comments (attachments live on comment objects)."""
+        status, payload, _ = self._get(f"/tickets/{ticket_id}/comments.json")
+        if status == 404:
+            return []  # ticket vanished mid-scan; classify on core fields
+        if status != 200:
+            raise RuntimeError(f"Zendesk comments HTTP {status} for ticket {ticket_id}")
+        comments = (payload or {}).get("comments") or []
+        return [c for c in comments if isinstance(c, dict)]
+
     def show_many_users(self, ids: list[int]) -> dict[int, dict[str, Any]]:
         ids = [i for i in ids if i]
         if not ids:
@@ -304,17 +314,31 @@ def _parse_verdict(text: str, expected_ticket_id: int) -> tuple[str, str]:
     return verdict, ""
 
 
-def _format_ticket_block(ticket: dict[str, Any], requester_email: str, desc_cap: int) -> tuple[str, bool]:
-    """Render one ticket for the LLM. Returns (block_text, truncated)."""
+def _format_ticket_block(ticket: dict[str, Any], comments: list[dict[str, Any]], requester_email: str, desc_cap: int) -> tuple[str, list[str], bool]:
+    """Render one ticket for the LLM. Returns (block_text, attachment_names, truncated).
+
+    Attachment names come from the ticket's own attachment list plus every
+    comment's attachments — the same union the oikb connector builds
+    (src/oikb/connectors/zendesktickets.py _collect_attachments). Ticket
+    objects from show_many carry NO attachments themselves (Zendesk OAS
+    TicketObject has only the boolean allow_attachments); attachment payloads
+    live on comment objects, which the caller fetches via
+    /tickets/{id}/comments.json.
+    """
     description = str(ticket.get("description") or "")
     truncated = len(description) > desc_cap
     if truncated:
         description = description[:desc_cap] + "\n[…description truncated…]"
-    comment_attachment_names: list[str] = []
+    attachment_names: list[str] = []
     for attachment in ticket.get("attachments") or []:
         name = str(attachment.get("file_name") or "").strip()
         if name:
-            comment_attachment_names.append(name)
+            attachment_names.append(name)
+    for comment in comments or []:
+        for attachment in comment.get("attachments") or []:
+            name = str(attachment.get("file_name") or "").strip()
+            if name:
+                attachment_names.append(name)
     lines = [
         f"ticket_id: {ticket.get('id')}",
         f"subject: {ticket.get('subject')!r}",
@@ -323,11 +347,11 @@ def _format_ticket_block(ticket: dict[str, Any], requester_email: str, desc_cap:
         f"type: {ticket.get('type')}",
         f"tags: {ticket.get('tags') or []}",
         f"requester_email: {requester_email or '(unresolved)'}",
-        f"attachment_names: {comment_attachment_names}",
+        f"attachment_names: {attachment_names}",
         "description:",
         description or "(empty)",
     ]
-    return "\n".join(lines), truncated
+    return "\n".join(lines), attachment_names, truncated
 
 
 def _append_dedup(path: Path, ticket_id: int, deny_ids: set[int]) -> None:
@@ -396,9 +420,12 @@ def main() -> None:
     prompt_sha = _sha256_file(prompt_path)
 
     # ---- State / resume -------------------------------------------------
+    # --reset intentionally accepts a changed prompt file or stop ID: it is
+    # the documented remedy for exactly those mismatches, so the guards must
+    # let it through rather than _die before the reset block can run.
     reset_requested = "--reset" in sys.argv[1:]
     state = _load_state(state_path)
-    if state is not None:
+    if state is not None and not reset_requested:
         if state.get("prompt_sha256") not in (None, prompt_sha):
             _die(
                 "prompt file changed since the state file was written "
@@ -410,14 +437,14 @@ def main() -> None:
                 "LLM_SCAN_STOP_TICKET_ID changed since the state file was written "
                 f"(state has {state.get('stop_id')!r}, env has {stop_id}); use --reset to accept the new bound"
             )
+    if state is not None and not reset_requested:
         next_id = int(state.get("next_id") or 1)
         stats = dict(state.get("stats") or {})
+        print(f"Resuming from ID {next_id} (saved stats: {stats})")
     else:
         next_id = 1
         stats = {}
     if reset_requested:
-        next_id = 1
-        stats = {}
         print("--reset: restarting from ID 1 (counts recomputed from files)")
     if next_id > stop_id:
         print(f"Nothing to do: next_id={next_id} > stop_id={stop_id} (pass complete).")
@@ -486,22 +513,35 @@ def main() -> None:
                     last_processed_id = ticket_id
                     continue
                 requester_email = str(users.get(ticket.get("requester_id"), {}).get("email") or "")
-                block, truncated = _format_ticket_block(ticket, requester_email, desc_cap)
+                comments = zendesk.fetch_ticket_comments(ticket_id)
+                block, _attachment_names, truncated = _format_ticket_block(ticket, comments, requester_email, desc_cap)
 
-                payload = prompt_text + "\n\n---\n\n" + _FORMAT_INSTRUCTIONS + "\n\nTICKET DATA:\n" + block
-                if truncated:
-                    payload += "\n\nNOTE: description was truncated; classify with 'unsure' if the truncated part might change your verdict."
-
-                raw_response = None
                 verdict = "unsure"
-                reason = "no response obtained"
-                try:
-                    raw_response = llm.classify(payload)
-                    verdict, reason = _parse_verdict(raw_response, ticket_id)
-                except RuntimeError as exc:
-                    per_ticket_failures += 1
-                    reason = str(exc)
+                if truncated and not _attachment_names:
+                    # Documented fail-closed policy: truncate the description
+                    # and loose attachment evidence -> do not classify; a
+                    # model verdict on partial evidence is advisory only.
+                    reason = "description truncated beyond LLM_SCAN_DESC_CHAR_CAP"
+                else:
+                    payload = prompt_text + "\n\n---\n\n" + _FORMAT_INSTRUCTIONS + "\n\nTICKET DATA:\n" + block
+                    if truncated:
+                        payload += "\n\nNOTE: description was truncated; classify with 'unsure' if the truncated part might change your verdict."
+                    raw_response = None
                     verdict = "unsure"
+                    reason = "no response obtained"
+                    try:
+                        raw_response = llm.classify(payload)
+                        verdict, reason = _parse_verdict(raw_response, ticket_id)
+                    except RuntimeError as exc:
+                        per_ticket_failures += 1
+                        reason = str(exc)
+                        verdict = "unsure"
+                    if truncated and verdict != "unsure":
+                        # Enforce the documented invariant even when the model
+                        # answered on truncated text: evidence was cut, so the
+                        # ticket must go to human review, never auto-allow.
+                        reason = f"forced unsure: description truncated ({reason})"
+                        verdict = "unsure"
 
                 stats[verdict] = int(stats.get(verdict) or 0) + 1
                 if verdict == "deny":

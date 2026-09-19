@@ -54,6 +54,7 @@ Usage
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
@@ -118,6 +119,13 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
             _die(f"cannot reach Open WebUI at {base_url}: {exc}")
         except json.JSONDecodeError as exc:
             _die(f"KB response was not JSON: {exc}")
+        except (TimeoutError, http.client.HTTPException, OSError, UnicodeDecodeError) as exc:
+            # Post-connect failures that are NOT urllib.error.URLError
+            # subclasses (read-phase stall -> TimeoutError, truncated body ->
+            # IncompleteRead, decode issues): these are infrastructure errors
+            # and MUST route to exit 2 — exit 1 is reserved for a confirmed
+            # leak (LEAKED), and a traceback exit(1) here would read as one.
+            _die(f"KB response failed or was unreadable: {type(exc).__name__}: {exc}")
         if not isinstance(payload, dict):
             _die(f"KB response was not a JSON object: {str(payload)[:200]}")
         # Null-tolerant parse (this server has served explicit nulls).

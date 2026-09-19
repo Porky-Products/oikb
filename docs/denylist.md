@@ -55,6 +55,13 @@ ticket in the range is unreachable) rather than by date: a date cutoff on
 the incremental stream would mis-bound old tickets that received late
 comments.
 
+For each ticket the scanner also fetches `GET /tickets/{id}/comments.json`
+once — attachment payloads live on comment objects (the `show_many` ticket
+records carry no attachment list, only the boolean `allow_attachments`), and
+attachment filenames are a primary deny signal. Comment *bodies* are not
+sent to the LLM; only the attachment filenames are rendered into the
+classification block. Budget one extra API call per ticket.
+
 ```bash
 export ZENDESKTICKET_SUBDOMAIN=porky
 export ZENDESKTICKET_USER=you@porky.com   # email; /token appended
@@ -82,8 +89,11 @@ Behavior:
   continues. Changing the prompt file or stop ID between runs aborts (use
   `--reset` to restart the pass intentionally).
 - **Fail-closed**: LLM outages abort the run rather than guessing;
-  malformed responses fall back to `unsure` for human review; verdicts are
-  categorical `deny|unsure|allow` (no confidence scores).
+  malformed responses fall back to `unsure` for human review; a ticket whose
+  description is truncated by `LLM_SCAN_DESC_CHAR_CAP` is forced to `unsure`
+  (review file) regardless of what the model answers — partial evidence is
+  never auto-allowed; verdicts are categorical `deny|unsure|allow` (no
+  confidence scores).
 - **Review file**: lines like `45748  # unsure: non-JSON response  (…)`.
   Triage each by adding the ID to a denylist file (deny it) or doing
   nothing (accept as allowed). The scanner deduplicates against existing
