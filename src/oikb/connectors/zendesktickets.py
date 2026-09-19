@@ -35,6 +35,7 @@ _DEFAULT_ATTACHMENT_EXTENSIONS = frozenset(
     }
 )
 _ATTACHMENT_EXTENSIONS_ENV = "ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS"
+_DENYLIST_FILES_ENV = "ZENDESKTICKET_DENYLIST_FILES"
 
 
 class ZendeskTicketsConnector(BaseConnector):
@@ -75,6 +76,21 @@ class ZendeskTicketsConnector(BaseConnector):
         self._include_tags = _parse_tags(include_tags_value)
         self._exclude_tags = _parse_tags(exclude_tags_value)
         self._statuses = _parse_statuses(status_value)
+        # Deduplicated union of every denylist file. Loaded once at init and
+        # applied to both newly crawled tickets and carried-forward state,
+        # so a denylisted ticket already synced to the KB drops out of the
+        # manifest and sync's deleted-diff removes its KB files (same purge
+        # path as the tag filters -- see reset_zendesktickets_checkpoint.py
+        # for why re-serving alone is insufficient). Fail-closed: an
+        # unreadable file or malformed line aborts the run rather than
+        # risking a sensitive ticket being synced.
+        self._denied_ticket_ids = _load_denylist_files(os.environ.get(_DENYLIST_FILES_ENV, ""))
+        if self._denied_ticket_ids:
+            log.info(
+                "ZendeskTicketsConnector.denylist_loaded: files_env=%r denied_ticket_ids=%d",
+                os.environ.get(_DENYLIST_FILES_ENV),
+                len(self._denied_ticket_ids),
+            )
         if not self._subdomain or not self._user or not self._token:
             raise ValueError(
                 "Zendesk tickets credentials required. Set ZENDESKTICKET_SUBDOMAIN, "
@@ -168,7 +184,7 @@ class ZendeskTicketsConnector(BaseConnector):
 
                     seen_ticket_ids.add(ticket_id)
 
-                    if not self._should_include_ticket(ticket):
+                    if self._denied(ticket_id) or not self._should_include_ticket(ticket):
                         excluded_ticket_ids.add(ticket_id)
                         continue
 
@@ -234,7 +250,9 @@ class ZendeskTicketsConnector(BaseConnector):
         carried_forward = {
             ticket_id: entries
             for ticket_id, entries in prior_entries.items()
-            if ticket_id not in seen_ticket_ids and ticket_id not in excluded_ticket_ids
+            if ticket_id not in seen_ticket_ids
+            and ticket_id not in excluded_ticket_ids
+            and not self._denied(ticket_id)
         }
 
         if attachments_enabled_previously and not self._download_attachments:
@@ -331,7 +349,9 @@ class ZendeskTicketsConnector(BaseConnector):
         carried_forward = {
             ticket_id: entries
             for ticket_id, entries in prior_entries.items()
-            if ticket_id not in seen_ticket_ids and ticket_id not in excluded_ticket_ids
+            if ticket_id not in seen_ticket_ids
+            and ticket_id not in excluded_ticket_ids
+            and not self._denied(ticket_id)
         }
         if attachments_enabled_previously and not self._download_attachments:
             for ticket_id, entries in list(carried_forward.items()):
@@ -725,6 +745,17 @@ class ZendeskTicketsConnector(BaseConnector):
             return False
         return True
 
+    def _denied(self, ticket_id: str) -> bool:
+        """Whether a ticket ID is denylisted.
+
+        Applied to newly crawled tickets AND carried-forward state entries:
+        dropping a carried-forward ticket from the manifest makes sync's
+        deleted-diff purge its KB files, which is the only way an
+        already-synced ticket leaves the KB (stored state is never
+        re-filtered by _should_include_ticket alone).
+        """
+        return ticket_id in self._denied_ticket_ids
+
     def _checkpoint_path(self) -> Path:
         return self._state_dir / "resume_checkpoint.txt"
 
@@ -868,6 +899,42 @@ def _parse_bool(value: str) -> bool:
 
 def _parse_tags(value: str) -> set[str]:
     return {part.strip().lower() for part in value.split(",") if part.strip()}
+
+
+def _load_denylist_files(value: str) -> set[str]:
+    """Load and union the comma-separated plaintext denylist files.
+
+    Format: one ticket ID per line; blank lines and ``#`` comments ignored.
+    A missing or unreadable file, or a non-numeric data line, raises
+    ValueError so a misconfigured denylist fails the run instead of
+    silently syncing a sensitive ticket (fail-closed).
+    """
+    denied: set[str] = set()
+    paths = [part.strip() for part in value.split(",") if part.strip()]
+    for raw_path in paths:
+        expanded = Path(os.path.expanduser(raw_path))
+        if not expanded.is_file():
+            raise ValueError(
+                f"Zendesk tickets denylist file not found: {raw_path!r} "
+                f"(from {_DENYLIST_FILES_ENV}={value!r})"
+            )
+        try:
+            text = expanded.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(
+                f"Cannot read Zendesk tickets denylist file {raw_path!r}: {exc}"
+            ) from exc
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            entry = line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            if not entry.isdigit():
+                raise ValueError(
+                    f"Malformed denylist line {raw_path}:{line_number}: "
+                    f"expected a numeric ticket ID, got {entry!r}"
+                )
+            denied.add(entry)
+    return denied
 
 
 def _parse_attachment_extensions(value: str | None) -> frozenset[str] | None:
