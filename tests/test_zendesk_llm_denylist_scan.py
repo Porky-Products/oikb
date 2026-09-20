@@ -204,13 +204,13 @@ def test_truncated_description_skips_llm(scan, tmp_path, monkeypatch):
 
 
 def test_llm_request_failure_aborts_not_consumed(scan, tmp_path, monkeypatch):
-    # LLM auth failure must abort the whole run (SystemExit 2 via the outer
+    # LLM auth failure must abort the whole run (SystemExit via the outer
     # handler) instead of marking tickets unsure and advancing
     zendesk = FakeZendeskClient(
         tickets={1: _ticket(1), 2: _ticket(2)},
         comments={1: ([], False), 2: ([], False)},
     )
-    llm = FakeLLMClient(responses=[])  # first classify() raises RuntimeError
+    llm = FakeLLMClient(responses=[])  # first classify() raises LLMRequestError
     env_backup = dict(os.environ)
     try:
         with pytest.raises(SystemExit) as excinfo:
@@ -223,3 +223,73 @@ def test_llm_request_failure_aborts_not_consumed(scan, tmp_path, monkeypatch):
     finally:
         os.environ.clear()
         os.environ.update(env_backup)
+
+
+class MalformedLLMClient:
+    """Returns 2xx responses whose bodies are unusable (empty/malformed choices)."""
+
+    def __init__(self, payloads):
+        self._payloads = list(payloads)
+        self.calls = 0
+
+    def classify(self, payload: str) -> str:
+        self.calls += 1
+        if not self._payloads:
+            raise scan_mod.RuntimeError("should not be called again")
+        body = self._payloads.pop(0)
+        raise scan_mod.MalformedCompletionError(body)
+
+
+scan_mod = None
+
+
+def test_malformed_completion_yields_per_ticket_unsure_not_abort(scan, tmp_path, monkeypatch):
+    """R1-F-bd4a1e9a: a 2xx response with empty/malformed choices must land
+    that ONE ticket in the review file as unsure and let the scan continue,
+    not abort the run like a transport failure."""
+    global scan_mod
+    scan_mod = scan
+    zendesk = FakeZendeskClient(
+        tickets={1: _ticket(1), 2: _ticket(2)},
+        comments={1: ([], False), 2: ([], False)},
+    )
+    llm = MalformedLLMClient(["empty choices", "malformed completion payload: bad"])
+    _run_scan(tmp_path, monkeypatch, scan, stop_id="2", llm=llm, zendesk=zendesk)
+    review = (tmp_path / "review.txt").read_text()
+    assert "1  # unsure: malformed completion: empty choices" in review
+    assert "2  # unsure: malformed completion: malformed completion payload: bad" in review
+    assert llm.calls == 2  # both tickets attempted; neither aborted the run
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["next_id"] == 3  # full segment completed normally
+
+
+def test_env_int_rejects_negative_and_nonnumeric(scan, monkeypatch):
+    monkeypatch.setenv("LLM_SCAN_MAX_PER_RUN", "-1")
+    with pytest.raises(SystemExit) as excinfo:
+        scan._env_int("LLM_SCAN_MAX_PER_RUN", 1000, minimum=0)
+    assert excinfo.value.code == 1
+
+    monkeypatch.setenv("LLM_SCAN_MAX_PER_RUN", "abc")
+    with pytest.raises(SystemExit) as excinfo:
+        scan._env_int("LLM_SCAN_MAX_PER_RUN", 1000, minimum=0)
+    assert excinfo.value.code == 1
+
+    monkeypatch.setenv("LLM_SCAN_MAX_PER_RUN", "")
+    assert scan._env_int("LLM_SCAN_MAX_PER_RUN", 1000, minimum=0) == 1000
+
+    monkeypatch.setenv("LLM_SCAN_MAX_PER_RUN", "5")
+    assert scan._env_int("LLM_SCAN_MAX_PER_RUN", 1000, minimum=0) == 5
+
+
+def test_env_float_rejects_nan_inf_negative(scan, monkeypatch):
+    for bad in ("nan", "inf", "-inf", "-1", "0", "abc"):
+        monkeypatch.setenv("LLM_SCAN_TIMEOUT_SECONDS", bad)
+        with pytest.raises(SystemExit) as excinfo:
+            scan._env_float("LLM_SCAN_TIMEOUT_SECONDS", 120.0, minimum=0.1)
+        assert excinfo.value.code == 1
+
+    monkeypatch.setenv("LLM_SCAN_TIMEOUT_SECONDS", "")
+    assert scan._env_float("LLM_SCAN_TIMEOUT_SECONDS", 120.0, minimum=0.1) == 120.0
+
+    monkeypatch.setenv("LLM_SCAN_TIMEOUT_SECONDS", "30.5")
+    assert scan._env_float("LLM_SCAN_TIMEOUT_SECONDS", 120.0, minimum=0.1) == 30.5

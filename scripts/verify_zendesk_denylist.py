@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import sys
 import urllib.error
@@ -219,8 +220,10 @@ def main() -> None:
         # A bad timeout is an operator configuration error: it must exit 2
         # (ERROR), never 1 — the status reserved for a confirmed leak.
         _die(f"invalid VERIFY_TIMEOUT_SECONDS: {exc}")
-    except TypeError:
-        _die("invalid VERIFY_TIMEOUT_SECONDS: not a number")
+    # float() accepts nan/inf/-1/0; urlopen would later raise uncaught
+    # ValueError/OverflowError/URLError exiting 1 (the LEAKED code).
+    if not math.isfinite(timeout) or timeout <= 0:
+        _die(f"invalid VERIFY_TIMEOUT_SECONDS: must be a positive finite number (got {timeout!r})")
 
     try:
         denied = _load_deny_ids(denylist_paths)

@@ -77,6 +77,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -128,6 +129,39 @@ Rules for the verdict:
 def _die(message: str) -> "None":
     print(f"error: {message}", file=sys.stderr)
     sys.exit(1)
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    """Parse a non-negative-int env var, _die()ing with a clear message on
+    anything else. Bare int() would either traceback (non-numeric) or, for
+    negatives like MAX_PER_RUN=-1, silently short-circuit the scan loop and
+    exit 0 as a 'completed pass' that classified zero tickets."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip()
+    if not (value.isascii() and value.isdigit()) :
+        _die(f"{name} must be an integer >= {minimum} (got {raw!r})")
+    parsed = int(value)
+    if parsed < minimum:
+        _die(f"{name} must be an integer >= {minimum} (got {raw!r})")
+    return parsed
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    """Parse a positive-float env var; _die() on non-numeric, negative, or
+    non-finite values (float() alone accepts nan/inf, which urlopen later
+    rejects with an uncaught ValueError/OverflowError)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = float(raw.strip())
+    except ValueError as exc:
+        _die(f"{name} must be a number >= {minimum} (got {raw!r}): {exc}")
+    if not math.isfinite(parsed) or parsed < minimum:
+        _die(f"{name} must be a finite number >= {minimum} (got {raw!r})")
+    return parsed
 
 
 def _sha256_file(path: Path) -> str:
@@ -242,6 +276,16 @@ class LLMRequestError(RuntimeError):
     """
 
 
+class MalformedCompletionError(RuntimeError):
+    """2xx completion whose JSON body is unusable (empty/malformed choices).
+
+    This is the model misbehaving, not the transport: the ticket must fall
+    back to per-ticket `unsure` for human review and the scan continues,
+    per the documented fail-closed policy. Deliberately NOT an
+    LLMRequestError so the outer abort handler treats it differently.
+    """
+
+
 class LLMClient:
     """Minimal OpenAI-compatible chat-completions client (Bearer auth)."""
 
@@ -284,10 +328,16 @@ class LLMClient:
                 try:
                     choices = (payload or {}).get("choices") or []
                     if not choices:
-                        raise RuntimeError("empty choices")
-                    return str(choices[0].get("message", {}).get("content", ""))
+                        raise MalformedCompletionError("empty choices")
+                    try:
+                        return str(choices[0].get("message", {}).get("content", ""))
+                    except (AttributeError, TypeError) as exc:
+                        raise MalformedCompletionError(f"malformed completion payload: {exc}") from exc
+                except MalformedCompletionError:
+                    raise
                 except (AttributeError, TypeError) as exc:
-                    raise RuntimeError(f"malformed completion payload: {exc}") from exc
+                    # payload itself not a dict / not subscriptable
+                    raise MalformedCompletionError(f"malformed completion payload: {exc}") from exc
             last_error = f"HTTP {status}: {raw[:300]}"
             if attempt == self._max_retries:
                 break
@@ -426,10 +476,10 @@ def main() -> None:
     denylist_path = Path(os.environ["LLM_SCAN_DENYLIST_FILE"])
     review_path = Path(os.environ["LLM_SCAN_REVIEW_FILE"])
     state_path = Path(os.environ["LLM_SCAN_STATE_FILE"])
-    max_per_run = int(os.environ.get("LLM_SCAN_MAX_PER_RUN") or _MAX_PER_RUN_DEFAULT)
-    timeout = float(os.environ.get("LLM_SCAN_TIMEOUT_SECONDS") or _TIMEOUT_DEFAULT)
-    llm_retries = int(os.environ.get("LLM_SCAN_MAX_LLM_RETRIES") or _MAX_LLM_RETRIES_DEFAULT)
-    desc_cap = int(os.environ.get("LLM_SCAN_DESC_CHAR_CAP") or _DESC_CAP_DEFAULT)
+    max_per_run = _env_int("LLM_SCAN_MAX_PER_RUN", _MAX_PER_RUN_DEFAULT, minimum=0)
+    timeout = _env_float("LLM_SCAN_TIMEOUT_SECONDS", _TIMEOUT_DEFAULT, minimum=0.1)
+    llm_retries = _env_int("LLM_SCAN_MAX_LLM_RETRIES", _MAX_LLM_RETRIES_DEFAULT, minimum=0)
+    desc_cap = _env_int("LLM_SCAN_DESC_CHAR_CAP", _DESC_CAP_DEFAULT, minimum=1)
 
     if not prompt_path.is_file():
         _die(f"prompt file not found: {prompt_path}")
@@ -588,13 +638,18 @@ def main() -> None:
                     payload = prompt_text + "\n\n---\n\n" + _FORMAT_INSTRUCTIONS + "\n\nTICKET DATA:\n" + block
                     verdict = "unsure"
                     reason = "no response obtained"
-                    # LLMRequestError (HTTP failure) propagates: it aborts the
-                    # run without consuming the range — infrastructure faults
-                    # are never per-ticket verdicts. Structural problems in a
-                    # 2xx response still resolve via _parse_verdict to unsure.
-                    raw_response = llm.classify(payload)
-                    parsed_verdict, parsed_reason = _parse_verdict(raw_response, ticket_id)
-                    verdict, reason = parsed_verdict, parsed_reason
+                    # Transport-level request failures (LLMRequestError)
+                    # propagate: aborting the run without consuming the range.
+                    # A 2xx response with an unusable body
+                    # (MalformedCompletionError) is model misbehavior, not
+                    # transport: this ticket falls back to `unsure` for human
+                    # review and the scan continues to the next ticket.
+                    try:
+                        raw_response = llm.classify(payload)
+                        parsed_verdict, parsed_reason = _parse_verdict(raw_response, ticket_id)
+                        verdict, reason = parsed_verdict, parsed_reason
+                    except MalformedCompletionError as exc:
+                        verdict, reason = "unsure", f"malformed completion: {exc}"
 
                 stats[verdict] = int(stats.get(verdict) or 0) + 1
                 if verdict == "deny":
