@@ -168,6 +168,18 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _parse_retry_after(headers: Any) -> float | None:
+    """Extract a numeric Retry-After header value, mirroring the connector."""
+    raw = getattr(headers, "get", lambda _name: None)("Retry-After")
+    if raw is None:
+        return None
+    try:
+        parsed = float(str(raw).strip())
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _http_json(
     url: str,
     *,
@@ -175,22 +187,25 @@ def _http_json(
     headers: dict[str, str] | None,
     body: bytes | None = None,
     timeout: float,
-) -> tuple[int, Any, str]:
+) -> tuple[int, Any, str, float | None]:
     request = urllib.request.Request(url, data=body, headers=headers or {})
     if method != "GET":
         request.get_method = lambda: method  # type: ignore[assignment]
+    retry_after: float | None = None
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status = response.status
             raw = response.read().decode("utf-8", errors="replace")
+            retry_after = _parse_retry_after(response.headers)
     except urllib.error.HTTPError as exc:
         status = exc.code
         raw = exc.read().decode("utf-8", errors="replace")
+        retry_after = _parse_retry_after(exc.headers)
     try:
         payload = json.loads(raw) if raw else None
     except json.JSONDecodeError:
         payload = None
-    return status, payload, raw
+    return status, payload, raw, retry_after
 
 
 class ZendeskClient:
@@ -209,7 +224,7 @@ class ZendeskClient:
         url = self._base + path_qs
         delay = 1.0
         for attempt in range(self._max_retries + 1):
-            status, payload, raw = _http_json(
+            status, payload, raw, retry_after = _http_json(
                 url, headers={"Authorization": self._auth, "User-Agent": "oikb-llm-scan/1"}, timeout=self._timeout
             )
             if status != 429:
@@ -217,7 +232,7 @@ class ZendeskClient:
             if attempt == self._max_retries:
                 return status, payload, raw
             # Retry-After: honor when parseable, else exponential backoff.
-            pause = delay
+            pause = min(retry_after, 90.0) if retry_after else delay
             time.sleep(pause)
             delay = min(delay * 2, 90.0)
         return status, payload, raw  # pragma: no cover - unreachable
@@ -321,7 +336,7 @@ class LLMClient:
         delay = 5.0
         last_error = ""
         for attempt in range(self._max_retries + 1):
-            status, payload, raw = _http_json(
+            status, payload, raw, _retry_after = _http_json(
                 self._url, method="POST", headers=headers, body=request_body, timeout=self._timeout
             )
             if 200 <= status < 300:

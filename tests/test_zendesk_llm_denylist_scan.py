@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -442,3 +443,76 @@ def test_append_to_empty_and_new_files(scan, tmp_path):
     scan._append_dedup(empty, 2, ids)
     assert empty.read_bytes() == b"2\n"
     assert _reload_deny_ids(empty) == {2}
+
+
+class _FakeTime:
+    def __init__(self):
+        self.sleeps: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
+
+def _client(scan):
+    return scan.ZendeskClient("example", "user@example.com", "token", timeout=5.0, max_retries=3)
+
+
+def test_get_honors_retry_after_header(scan, monkeypatch):
+    """R3-F-c693885c: a 429 with a parseable Retry-After must be waited out
+    (mirroring the connector's _retry_delay_seconds) instead of using the
+    fixed exponential backoff."""
+    fake_time = _FakeTime()
+    responses: list[tuple[int, Any, str, float | None]] = [
+        (429, None, "", 30.0),
+        (200, {"tickets": []}, "", None),
+    ]
+    monkeypatch.setattr(scan, "_http_json", lambda *a, **kw: responses.pop(0))
+    monkeypatch.setattr(scan, "time", fake_time)
+
+    status, payload, _ = _client(scan)._get("/tickets/show_many.json?ids=1")
+    assert status == 200
+    assert payload == {"tickets": []}
+    assert fake_time.sleeps == [30.0]
+
+
+def test_get_caps_retry_after_at_backoff_max(scan, monkeypatch):
+    """An oversized Retry-After is capped at the 90s backoff maximum."""
+    fake_time = _FakeTime()
+    responses = [
+        (429, None, "", 300.0),
+        (200, {}, "", None),
+    ]
+    monkeypatch.setattr(scan, "_http_json", lambda *a, **kw: responses.pop(0))
+    monkeypatch.setattr(scan, "time", fake_time)
+
+    status, _, _ = _client(scan)._get("/tickets/show_many.json?ids=1")
+    assert status == 200
+    assert fake_time.sleeps == [90.0]
+
+
+def test_get_falls_back_to_exponential_without_retry_after(scan, monkeypatch):
+    """A 429 without a Retry-After value keeps the exponential backoff."""
+    fake_time = _FakeTime()
+    responses = [
+        (429, None, "", None),
+        (429, None, "", None),
+        (200, {}, "", None),
+    ]
+    monkeypatch.setattr(scan, "_http_json", lambda *a, **kw: responses.pop(0))
+    monkeypatch.setattr(scan, "time", fake_time)
+
+    status, _, _ = _client(scan)._get("/tickets/show_many.json?ids=1")
+    assert status == 200
+    assert fake_time.sleeps == [1.0, 2.0]
+
+
+def test_parse_retry_after_values(scan):
+    """_parse_retry_after mirrors the connector: numeric values pass through,
+    anything else (missing, unparseable, non-positive) becomes None."""
+    assert scan._parse_retry_after({"Retry-After": "30"}) == 30.0
+    assert scan._parse_retry_after({"Retry-After": "2.5"}) == 2.5
+    assert scan._parse_retry_after({}) is None
+    assert scan._parse_retry_after({"Retry-After": "not-a-number"}) is None
+    assert scan._parse_retry_after({"Retry-After": "0"}) is None
+    assert scan._parse_retry_after({"Retry-After": "-5"}) is None
+    assert scan._parse_retry_after(None) is None
