@@ -1170,6 +1170,21 @@ def test_non_ascii_digit_denylist_entry_fails_closed(
         ZendeskTicketsConnector(state_dir=str(state_dir))
 
 
+def test_huge_digit_denylist_entry_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A 4301-digit entry passes isdigit() but overflows CPython's int/str
+    conversion limit; the connector must raise its controlled ValueError,
+    not a raw traceback."""
+    state_dir = _make_state_dir(tmp_path, "denylist-huge")
+    denylist = tmp_path / "deny.txt"
+    denylist.write_text("9" * 4301 + "\n")
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+
+    with pytest.raises(ValueError, match="Malformed denylist line"):
+        ZendeskTicketsConnector(state_dir=str(state_dir))
+
+
 def test_missing_denylist_file_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "denylist-missing")
     missing = tmp_path / "does-not-exist.txt"

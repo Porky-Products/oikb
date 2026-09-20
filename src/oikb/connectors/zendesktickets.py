@@ -944,7 +944,17 @@ def _load_denylist_files(value: str) -> set[str]:
                     f"Malformed denylist line {raw_path}:{line_number}: "
                     f"expected a numeric ticket ID, got {entry!r}"
                 )
-            denied.add(str(int(entry)))
+            try:
+                denied.add(str(int(entry)))
+            except ValueError as exc:
+                # isdigit() passes absurdly long digit strings, but CPython's
+                # int/str conversion limit (~4300 digits) still raises; keep
+                # the same controlled fail-closed contract as malformed
+                # entries instead of a raw traceback.
+                raise ValueError(
+                    f"Malformed denylist line {raw_path}:{line_number}: "
+                    f"unparseable numeric ticket ID {entry!r}: {exc}"
+                ) from exc
     return denied
 
 

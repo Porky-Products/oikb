@@ -8,6 +8,12 @@ These cover the Copilot PR-#40 review findings:
   ASCII-digit rule (no '+45748', no fullwidth digits)
 - comments pagination (next_page) forces unsure, never auto-allow
 - truncated descriptions skip the LLM call entirely
+- comment bodies are rendered into the LLM payload (operator spec); a
+  comment-bodies char cap, like the description cap, forces unsure
+- show_many-omitted IDs are cross-checked via single GET (archive-blind
+  recovery); truly missing IDs are counted and the cursor advances
+- absurdly long digit strings (>4300 digits) that pass isdigit() but
+  overflow CPython's int/str limit die cleanly (exit 1), never traceback
 - LLM request failures propagate (abort) instead of consuming the range
 """
 
@@ -39,12 +45,21 @@ def scan():
 class FakeZendeskClient:
     """Stub mirroring ZendeskClient's fetch/show methods."""
 
-    def __init__(self, tickets: dict[int, dict], comments: dict[int, tuple[list, bool]]):
+    def __init__(
+        self,
+        tickets: dict[int, dict],
+        comments: dict[int, tuple[list, bool]],
+        omit_from_show_many: set[int] | None = None,
+    ):
         self._tickets = tickets
         self._comments = comments
+        self._omit = set(omit_from_show_many or ())
 
     def show_many_tickets(self, ids):
-        return {i: self._tickets[i] for i in ids if i in self._tickets}
+        return {i: self._tickets[i] for i in ids if i in self._tickets and i not in self._omit}
+
+    def fetch_ticket(self, ticket_id):
+        return self._tickets.get(ticket_id)
 
     def show_many_users(self, ids):
         return {i: {"id": i, "email": f"u{i}@example.com"} for i in ids}
@@ -85,12 +100,18 @@ def test_parse_verdict_accepts_only_known_verdicts(scan):
 
 def test_format_ticket_block_reports_truncation(scan):
     ticket = _ticket(1, description="x" * 100)
-    block, names, truncated = scan._format_ticket_block(
-        ticket, [{"attachments": [{"file_name": "credit_app.pdf"}]}], "a@b.c", desc_cap=10
+    block, names, desc_truncated, comments_truncated = scan._format_ticket_block(
+        ticket,
+        [{"attachments": [{"file_name": "credit_app.pdf"}], "body": "y" * 50}],
+        "a@b.c",
+        desc_cap=10,
+        comments_cap=10,
     )
-    assert truncated is True
+    assert desc_truncated is True
+    assert comments_truncated is True
     assert names == ["credit_app.pdf"]
     assert "[…description truncated…]" in block
+    assert "[…comment bodies truncated…]" in block
 
 
 def _run_scan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scan, *, stop_id: str, llm, zendesk, reset: bool = False):
@@ -280,6 +301,125 @@ def test_truncated_description_skips_llm(scan, tmp_path, monkeypatch):
     review = (tmp_path / "review.txt").read_text()
     assert "description truncated" in review
     assert llm.calls == []
+
+
+def test_comment_bodies_reach_llm_payload(scan, tmp_path, monkeypatch):
+    # Operator spec: comment bodies are rendered into the classification
+    # block (only attachment *contents* are withheld); a routing-number
+    # sentence in a reply body must reach the LLM payload.
+    comments = [
+        {"id": 1, "body": "Here are the account and routing numbers for the deposit.", "attachments": []},
+        {"id": 2, "body": "Also see the attached credit app.", "attachments": [{"file_name": "credit_app.pdf"}]},
+    ]
+    zendesk = FakeZendeskClient(tickets={1: _ticket(1)}, comments={1: (comments, False)})
+    llm = FakeLLMClient(
+        responses=[json.dumps({"ticket_id": 1, "verdict": "deny", "reason": "bank data"})]
+    )
+    _run_scan(tmp_path, monkeypatch, scan, stop_id="1", llm=llm, zendesk=zendesk)
+    assert len(llm.calls) == 1
+    assert "Here are the account and routing numbers" in llm.calls[0]
+    assert "credit_app.pdf" in llm.calls[0]
+    assert (tmp_path / "deny.txt").read_text().strip() == "1"
+
+
+def test_comment_char_cap_forces_unsure(scan, tmp_path, monkeypatch):
+    # Comment bodies beyond LLM_SCAN_COMMENTS_CHAR_CAP are partial
+    # evidence: forced unsure, LLM never called.
+    monkeypatch.setenv("LLM_SCAN_COMMENTS_CHAR_CAP", "10")
+    comments = [{"id": 1, "body": "y" * 50, "attachments": []}]
+    zendesk = FakeZendeskClient(tickets={1: _ticket(1)}, comments={1: (comments, False)})
+    llm = FakeLLMClient(responses=[])
+    _run_scan(tmp_path, monkeypatch, scan, stop_id="1", llm=llm, zendesk=zendesk)
+    review = (tmp_path / "review.txt").read_text()
+    assert "comment bodies truncated" in review
+    assert llm.calls == []
+
+
+def test_show_many_omission_recovered_via_single_fetch(scan, tmp_path, monkeypatch):
+    # show_many omitting an ID that a single GET returns is the
+    # archive-blindness signal (zendesk_archive_smoke.py exit 2): the
+    # scanner must cross-check and classify the ticket, not consume it.
+    zendesk = FakeZendeskClient(
+        tickets={1: _ticket(1), 2: _ticket(2)},
+        comments={1: ([], False), 2: ([], False)},
+        omit_from_show_many={2},
+    )
+    llm = FakeLLMClient(
+        responses=[
+            json.dumps({"ticket_id": 1, "verdict": "allow", "reason": "ok"}),
+            json.dumps({"ticket_id": 2, "verdict": "deny", "reason": "credit app"}),
+        ]
+    )
+    _run_scan(tmp_path, monkeypatch, scan, stop_id="2", llm=llm, zendesk=zendesk)
+    assert len(llm.calls) == 2
+    assert "ticket_id: 2" in llm.calls[1]
+    assert (tmp_path / "deny.txt").read_text().strip() == "2"
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["stats"]["recovered_single_fetch"] == 1
+    assert state["stats"].get("skipped_missing", 0) == 0
+
+
+def test_missing_ticket_counted_and_cursor_advances(scan, tmp_path, monkeypatch):
+    # An ID served by neither show_many nor single GET (deleted/never
+    # existed) is counted as missing and the cursor advances past it.
+    zendesk = FakeZendeskClient(
+        tickets={2: _ticket(2)},
+        comments={2: ([], False)},
+    )
+    llm = FakeLLMClient(
+        responses=[json.dumps({"ticket_id": 2, "verdict": "allow", "reason": "ok"})]
+    )
+    _run_scan(tmp_path, monkeypatch, scan, stop_id="2", llm=llm, zendesk=zendesk)
+    assert len(llm.calls) == 1  # only ticket 2; ticket 1 never classified
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["stats"]["skipped_missing"] == 1
+    assert state["next_id"] == 3
+
+
+def test_huge_digit_stop_id_rejected_cleanly(scan, tmp_path, monkeypatch):
+    # isdigit() passes a 4301-digit string, but CPython's int/str
+    # conversion limit raises ValueError; must _die (exit 1), not traceback.
+    with pytest.raises(SystemExit) as excinfo:
+        _run_scan(
+            tmp_path,
+            monkeypatch,
+            scan,
+            stop_id="9" * 4301,
+            llm=FakeLLMClient(responses=[]),
+            zendesk=FakeZendeskClient(tickets={}, comments={}),
+        )
+    assert excinfo.value.code == 1
+
+
+def test_huge_digit_denylist_entry_rejected_cleanly(scan, tmp_path, monkeypatch):
+    # Same overflow via an operator-edited denylist file: controlled
+    # _die (exit 1), never a raw ValueError traceback.
+    (tmp_path / "deny.txt").write_text("9" * 4301 + "\n")
+    with pytest.raises(SystemExit) as excinfo:
+        _run_scan(
+            tmp_path,
+            monkeypatch,
+            scan,
+            stop_id="1",
+            llm=FakeLLMClient(responses=[]),
+            zendesk=FakeZendeskClient(tickets={}, comments={}),
+        )
+    assert excinfo.value.code == 1
+
+
+def test_huge_digit_review_entry_rejected_cleanly(scan, tmp_path, monkeypatch):
+    # Same overflow via the review file: controlled _die (exit 1).
+    (tmp_path / "review.txt").write_text("9" * 4301 + "\n")
+    with pytest.raises(SystemExit) as excinfo:
+        _run_scan(
+            tmp_path,
+            monkeypatch,
+            scan,
+            stop_id="1",
+            llm=FakeLLMClient(responses=[]),
+            zendesk=FakeZendeskClient(tickets={}, comments={}),
+        )
+    assert excinfo.value.code == 1
 
 
 def test_llm_request_failure_aborts_not_consumed(scan, tmp_path, monkeypatch):

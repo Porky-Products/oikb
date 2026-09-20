@@ -93,7 +93,17 @@ def _load_deny_ids(paths: list[str]) -> set[str]:
                             f"malformed denylist line {raw_path}:{line_number}: "
                             f"expected a numeric ticket ID, got {entry!r}"
                         )
-                    denied.add(str(int(entry)))
+                    try:
+                        denied.add(str(int(entry)))
+                    except ValueError as exc:
+                        # isdigit() passes absurdly long digit strings, but
+                        # CPython's int/str conversion limit (~4300 digits)
+                        # still raises; keep the ERROR exit code, never the
+                        # LEAKED code a raw traceback would produce.
+                        _die(
+                            f"malformed denylist line {raw_path}:{line_number}: "
+                            f"unparseable numeric ticket ID {entry!r}: {exc}"
+                        )
         except UnicodeDecodeError as exc:
             # Not an OSError subclass: without this, a non-UTF-8 denylist
             # would crash with an uncaught traceback exiting 1 — the code

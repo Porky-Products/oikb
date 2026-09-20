@@ -154,3 +154,14 @@ def test_bom_prefixed_denylist_parses(verify, tmp_path):
     p = tmp_path / "deny.txt"
     p.write_text("\ufeff45748\n", encoding="utf-8")
     assert verify._load_deny_ids([str(p)]) == {"45748"}
+
+
+def test_huge_digit_denylist_entry_exits_2(verify, tmp_path):
+    """A 4301-digit entry passes isdigit() but overflows CPython's int/str
+    conversion limit; the verifier must exit 2 (ERROR) — never 1 (LEAKED),
+    which a raw ValueError traceback would produce."""
+    huge = tmp_path / "deny-huge.txt"
+    huge.write_text("9" * 4301 + "\n")
+    with pytest.raises(SystemExit) as excinfo:
+        verify._load_deny_ids([str(huge)])
+    assert excinfo.value.code == 2

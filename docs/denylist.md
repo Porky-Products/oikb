@@ -53,14 +53,18 @@ above it are handled by the normal tag filters. IDs are walked in creation
 order (verified: `tickets/show_many.json` serves archived tickets, so no
 ticket in the range is unreachable) rather than by date: a date cutoff on
 the incremental stream would mis-bound old tickets that received late
-comments.
+comments. IDs that `show_many` nonetheless omits are cross-checked with a
+single `GET /tickets/{id}.json` before being treated as missing — the
+archive-blindness signal `zendesk_archive_smoke.py` exit-2 tests for.
 
 For each ticket the scanner also fetches `GET /tickets/{id}/comments.json`
 once — attachment payloads live on comment objects (the `show_many` ticket
 records carry no attachment list, only the boolean `allow_attachments`), and
-attachment filenames are a primary deny signal. Comment *bodies* are not
-sent to the LLM; only the attachment filenames are rendered into the
-classification block. Budget one extra API call per ticket.
+attachment filenames are a primary deny signal. Comment *bodies* are
+rendered into the classification block (total chars capped by
+`LLM_SCAN_COMMENTS_CHAR_CAP`); only attachment *contents* are withheld —
+filenames stay, as they often indicate the content ("credit app", "bank
+records"). Budget one extra API call per ticket.
 
 ```bash
 export ZENDESKTICKET_SUBDOMAIN=porky
@@ -81,7 +85,9 @@ python3 scripts/zendesk_llm_denylist_scan.py
 Optional: `LLM_SCAN_MAX_PER_RUN` (default `1000`, `0` = unlimited),
 `LLM_SCAN_TIMEOUT_SECONDS` (default `120`), `LLM_SCAN_MAX_LLM_RETRIES`
 (default `3`), `LLM_SCAN_DESC_CHAR_CAP` (default `6000`; oversized
-descriptions are truncated and forced to `unsure`).
+descriptions are truncated and forced to `unsure`),
+`LLM_SCAN_COMMENTS_CHAR_CAP` (default `6000`; total comment-body chars per
+ticket, same forced-`unsure` rule).
 
 Behavior:
 
@@ -91,7 +97,8 @@ Behavior:
 - **Fail-closed**: LLM request failures (auth errors, outages) abort the run
   rather than guessing or consuming the ticket range; malformed model
   responses fall back to `unsure` for human review; partial evidence — a
-  description truncated by `LLM_SCAN_DESC_CHAR_CAP`, or a comments response
+  description truncated by `LLM_SCAN_DESC_CHAR_CAP`, comment bodies
+  truncated by `LLM_SCAN_COMMENTS_CHAR_CAP`, or a comments response
   with more pages than the scanner reads (full pagination is tracked in
   issue #41) — is forced to `unsure` (review file) and never sent to the LLM
   at all, regardless of what the model might answer; verdicts are categorical

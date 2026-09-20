@@ -68,6 +68,8 @@ Scanner:
   LLM_SCAN_MAX_LLM_RETRIES        optional; default 3 per ticket
   LLM_SCAN_DESC_CHAR_CAP           optional; default 6000 chars of description
                                    per ticket; larger -> forced unsure
+  LLM_SCAN_COMMENTS_CHAR_CAP       optional; default 6000 chars of comment
+                                   bodies per ticket; larger -> forced unsure
 
 Stdlib only; no backend imports, runs anywhere Python 3.9+ runs.
 """
@@ -90,6 +92,7 @@ from typing import Any
 
 _BATCH_IDS = 100  # Zendesk show_many page limit
 _DESC_CAP_DEFAULT = 6000
+_COMMENTS_CAP_DEFAULT = 6000
 _TIMEOUT_DEFAULT = 120.0
 _MAX_LLM_RETRIES_DEFAULT = 3
 _MAX_PER_RUN_DEFAULT = 1000
@@ -248,6 +251,22 @@ class ZendeskClient:
                 out[ticket["id"]] = ticket
         return out
 
+    def fetch_ticket(self, ticket_id: int) -> dict[str, Any] | None:
+        """Fetch one ticket by ID; None on 404 (deleted/never-existed).
+
+        Cross-check for IDs that show_many omitted: per the
+        zendesk_archive_smoke.py contract, omitted-but-single-fetchable is
+        the archive-blindness signal, and such tickets must still be
+        classified rather than silently consumed.
+        """
+        status, payload, _ = self._get(f"/tickets/{ticket_id}.json")
+        if status == 404:
+            return None
+        if status != 200:
+            raise RuntimeError(f"Zendesk ticket HTTP {status} for ticket {ticket_id}")
+        ticket = (payload or {}).get("ticket")
+        return ticket if isinstance(ticket, dict) else None
+
     def fetch_ticket_comments(self, ticket_id: int) -> tuple[list[dict[str, Any]], bool]:
         """Fetch a ticket's comments (attachments live on comment objects).
 
@@ -397,31 +416,52 @@ def _parse_verdict(text: str, expected_ticket_id: int) -> tuple[str, str]:
     return verdict, ""
 
 
-def _format_ticket_block(ticket: dict[str, Any], comments: list[dict[str, Any]], requester_email: str, desc_cap: int) -> tuple[str, list[str], bool]:
-    """Render one ticket for the LLM. Returns (block_text, attachment_names, truncated).
+def _format_ticket_block(
+    ticket: dict[str, Any],
+    comments: list[dict[str, Any]],
+    requester_email: str,
+    desc_cap: int,
+    comments_cap: int,
+) -> tuple[str, list[str], bool, bool]:
+    """Render one ticket for the LLM. Returns (block_text, attachment_names,
+    desc_truncated, comments_truncated).
 
-    Attachment names come from the ticket's own attachment list plus every
-    comment's attachments — the same union the oikb connector builds
-    (src/oikb/connectors/zendesktickets.py _collect_attachments). Ticket
-    objects from show_many carry NO attachments themselves (Zendesk OAS
-    TicketObject has only the boolean allow_attachments); attachment payloads
-    live on comment objects, which the caller fetches via
-    /tickets/{id}/comments.json.
+    Comment bodies are rendered — the connector publishes them into the KB
+    (src/oikb/connectors/zendesktickets.py _render_ticket_markdown), so the
+    classifier must see the same textual evidence; only attachment
+    *contents* are withheld (performance compromise), names stay as they
+    often indicate the content ("credit app", "bank records"). Attachment
+    names come from the ticket's own attachment list plus every comment's
+    attachments — the same union the oikb connector builds
+    (_collect_attachments). Ticket objects from show_many carry NO
+    attachments themselves (Zendesk OAS TicketObject has only the boolean
+    allow_attachments); attachment payloads live on comment objects, which
+    the caller fetches via /tickets/{id}/comments.json.
     """
     description = str(ticket.get("description") or "")
-    truncated = len(description) > desc_cap
-    if truncated:
+    desc_truncated = len(description) > desc_cap
+    if desc_truncated:
         description = description[:desc_cap] + "\n[…description truncated…]"
     attachment_names: list[str] = []
-    for attachment in ticket.get("attachments") or []:
-        name = str(attachment.get("file_name") or "").strip()
-        if name:
-            attachment_names.append(name)
+    comment_bodies: list[str] = []
+    comments_chars = 0
+    comments_truncated = False
     for comment in comments or []:
         for attachment in comment.get("attachments") or []:
             name = str(attachment.get("file_name") or "").strip()
             if name:
                 attachment_names.append(name)
+        body = str(comment.get("body") or "").strip()
+        if not body:
+            continue
+        if comments_chars + len(body) > comments_cap:
+            remaining = comments_cap - comments_chars
+            if remaining > 0:
+                comment_bodies.append(body[:remaining] + "\n[…comment bodies truncated…]")
+            comments_truncated = True
+            break
+        comment_bodies.append(body)
+        comments_chars += len(body)
     lines = [
         f"ticket_id: {ticket.get('id')}",
         f"subject: {ticket.get('subject')!r}",
@@ -433,8 +473,10 @@ def _format_ticket_block(ticket: dict[str, Any], comments: list[dict[str, Any]],
         f"attachment_names: {attachment_names}",
         "description:",
         description or "(empty)",
+        "comments:",
+        "\n---\n".join(comment_bodies) or "(none)",
     ]
-    return "\n".join(lines), attachment_names, truncated
+    return "\n".join(lines), attachment_names, desc_truncated, comments_truncated
 
 
 def _append_line(path: Path, line: str) -> None:
@@ -507,7 +549,12 @@ def main() -> None:
         if not (stop_id_raw.isascii() and stop_id_raw.isdigit()) or stop_id_raw == "0" or stop_id_raw.lstrip("0") == "":
             _die(f"{name} must be a positive integer (got {os.environ.get(name)!r})")
     # canonicalize leading zeros so state comparisons are stable
-    stop_id = int(os.environ["LLM_SCAN_STOP_TICKET_ID"])
+    try:
+        stop_id = int(os.environ["LLM_SCAN_STOP_TICKET_ID"])
+    except ValueError as exc:
+        # isdigit() passes absurdly long digit strings, but CPython's
+        # int/str conversion limit (~4300 digits) still raises.
+        _die(f"LLM_SCAN_STOP_TICKET_ID is not parseable as an integer: {exc}")
     prompt_path = Path(os.environ["LLM_SCAN_PROMPT_FILE"])
     denylist_path = Path(os.environ["LLM_SCAN_DENYLIST_FILE"])
     review_path = Path(os.environ["LLM_SCAN_REVIEW_FILE"])
@@ -516,6 +563,7 @@ def main() -> None:
     timeout = _env_float("LLM_SCAN_TIMEOUT_SECONDS", _TIMEOUT_DEFAULT, minimum=0.1)
     llm_retries = _env_int("LLM_SCAN_MAX_LLM_RETRIES", _MAX_LLM_RETRIES_DEFAULT, minimum=0)
     desc_cap = _env_int("LLM_SCAN_DESC_CHAR_CAP", _DESC_CAP_DEFAULT, minimum=1)
+    comments_cap = _env_int("LLM_SCAN_COMMENTS_CHAR_CAP", _COMMENTS_CAP_DEFAULT, minimum=1)
 
     if not prompt_path.is_file():
         _die(f"prompt file not found: {prompt_path}")
@@ -592,7 +640,16 @@ def main() -> None:
                         f"{denylist_path}:{line_no}: malformed denylist entry {entry!r}; "
                         "expected a plain numeric ticket ID"
                     )
-                deny_ids.add(int(entry))
+                try:
+                    deny_ids.add(int(entry))
+                except ValueError as exc:
+                    # isdigit() passes absurdly long digit strings, but
+                    # CPython's int/str conversion limit (~4300 digits)
+                    # still raises.
+                    _die(
+                        f"{denylist_path}:{line_no}: unparseable denylist entry "
+                        f"{entry!r}: {exc}"
+                    )
         except UnicodeDecodeError as exc:
             # Not an OSError: without this a non-UTF-8 denylist crashes
             # with a raw traceback instead of a clean fail-closed error.
@@ -611,7 +668,16 @@ def main() -> None:
                             f"{review_path}:{line_no}: malformed review entry {head!r}; "
                             "expected a plain numeric ticket ID before the comment"
                         )
-                    reviewed.add(int(head))
+                    try:
+                        reviewed.add(int(head))
+                    except ValueError as exc:
+                        # isdigit() passes absurdly long digit strings, but
+                        # CPython's int/str conversion limit (~4300 digits)
+                        # still raises.
+                        _die(
+                            f"{review_path}:{line_no}: unparseable review entry "
+                            f"{head!r}: {exc}"
+                        )
         except UnicodeDecodeError as exc:
             _die(f"{review_path} is not valid UTF-8: {exc}")
 
@@ -655,28 +721,44 @@ def main() -> None:
                     break
                 ticket = tickets.get(ticket_id)
                 if ticket is None:
-                    # Deleted/never-existed IDs are simply not served.
-                    stats["skipped_missing"] = int(stats.get("skipped_missing") or 0) + 1
-                    last_processed_id = ticket_id
-                    continue
+                    # show_many can omit archived tickets; the PR's own
+                    # smoke script (zendesk_archive_smoke.py) defines
+                    # omitted-but-single-fetchable as the archive-blindness
+                    # signal, so cross-check via single GET before treating
+                    # the ID as nonexistent — otherwise the cursor would
+                    # silently consume an unclassified legacy ticket.
+                    ticket = zendesk.fetch_ticket(ticket_id)
+                    if ticket is None:
+                        # Deleted/never-existed IDs are simply not served.
+                        stats["skipped_missing"] = int(stats.get("skipped_missing") or 0) + 1
+                        last_processed_id = ticket_id
+                        continue
+                    stats["recovered_single_fetch"] = int(stats.get("recovered_single_fetch") or 0) + 1
+                    rid = ticket.get("requester_id")
+                    if rid:
+                        users.update(zendesk.show_many_users([int(rid)]))
                 requester_email = str(users.get(ticket.get("requester_id"), {}).get("email") or "")
-                comments, comments_truncated = zendesk.fetch_ticket_comments(ticket_id)
-                block, attachment_names, _desc_truncated = _format_ticket_block(ticket, comments, requester_email, desc_cap)
-                # Partial evidence — description cap hit, or comments pages
-                # beyond the first (this scanner reads one page; full
-                # traversal is issue #41) — must never yield an automatic
-                # verdict: skip the LLM call entirely and force `unsure`.
-                partial_evidence = _desc_truncated or comments_truncated
+                comments, comments_paginated = zendesk.fetch_ticket_comments(ticket_id)
+                block, attachment_names, desc_truncated, comments_truncated = _format_ticket_block(
+                    ticket, comments, requester_email, desc_cap, comments_cap
+                )
+                # Partial evidence — description cap hit, comment-bodies
+                # cap hit, or comments pages beyond the first (this scanner
+                # reads one page; full traversal is issue #41) — must never
+                # yield an automatic verdict: skip the LLM call entirely
+                # and force `unsure`.
+                partial_evidence = desc_truncated or comments_truncated or comments_paginated
 
                 verdict = "unsure"
                 if partial_evidence:
-                    reason = (
-                        "description truncated beyond LLM_SCAN_DESC_CHAR_CAP"
-                        if _desc_truncated
-                        else "comments paginated beyond first page (issue #41)"
-                    )
-                    if _desc_truncated and comments_truncated:
-                        reason = "description truncated and comments paginated (issue #41)"
+                    reasons = []
+                    if desc_truncated:
+                        reasons.append("description truncated beyond LLM_SCAN_DESC_CHAR_CAP")
+                    if comments_truncated:
+                        reasons.append("comment bodies truncated beyond LLM_SCAN_COMMENTS_CHAR_CAP")
+                    if comments_paginated:
+                        reasons.append("comments paginated beyond first page (issue #41)")
+                    reason = "; ".join(reasons)
                     stats["forced_unsure_partial_evidence"] = (
                         int(stats.get("forced_unsure_partial_evidence") or 0) + 1
                     )
@@ -751,6 +833,7 @@ def _summary(stats: dict[str, Any], classified_this_run: int, failures: int, sto
         f"  verdict totals (all runs so far): "
         f"deny={stats.get('deny', 0)} unsure={stats.get('unsure', 0)} "
         f"allow={stats.get('allow', 0)} missing={stats.get('skipped_missing', 0)} "
+        f"recovered={stats.get('recovered_single_fetch', 0)} "
         f"forced-unsure-partial={stats.get('forced_unsure_partial_evidence', 0)}\n"
         f"  this run: classified={classified_this_run} llm_failures={failures}\n"
         f"  cursor: next_id={next_id} of stop_id={stop_id}"
