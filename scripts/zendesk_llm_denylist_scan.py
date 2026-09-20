@@ -199,15 +199,23 @@ class ZendeskClient:
                 out[ticket["id"]] = ticket
         return out
 
-    def fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]]:
-        """Fetch a ticket's comments (attachments live on comment objects)."""
+    def fetch_ticket_comments(self, ticket_id: int) -> tuple[list[dict[str, Any]], bool]:
+        """Fetch a ticket's comments (attachments live on comment objects).
+
+        Returns (comments, more_pages). more_pages is True when the response
+        indicates continuation: Zendesk paginates this endpoint, and this
+        scanner deliberately reads only the first page — the caller forces
+        `unsure` (human review) rather than classifying on partial evidence.
+        Full traversal is tracked in issue #41.
+        """
         status, payload, _ = self._get(f"/tickets/{ticket_id}/comments.json")
         if status == 404:
-            return []  # ticket vanished mid-scan; classify on core fields
+            return [], False  # ticket vanished mid-scan; classify on core fields
         if status != 200:
             raise RuntimeError(f"Zendesk comments HTTP {status} for ticket {ticket_id}")
         comments = (payload or {}).get("comments") or []
-        return [c for c in comments if isinstance(c, dict)]
+        more = bool((payload or {}).get("next_page"))
+        return [c for c in comments if isinstance(c, dict)], more
 
     def show_many_users(self, ids: list[int]) -> dict[int, dict[str, Any]]:
         ids = [i for i in ids if i]
@@ -222,6 +230,16 @@ class ZendeskClient:
             if isinstance(user, dict) and isinstance(user.get("id"), int):
                 out[user["id"]] = user
         return out
+
+
+class LLMRequestError(RuntimeError):
+    """Chat-completions request failed after retries (HTTP auth/outage/5xx).
+
+    Distinct from a malformed-but-successful 2xx completion payload: request
+    failures are infrastructure faults that must abort the scan rather than
+    be recorded as per-ticket `unsure` verdicts (which would consume the
+    ticket range without classification).
+    """
 
 
 class LLMClient:
@@ -279,7 +297,7 @@ class LLMClient:
                 delay = min(delay * 2, 60.0)
                 continue
             break
-        raise RuntimeError(f"LLM request failed after {self._max_retries + 1} attempts: {last_error}")
+        raise LLMRequestError(f"LLM request failed after {self._max_retries + 1} attempts: {last_error}")
 
 
 def _parse_verdict(text: str, expected_ticket_id: int) -> tuple[str, str]:
@@ -399,9 +417,10 @@ def main() -> None:
             + "\nSee this script's docstring for the full list and semantics."
         )
     for name in ("LLM_SCAN_STOP_TICKET_ID",):
-        if not os.environ.get(name, "").strip().isdigit():
+        stop_id_raw = os.environ.get(name, "").strip()
+        if not (stop_id_raw.isascii() and stop_id_raw.isdigit()) or stop_id_raw == "0" or stop_id_raw.lstrip("0") == "":
             _die(f"{name} must be a positive integer (got {os.environ.get(name)!r})")
-
+    # canonicalize leading zeros so state comparisons are stable
     stop_id = int(os.environ["LLM_SCAN_STOP_TICKET_ID"])
     prompt_path = Path(os.environ["LLM_SCAN_PROMPT_FILE"])
     denylist_path = Path(os.environ["LLM_SCAN_DENYLIST_FILE"])
@@ -445,7 +464,25 @@ def main() -> None:
         next_id = 1
         stats = {}
     if reset_requested:
-        print("--reset: restarting from ID 1 (counts recomputed from files)")
+        # Archive stale classification artifacts rather than silently keep
+        # applying them: a deny decision from the *previous* prompt survives
+        # into the new pass otherwise (denylist is dedup-only, never
+        # retracted). Renaming to a .pre-reset-<sha8> sidecar preserves the
+        # operator's history while guaranteeing the fresh pass starts from
+        # empty outputs. Mid-run aborts restore nothing (operator can
+        # re-merge manually from the archives if wanted).
+        for path in (denylist_path, review_path):
+            if path.exists() and path.stat().st_size > 0:
+                archive = path.with_name(f"{path.name}.pre-reset-{prompt_sha[:8]}")
+                n = 1
+                while archive.exists():
+                    archive = path.with_name(f"{path.name}.pre-reset-{prompt_sha[:8]}.{n}")
+                    n += 1
+                path.rename(archive)
+                print(f"--reset: archived prior {path.name} to {archive.name}")
+        if state_path.exists():
+            state_path.unlink()
+        print("--reset: restarting from ID 1 (prior counts discarded; outputs start empty)")
     if next_id > stop_id:
         print(f"Nothing to do: next_id={next_id} > stop_id={stop_id} (pass complete).")
         _write_completion(state_path, next_id, stop_id, prompt_sha, stats)
@@ -454,18 +491,33 @@ def main() -> None:
     # ---- Existing denylist (dedup on append) ---------------------------
     deny_ids: set[int] = set()
     if denylist_path.exists():
-        for line in denylist_path.read_text(encoding="utf-8").splitlines():
+        for line_no, line in enumerate(denylist_path.read_text(encoding="utf-8").splitlines(), start=1):
             entry = line.strip()
-            if entry and not entry.startswith("#"):
-                deny_ids.add(int(entry))
+            if not entry or entry.startswith("#"):
+                continue
+            # Same strict rule as the connector's loader: ASCII digits only,
+            # so the scanner never emits or accepts entries the connector
+            # would later reject (e.g. '+45748', fullwidth digits).
+            if not (entry.isascii() and entry.isdigit()):
+                _die(
+                    f"{denylist_path}:{line_no}: malformed denylist entry {entry!r}; "
+                    "expected a plain numeric ticket ID"
+                )
+            deny_ids.add(int(entry))
     reviewed: set[int] = set()
     if review_path.exists():
-        for line in review_path.read_text(encoding="utf-8").splitlines():
+        for line_no, line in enumerate(review_path.read_text(encoding="utf-8").splitlines(), start=1):
             entry = line.strip()
-            if entry and not entry.startswith("#"):
-                head = entry.split("#", 1)[0].strip()
-                if head.isdigit():
-                    reviewed.add(int(head))
+            if not entry or entry.startswith("#"):
+                continue
+            head = entry.split("#", 1)[0].strip()
+            if head:
+                if not (head.isascii() and head.isdigit()):
+                    _die(
+                        f"{review_path}:{line_no}: malformed review entry {head!r}; "
+                        "expected a plain numeric ticket ID before the comment"
+                    )
+                reviewed.add(int(head))
 
     zendesk = ZendeskClient(
         subdomain=os.environ["ZENDESKTICKET_SUBDOMAIN"],
@@ -483,7 +535,6 @@ def main() -> None:
     )
 
     classified_this_run = 0
-    per_ticket_failures = 0
     # Last ID this run actually processed (classified or confirmed missing).
     # The persisted cursor derives from it, never from batch_ids[-1]: a cap
     # hit mid-batch leaves the batch tail unvisited, and advancing past it
@@ -513,35 +564,37 @@ def main() -> None:
                     last_processed_id = ticket_id
                     continue
                 requester_email = str(users.get(ticket.get("requester_id"), {}).get("email") or "")
-                comments = zendesk.fetch_ticket_comments(ticket_id)
-                block, _attachment_names, truncated = _format_ticket_block(ticket, comments, requester_email, desc_cap)
+                comments, comments_truncated = zendesk.fetch_ticket_comments(ticket_id)
+                block, attachment_names, _desc_truncated = _format_ticket_block(ticket, comments, requester_email, desc_cap)
+                # Partial evidence — description cap hit, or comments pages
+                # beyond the first (this scanner reads one page; full
+                # traversal is issue #41) — must never yield an automatic
+                # verdict: skip the LLM call entirely and force `unsure`.
+                partial_evidence = _desc_truncated or comments_truncated
 
                 verdict = "unsure"
-                if truncated and not _attachment_names:
-                    # Documented fail-closed policy: truncate the description
-                    # and loose attachment evidence -> do not classify; a
-                    # model verdict on partial evidence is advisory only.
-                    reason = "description truncated beyond LLM_SCAN_DESC_CHAR_CAP"
+                if partial_evidence:
+                    reason = (
+                        "description truncated beyond LLM_SCAN_DESC_CHAR_CAP"
+                        if _desc_truncated
+                        else "comments paginated beyond first page (issue #41)"
+                    )
+                    if _desc_truncated and comments_truncated:
+                        reason = "description truncated and comments paginated (issue #41)"
+                    stats["forced_unsure_partial_evidence"] = (
+                        int(stats.get("forced_unsure_partial_evidence") or 0) + 1
+                    )
                 else:
                     payload = prompt_text + "\n\n---\n\n" + _FORMAT_INSTRUCTIONS + "\n\nTICKET DATA:\n" + block
-                    if truncated:
-                        payload += "\n\nNOTE: description was truncated; classify with 'unsure' if the truncated part might change your verdict."
-                    raw_response = None
                     verdict = "unsure"
                     reason = "no response obtained"
-                    try:
-                        raw_response = llm.classify(payload)
-                        verdict, reason = _parse_verdict(raw_response, ticket_id)
-                    except RuntimeError as exc:
-                        per_ticket_failures += 1
-                        reason = str(exc)
-                        verdict = "unsure"
-                    if truncated and verdict != "unsure":
-                        # Enforce the documented invariant even when the model
-                        # answered on truncated text: evidence was cut, so the
-                        # ticket must go to human review, never auto-allow.
-                        reason = f"forced unsure: description truncated ({reason})"
-                        verdict = "unsure"
+                    # LLMRequestError (HTTP failure) propagates: it aborts the
+                    # run without consuming the range — infrastructure faults
+                    # are never per-ticket verdicts. Structural problems in a
+                    # 2xx response still resolve via _parse_verdict to unsure.
+                    raw_response = llm.classify(payload)
+                    parsed_verdict, parsed_reason = _parse_verdict(raw_response, ticket_id)
+                    verdict, reason = parsed_verdict, parsed_reason
 
                 stats[verdict] = int(stats.get(verdict) or 0) + 1
                 if verdict == "deny":
@@ -570,27 +623,21 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nInterrupted; state saved through the last completed batch.")
         _save_state(state_path, {"next_id": next_id, "stop_id": stop_id, "prompt_sha256": prompt_sha, "stats": stats})
-        _summary(stats, classified_this_run, per_ticket_failures, stop_id, next_id)
+        _summary(stats, classified_this_run, 0, stop_id, next_id)
         sys.exit(130)
     except (urllib.error.URLError, RuntimeError, OSError) as exc:
         # Infra failure: abort without advancing past unclassified tickets.
         print(f"error: aborted after infra failure: {exc}", file=sys.stderr)
         print("        state saved through the last completed batch; re-run to resume.")
         _save_state(state_path, {"next_id": next_id, "stop_id": stop_id, "prompt_sha256": prompt_sha, "stats": stats})
-        _summary(stats, classified_this_run, per_ticket_failures, stop_id, next_id)
+        _summary(stats, classified_this_run, 0, stop_id, next_id)
         sys.exit(1)
 
     print(f"Pass segment complete at next_id={next_id} (stop_id={stop_id}).")
     if next_id > stop_id:
         print("Full pass complete.")
     _save_state(state_path, {"next_id": next_id, "stop_id": stop_id, "prompt_sha256": prompt_sha, "stats": stats})
-    _summary(stats, classified_this_run, per_ticket_failures, stop_id, next_id)
-    if per_ticket_failures:
-        print(
-            "NOTE: some tickets fell back to 'unsure' after LLM failures; "
-            "they are in the review file. Re-run after checking OPENAI_* config."
-        )
-        sys.exit(2)
+    _summary(stats, classified_this_run, 0, stop_id, next_id)
 
 
 def _write_completion(state_path: Path, next_id: int, stop_id: int, prompt_sha: str, stats: dict[str, Any]) -> None:
@@ -602,7 +649,8 @@ def _summary(stats: dict[str, Any], classified_this_run: int, failures: int, sto
         "\nSummary:\n"
         f"  verdict totals (all runs so far): "
         f"deny={stats.get('deny', 0)} unsure={stats.get('unsure', 0)} "
-        f"allow={stats.get('allow', 0)} missing={stats.get('skipped_missing', 0)}\n"
+        f"allow={stats.get('allow', 0)} missing={stats.get('skipped_missing', 0)} "
+        f"forced-unsure-partial={stats.get('forced_unsure_partial_evidence', 0)}\n"
         f"  this run: classified={classified_this_run} llm_failures={failures}\n"
         f"  cursor: next_id={next_id} of stop_id={stop_id}"
     )

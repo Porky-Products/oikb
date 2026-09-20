@@ -11,7 +11,7 @@ archived legacy tickets are the entire population the scanner must classify,
 they can no longer be edited (so they cannot be given the ``ach_request`` /
 ``sensitive`` tags), and Zendesk's behavior on serving archived tickets
 through the standard endpoints is exactly what this script measures
-empetically rather than trusting docs or memory.
+empirically rather than trusting docs or memory.
 
 What it checks, per ticket ID passed (default: 45748, a known archived
 legacy ticket):

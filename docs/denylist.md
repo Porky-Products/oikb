@@ -88,16 +88,22 @@ Behavior:
 - **Resumable**: state is the next ticket ID; re-run after any abort and it
   continues. Changing the prompt file or stop ID between runs aborts (use
   `--reset` to restart the pass intentionally).
-- **Fail-closed**: LLM outages abort the run rather than guessing;
-  malformed responses fall back to `unsure` for human review; a ticket whose
-  description is truncated by `LLM_SCAN_DESC_CHAR_CAP` is forced to `unsure`
-  (review file) regardless of what the model answers — partial evidence is
-  never auto-allowed; verdicts are categorical `deny|unsure|allow` (no
-  confidence scores).
+- **Fail-closed**: LLM request failures (auth errors, outages) abort the run
+  rather than guessing or consuming the ticket range; malformed model
+  responses fall back to `unsure` for human review; partial evidence — a
+  description truncated by `LLM_SCAN_DESC_CHAR_CAP`, or a comments response
+  with more pages than the scanner reads (full pagination is tracked in
+  issue #41) — is forced to `unsure` (review file) and never sent to the LLM
+  at all, regardless of what the model might answer; verdicts are categorical
+  `deny|unsure|allow` (no confidence scores).
 - **Review file**: lines like `45748  # unsure: non-JSON response  (…)`.
   Triage each by adding the ID to a denylist file (deny it) or doing
   nothing (accept as allowed). The scanner deduplicates against existing
   files, so reviewed IDs are never re-appended on later runs.
+- **`--reset` semantics**: restarting archives any existing denylist/review
+  files to `<name>.pre-reset-<prompt-sha8>` sidecars (preserving history)
+  and deletes the state file, so the fresh pass starts from empty outputs —
+  deny decisions from the previous prompt are not silently carried forward.
 
 ## Purging and verifying
 

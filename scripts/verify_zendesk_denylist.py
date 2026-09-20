@@ -213,7 +213,14 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    timeout = float(os.environ.get("VERIFY_TIMEOUT_SECONDS") or _TIMEOUT_DEFAULT)
+    try:
+        timeout = float(os.environ.get("VERIFY_TIMEOUT_SECONDS") or _TIMEOUT_DEFAULT)
+    except ValueError as exc:
+        # A bad timeout is an operator configuration error: it must exit 2
+        # (ERROR), never 1 — the status reserved for a confirmed leak.
+        _die(f"invalid VERIFY_TIMEOUT_SECONDS: {exc}")
+    except TypeError:
+        _die("invalid VERIFY_TIMEOUT_SECONDS: not a number")
 
     try:
         denied = _load_deny_ids(denylist_paths)

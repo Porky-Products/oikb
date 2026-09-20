@@ -73,6 +73,6 @@ ticket: credit-dept requester asks how to change their own app password
 Deny when the ticket itself carries or requests the sensitive financial
 material. Allow when the ticket only discusses business in general terms.
 If you cannot tell — truncated, ambiguous, missing pieces — answer
-unsure. A wrongly-denied ordinary ticket is recoverable by a human
-reviewing the review-file pipeline; sensitive data leaked into the KB is
-not.
+unsure. A wrongly-denied ordinary ticket requires an operator to remove
+its ID from the denylist file by hand; sensitive data leaked into the KB is
+not recoverable that way. Both errors are bad — hence unsure when in doubt.
