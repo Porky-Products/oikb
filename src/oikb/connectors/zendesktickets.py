@@ -930,7 +930,16 @@ def _parse_bool(value: str) -> bool:
 
 
 def _parse_tags(value: str) -> set[str]:
-    return {part.strip().lower() for part in value.split(",") if part.strip()}
+    # Tolerate quoted env values (e.g. EXCLUDETAG="a, b") where the inner
+    # quotes would otherwise become part of each tag and never match. Strip
+    # quotes first, then let str.strip() remove *all* whitespace (including
+    # non-ASCII spaces like NBSP that env values pasted from documents can
+    # carry), so ' ach_request' and ' sap:other "' both reduce cleanly.
+    return {
+        tag
+        for part in value.split(",")
+        if (tag := part.strip("\"'").strip().lower())
+    }
 
 
 def _parse_attachment_extensions(value: str | None) -> frozenset[str] | None:
