@@ -114,16 +114,22 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
             base_url.rstrip("/")
             + f"/api/v1/knowledge/{urllib.parse.quote(str(kb_id))}/files?{qs}"
         )
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": "oikb-deny-verify/1",
-            },
-        )
         try:
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "User-Agent": "oikb-deny-verify/1",
+                },
+            )
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
+        except ValueError as exc:
+            # urllib raises ValueError at Request construction for
+            # unparseable URLs (e.g. a scheme-less base_url, which the main
+            # oikb config accepts): an operator config error, so exit 2
+            # (ERROR) — never 1, which is reserved for a confirmed leak.
+            _die(f"invalid OPEN_WEBUI_URL {base_url!r}: {exc}")
         except urllib.error.HTTPError as exc:
             _die(f"KB request failed with HTTP {exc.code}: {url}")
         except urllib.error.URLError as exc:

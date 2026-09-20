@@ -61,6 +61,22 @@ def test_timeout_nonfinite_or_nonpositive_exits_2(verify, denylist, monkeypatch,
     assert excinfo.value.code == 2
 
 
+@pytest.mark.parametrize("bad_url", ["openwebui", "open-webui", "openwebui.example.com"])
+def test_schemeless_openwebui_url_exits_2(verify, denylist, bad_url):
+    """R2-F-bcbfb1e6: urllib raises ValueError at Request construction for a
+    scheme-less base_url (the main oikb config accepts bare hosts), and that
+    uncaught ValueError used to exit 1 — the documented LEAKED code."""
+    env = {
+        "OPEN_WEBUI_URL": bad_url,
+        "OPEN_WEBUI_API_KEY": "k",
+    }
+    with mock.patch.dict(os.environ, env):
+        with mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]):
+            with pytest.raises(SystemExit) as excinfo:
+                verify.main()
+    assert excinfo.value.code == 2
+
+
 def test_timeout_valid_value_accepted(verify, denylist):
     env = {
         "OPEN_WEBUI_URL": "http://openwebui",
