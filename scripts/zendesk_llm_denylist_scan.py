@@ -564,33 +564,41 @@ def main() -> None:
     if denylist_path.exists():
         # utf-8-sig: tolerate an editor-written BOM on operator-edited
         # files; identical to utf-8 for the scanner's own BOM-less output.
-        for line_no, line in enumerate(denylist_path.read_text(encoding="utf-8-sig").splitlines(), start=1):
-            entry = line.strip()
-            if not entry or entry.startswith("#"):
-                continue
-            # Same strict rule as the connector's loader: ASCII digits only,
-            # so the scanner never emits or accepts entries the connector
-            # would later reject (e.g. '+45748', fullwidth digits).
-            if not (entry.isascii() and entry.isdigit()):
-                _die(
-                    f"{denylist_path}:{line_no}: malformed denylist entry {entry!r}; "
-                    "expected a plain numeric ticket ID"
-                )
-            deny_ids.add(int(entry))
+        try:
+            for line_no, line in enumerate(denylist_path.read_text(encoding="utf-8-sig").splitlines(), start=1):
+                entry = line.strip()
+                if not entry or entry.startswith("#"):
+                    continue
+                # Same strict rule as the connector's loader: ASCII digits only,
+                # so the scanner never emits or accepts entries the connector
+                # would later reject (e.g. '+45748', fullwidth digits).
+                if not (entry.isascii() and entry.isdigit()):
+                    _die(
+                        f"{denylist_path}:{line_no}: malformed denylist entry {entry!r}; "
+                        "expected a plain numeric ticket ID"
+                    )
+                deny_ids.add(int(entry))
+        except UnicodeDecodeError as exc:
+            # Not an OSError: without this a non-UTF-8 denylist crashes
+            # with a raw traceback instead of a clean fail-closed error.
+            _die(f"{denylist_path} is not valid UTF-8: {exc}")
     reviewed: set[int] = set()
     if review_path.exists():
-        for line_no, line in enumerate(review_path.read_text(encoding="utf-8-sig").splitlines(), start=1):
-            entry = line.strip()
-            if not entry or entry.startswith("#"):
-                continue
-            head = entry.split("#", 1)[0].strip()
-            if head:
-                if not (head.isascii() and head.isdigit()):
-                    _die(
-                        f"{review_path}:{line_no}: malformed review entry {head!r}; "
-                        "expected a plain numeric ticket ID before the comment"
-                    )
-                reviewed.add(int(head))
+        try:
+            for line_no, line in enumerate(review_path.read_text(encoding="utf-8-sig").splitlines(), start=1):
+                entry = line.strip()
+                if not entry or entry.startswith("#"):
+                    continue
+                head = entry.split("#", 1)[0].strip()
+                if head:
+                    if not (head.isascii() and head.isdigit()):
+                        _die(
+                            f"{review_path}:{line_no}: malformed review entry {head!r}; "
+                            "expected a plain numeric ticket ID before the comment"
+                        )
+                    reviewed.add(int(head))
+        except UnicodeDecodeError as exc:
+            _die(f"{review_path} is not valid UTF-8: {exc}")
 
     zendesk = ZendeskClient(
         subdomain=os.environ["ZENDESKTICKET_SUBDOMAIN"],

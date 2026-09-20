@@ -196,6 +196,61 @@ def test_bom_prefixed_denylist_and_review_files_parse(scan, tmp_path, monkeypatc
     assert (tmp_path / "review.txt").read_text(encoding="utf-8") == "\ufeff2  # unsure: prior run\n"
 
 
+def test_invalid_utf8_denylist_file_fails_closed(scan, tmp_path, monkeypatch, capsys):
+    """A non-UTF-8 denylist must fail closed via _die naming the file, not
+    crash with an uncaught UnicodeDecodeError traceback."""
+    (tmp_path / "deny.txt").write_bytes(b"\xff\xfe1\n")
+    env = {
+        "ZENDESKTICKET_SUBDOMAIN": "x",
+        "ZENDESKTICKET_USER": "x",
+        "ZENDESKTICKET_TOKEN": "x",
+        "OPENAI_BASE_URL": "http://llm",
+        "OPENAI_API_KEY": "k",
+        "OPENAI_MODEL": "m",
+        "LLM_SCAN_STOP_TICKET_ID": "5",
+        "LLM_SCAN_PROMPT_FILE": str(tmp_path / "prompt.md"),
+        "LLM_SCAN_DENYLIST_FILE": str(tmp_path / "deny.txt"),
+        "LLM_SCAN_REVIEW_FILE": str(tmp_path / "review.txt"),
+        "LLM_SCAN_STATE_FILE": str(tmp_path / "state.json"),
+    }
+    monkeypatch.setattr(scan, "REQUIRED_ENV", list(env.keys()))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    (tmp_path / "prompt.md").write_text("deny credit applications")
+    monkeypatch.setattr(scan.sys, "argv", ["prog"])
+    with pytest.raises(SystemExit) as excinfo:
+        scan.main()
+    assert excinfo.value.code == 1  # _die exit code
+    assert "not valid UTF-8" in capsys.readouterr().err
+
+
+def test_invalid_utf8_review_file_fails_closed(scan, tmp_path, monkeypatch, capsys):
+    """A non-UTF-8 review file must fail closed via _die naming the file."""
+    (tmp_path / "review.txt").write_bytes(b"\xff\xfe2\n")
+    env = {
+        "ZENDESKTICKET_SUBDOMAIN": "x",
+        "ZENDESKTICKET_USER": "x",
+        "ZENDESKTICKET_TOKEN": "x",
+        "OPENAI_BASE_URL": "http://llm",
+        "OPENAI_API_KEY": "k",
+        "OPENAI_MODEL": "m",
+        "LLM_SCAN_STOP_TICKET_ID": "5",
+        "LLM_SCAN_PROMPT_FILE": str(tmp_path / "prompt.md"),
+        "LLM_SCAN_DENYLIST_FILE": str(tmp_path / "deny.txt"),
+        "LLM_SCAN_REVIEW_FILE": str(tmp_path / "review.txt"),
+        "LLM_SCAN_STATE_FILE": str(tmp_path / "state.json"),
+    }
+    monkeypatch.setattr(scan, "REQUIRED_ENV", list(env.keys()))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    (tmp_path / "prompt.md").write_text("deny credit applications")
+    monkeypatch.setattr(scan.sys, "argv", ["prog"])
+    with pytest.raises(SystemExit) as excinfo:
+        scan.main()
+    assert excinfo.value.code == 1  # _die exit code
+    assert "not valid UTF-8" in capsys.readouterr().err
+
+
 def test_paginated_comments_force_unsure_without_llm(scan, tmp_path, monkeypatch):
     # Ticket 1: 250 comments -> Zendesk paginates; comments beyond page 1
     # are NOT fetched; classification must skip the LLM and record unsure.

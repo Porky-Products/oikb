@@ -1208,6 +1208,18 @@ def test_bom_prefixed_denylist_file_parses(monkeypatch: pytest.MonkeyPatch, tmp_
     connector.close()
 
 
+def test_invalid_utf8_denylist_file_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A non-UTF-8 denylist must abort with a controlled ValueError naming
+    the file, not an uncaught UnicodeDecodeError traceback."""
+    state_dir = _make_state_dir(tmp_path, "denylist-invalid-utf8")
+    bad = tmp_path / "deny.txt"
+    bad.write_bytes(b"\xff\xfe45748\n")
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(bad))
+
+    with pytest.raises(ValueError, match="Cannot read Zendesk tickets denylist file"):
+        ZendeskTicketsConnector(state_dir=str(state_dir))
+
+
 def test_denylisted_carried_forward_ticket_is_purged_from_kb_on_next_sync(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

@@ -923,7 +923,9 @@ def _load_denylist_files(value: str) -> set[str]:
             # utf-8-sig strips an editor-written BOM; identical to utf-8
             # for BOM-less files.
             text = expanded.read_text(encoding="utf-8-sig")
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
+            # UnicodeDecodeError (invalid UTF-8) is not an OSError; wrap it
+            # too so a non-UTF-8 denylist fails closed with file context.
             raise ValueError(
                 f"Cannot read Zendesk tickets denylist file {raw_path!r}: {exc}"
             ) from exc
