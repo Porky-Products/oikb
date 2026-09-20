@@ -293,3 +293,74 @@ def test_env_float_rejects_nan_inf_negative(scan, monkeypatch):
 
     monkeypatch.setenv("LLM_SCAN_TIMEOUT_SECONDS", "30.5")
     assert scan._env_float("LLM_SCAN_TIMEOUT_SECONDS", 120.0, minimum=0.1) == 30.5
+
+
+def _reload_deny_ids(path: Path) -> set[int]:
+    """Mimic the scanner/connector strict loader for assertion purposes."""
+    out: set[int] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        if entry.isascii() and entry.isdigit():
+            out.add(int(entry))
+    return out
+
+
+def test_append_dedup_no_trailing_newline_does_not_fuse(scan, tmp_path):
+    """R3-F-bacbf43c: appending to a file whose last line lacks a trailing
+    newline must insert a separator so the reloaded set equals the union —
+    never a fused '4602390001' phantom, never a lost ID."""
+    denylist = tmp_path / "deny.txt"
+    denylist.write_text("# legacy credit-application tickets\n45748\n46023")  # no trailing \n
+    ids = {45748, 46023}
+    scan._append_dedup(denylist, 90001, ids)
+    assert denylist.read_bytes() == (
+        b"# legacy credit-application tickets\n45748\n46023\n90001\n"
+    )
+    assert _reload_deny_ids(denylist) == {45748, 46023, 90001}
+    assert ids == {45748, 46023, 90001}
+
+    # Comment-without-newline variant: appended ID must not be swallowed.
+    denylist2 = tmp_path / "deny2.txt"
+    denylist2.write_text("45748\n# manual denials")  # no trailing \n
+    ids2 = {45748}
+    scan._append_dedup(denylist2, 90002, ids2)
+    assert _reload_deny_ids(denylist2) == {45748, 90002}
+
+
+def test_append_review_no_trailing_newline_does_not_fuse(scan, tmp_path):
+    """R3-F-bacbf43c (review-file variant): appending an unsure entry onto a
+    review file whose last line lacks a newline must keep both entries
+    separately parseable; the appended ticket must remain tracked."""
+    review = tmp_path / "review.txt"
+    review.write_text(
+        "45748  # unsure: previous run  (2026-01-01T00:00:00Z)"
+    )  # no trailing \n
+    reviewed: set[int] = set()
+    scan._append_review(review, 90002, "non-JSON response", reviewed)
+    text = review.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    assert len(lines) == 2, lines
+    head = lines[1].split("#", 1)[0].strip()
+    assert head == "90002"
+    assert 90002 in reviewed
+    # first entry untouched
+    assert lines[0].startswith("45748  # unsure: previous run")
+
+
+def test_append_to_empty_and_new_files(scan, tmp_path):
+    """Fresh/empty files append cleanly with no spurious separators."""
+    denylist = tmp_path / "fresh.txt"
+    ids: set[int] = set()
+    scan._append_dedup(denylist, 1, ids)
+    assert denylist.read_bytes() == b"1\n"
+    assert _reload_deny_ids(denylist) == {1}
+
+    # 0-byte file (e.g. created empty by an interrupted run): no spurious
+    # leading separator newline, entry parses cleanly.
+    empty = tmp_path / "empty.txt"
+    empty.write_bytes(b"")
+    scan._append_dedup(empty, 2, ids)
+    assert empty.read_bytes() == b"2\n"
+    assert _reload_deny_ids(empty) == {2}

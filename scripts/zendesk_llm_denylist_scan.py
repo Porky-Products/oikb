@@ -422,11 +422,33 @@ def _format_ticket_block(ticket: dict[str, Any], comments: list[dict[str, Any]],
     return "\n".join(lines), attachment_names, truncated
 
 
+def _append_line(path: Path, line: str) -> None:
+    """Append one line, inserting a separator newline first when the file's
+    final line lacks one.
+
+    Hand-edited files (the documented workflow in docs/denylist.md) may not
+    end in a newline; a plain append would fuse the new ID onto the last
+    entry ('46023' + '90001' -> '4602390001'), which every downstream loader
+    (scanner, connector) accepts silently — fail-open for the very ticket
+    being denied. Opening in 'rb' to inspect the final byte avoids
+    decode/encode round-trip surprises.
+    """
+    needs_separator = False
+    if path.exists() and path.stat().st_size > 0:
+        with path.open("rb") as fh:
+            fh.seek(-1, os.SEEK_END)
+            needs_separator = fh.read(1) != b"\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        if needs_separator:
+            fh.write("\n")
+        fh.write(line)
+
+
 def _append_dedup(path: Path, ticket_id: int, deny_ids: set[int]) -> None:
     if ticket_id in deny_ids:
         return
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(f"{ticket_id}\n")
+    _append_line(path, f"{ticket_id}\n")
     deny_ids.add(ticket_id)
 
 
@@ -434,8 +456,7 @@ def _append_review(path: Path, ticket_id: int, reason: str, reviewed: set[int]) 
     if ticket_id in reviewed:
         return
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(f"{ticket_id}  # unsure: {reason}  ({stamp})\n")
+    _append_line(path, f"{ticket_id}  # unsure: {reason}  ({stamp})\n")
     reviewed.add(ticket_id)
 
 
