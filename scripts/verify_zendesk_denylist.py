@@ -124,17 +124,14 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
             )
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except ValueError as exc:
-            # urllib raises ValueError at Request construction for
-            # unparseable URLs (e.g. a scheme-less base_url, which the main
-            # oikb config accepts): an operator config error, so exit 2
-            # (ERROR) — never 1, which is reserved for a confirmed leak.
-            _die(f"invalid OPEN_WEBUI_URL {base_url!r}: {exc}")
         except urllib.error.HTTPError as exc:
             _die(f"KB request failed with HTTP {exc.code}: {url}")
         except urllib.error.URLError as exc:
             _die(f"cannot reach Open WebUI at {base_url}: {exc}")
         except json.JSONDecodeError as exc:
+            # Must precede the generic ValueError clause: JSONDecodeError
+            # subclasses it, and a misplaced clause would misreport a
+            # non-JSON KB body as an OPEN_WEBUI_URL configuration error.
             _die(f"KB response was not JSON: {exc}")
         except (TimeoutError, http.client.HTTPException, OSError, UnicodeDecodeError) as exc:
             # Post-connect failures that are NOT urllib.error.URLError
@@ -143,6 +140,15 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
             # and MUST route to exit 2 — exit 1 is reserved for a confirmed
             # leak (LEAKED), and a traceback exit(1) here would read as one.
             _die(f"KB response failed or was unreadable: {type(exc).__name__}: {exc}")
+        except ValueError as exc:
+            # urllib raises ValueError at Request construction for
+            # unparseable URLs (e.g. a scheme-less base_url, which the main
+            # oikb config accepts): an operator config error, so exit 2
+            # (ERROR) — never 1, which is reserved for a confirmed leak.
+            # Deliberately LAST: json.JSONDecodeError and UnicodeDecodeError
+            # both subclass ValueError and must reach their dedicated
+            # handlers above instead of being misattributed here.
+            _die(f"invalid OPEN_WEBUI_URL {base_url!r}: {exc}")
         if not isinstance(payload, dict):
             _die(f"KB response was not a JSON object: {str(payload)[:200]}")
         # Null-tolerant parse (this server has served explicit nulls).
