@@ -35,6 +35,20 @@ _DEFAULT_ATTACHMENT_EXTENSIONS = frozenset(
     }
 )
 _ATTACHMENT_EXTENSIONS_ENV = "ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS"
+# Safety bound for comments pagination: a ticket needs an extreme comment
+# count to exceed it (100 pages x 100 comments/page default). Hitting the
+# bound fails closed -- the ticket is skipped rather than synced partially.
+_MAX_COMMENT_PAGES = 100
+
+
+def _foreign_zendesk_url(url: str, subdomain: str) -> bool:
+    """True when url is absolute but not the expected Zendesk API host.
+
+    next_page URLs are only followed on the authenticated client's own
+    host; anything else must not receive the token credentials.
+    """
+    netloc = urlparse(url).netloc
+    return bool(netloc) and netloc != f"{subdomain}.zendesk.com"
 
 
 class ZendeskTicketsConnector(BaseConnector):
@@ -548,9 +562,55 @@ class ZendeskTicketsConnector(BaseConnector):
             ) from exc
 
     def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]] | None:
-        """Fetch comments for a ticket, returning None on 404 or after exhausting retries."""
+        """Fetch every comments page for a ticket, following next_page.
+
+        Returns None on 404 or when any page cannot be fetched after
+        exhausting retries (fail-closed: a ticket is never synced with a
+        partial comment set, matching the excluded-ticket contract).
+        """
+        comments: list[dict[str, Any]] = []
+        next_page: str | None = None
+        seen_page_urls: set[str] = set()
+        for _page in range(_MAX_COMMENT_PAGES):
+            response = self._get_comments_page(ticket_id, next_page)
+            if response is None:
+                return None
+            payload = response.json()
+            comments.extend(payload.get("comments", []))
+            candidate = payload.get("next_page")
+            if not candidate:
+                return comments
+            if not isinstance(candidate, str) or _foreign_zendesk_url(candidate, self._subdomain):
+                log.warning(
+                    "ZendeskTicketsConnector: ticket %s returned a unusable comments next_page (%r); skipping ticket",
+                    ticket_id,
+                    candidate,
+                )
+                return None
+            if candidate in seen_page_urls:
+                log.warning(
+                    "ZendeskTicketsConnector: ticket %s comments next_page repeated (%s); skipping ticket",
+                    ticket_id,
+                    candidate,
+                )
+                return None
+            seen_page_urls.add(candidate)
+            next_page = candidate
+        log.warning(
+            "ZendeskTicketsConnector: ticket %s comments exceeded %d pages; skipping ticket",
+            ticket_id,
+            _MAX_COMMENT_PAGES,
+        )
+        return None
+
+    def _get_comments_page(self, ticket_id: int, next_page: str | None):
+        """Fetch one comments page, retrying 429/5xx like the single-page path.
+
+        Returns the response, or None on 404 or after exhausting retries.
+        """
+        url = next_page if next_page else f"/tickets/{ticket_id}/comments.json"
         for attempt in range(self._max_retries + 1):
-            response = self._zendesk_get(f"/tickets/{ticket_id}/comments.json")
+            response = self._zendesk_get(url)
             status = getattr(response, "status_code", None)
             if status == 404:
                 if self._verbose_http:
@@ -567,7 +627,7 @@ class ZendeskTicketsConnector(BaseConnector):
                 time.sleep(delay)
                 continue
             response.raise_for_status()
-            return response.json().get("comments", [])
+            return response
         return None
 
     def _render_ticket_markdown(self, ticket: dict[str, Any], comments: list[dict[str, Any]]) -> str:
