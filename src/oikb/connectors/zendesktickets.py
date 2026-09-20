@@ -907,7 +907,8 @@ def _load_denylist_files(value: str) -> set[str]:
     Format: one ticket ID per line; blank lines and ``#`` comments ignored.
     A missing or unreadable file, or a non-numeric data line, raises
     ValueError so a misconfigured denylist fails the run instead of
-    silently syncing a sensitive ticket (fail-closed).
+    silently syncing a sensitive ticket (fail-closed). A leading UTF-8
+    BOM (a common editor artifact) is tolerated.
     """
     denied: set[str] = set()
     paths = [part.strip() for part in value.split(",") if part.strip()]
@@ -919,7 +920,9 @@ def _load_denylist_files(value: str) -> set[str]:
                 f"(from {_DENYLIST_FILES_ENV}={value!r})"
             )
         try:
-            text = expanded.read_text(encoding="utf-8")
+            # utf-8-sig strips an editor-written BOM; identical to utf-8
+            # for BOM-less files.
+            text = expanded.read_text(encoding="utf-8-sig")
         except OSError as exc:
             raise ValueError(
                 f"Cannot read Zendesk tickets denylist file {raw_path!r}: {exc}"

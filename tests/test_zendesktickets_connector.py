@@ -1189,6 +1189,25 @@ def test_malformed_denylist_line_fails_closed(monkeypatch: pytest.MonkeyPatch, t
         ZendeskTicketsConnector(state_dir=str(state_dir))
 
 
+def test_bom_prefixed_denylist_file_parses(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A UTF-8 BOM (a common editor artifact) must not fail the run: the
+    entries are valid, so they load. Fail-closed applies to malformed data
+    lines, not encoding artifacts."""
+    state_dir = _make_state_dir(tmp_path, "denylist-bom")
+    denylist = tmp_path / "deny.txt"
+    denylist.write_text("\ufeff45748\n1002\n", encoding="utf-8")
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comments={},
+    )
+
+    assert connector._denied_ticket_ids == {"45748", "1002"}
+    connector.close()
+
+
 def test_denylisted_carried_forward_ticket_is_purged_from_kb_on_next_sync(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

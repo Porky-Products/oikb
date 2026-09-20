@@ -145,3 +145,12 @@ def test_timeout_valid_value_accepted(verify, denylist):
                 verify.main()
     assert excinfo.value.code == 2
     # main() reached transport with a parsed timeout: config was accepted.
+
+
+def test_bom_prefixed_denylist_parses(verify, tmp_path):
+    """The verifier reads the same operator-authored denylist files as the
+    connector, so a UTF-8 BOM must be tolerated here too: an otherwise
+    valid denylist must not fail verification."""
+    p = tmp_path / "deny.txt"
+    p.write_text("\ufeff45748\n", encoding="utf-8")
+    assert verify._load_deny_ids([str(p)]) == {"45748"}

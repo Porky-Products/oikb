@@ -77,7 +77,9 @@ def _load_deny_ids(paths: list[str]) -> set[str]:
     denied: set[str] = set()
     for raw_path in paths:
         try:
-            with open(raw_path, encoding="utf-8") as fh:
+            # utf-8-sig: tolerate an editor-written BOM, matching the
+            # connector's loader; identical to utf-8 for BOM-less files.
+            with open(raw_path, encoding="utf-8-sig") as fh:
                 for line_number, line in enumerate(fh, start=1):
                     entry = line.strip()
                     if not entry or entry.startswith("#"):

@@ -562,7 +562,9 @@ def main() -> None:
     # ---- Existing denylist (dedup on append) ---------------------------
     deny_ids: set[int] = set()
     if denylist_path.exists():
-        for line_no, line in enumerate(denylist_path.read_text(encoding="utf-8").splitlines(), start=1):
+        # utf-8-sig: tolerate an editor-written BOM on operator-edited
+        # files; identical to utf-8 for the scanner's own BOM-less output.
+        for line_no, line in enumerate(denylist_path.read_text(encoding="utf-8-sig").splitlines(), start=1):
             entry = line.strip()
             if not entry or entry.startswith("#"):
                 continue
@@ -577,7 +579,7 @@ def main() -> None:
             deny_ids.add(int(entry))
     reviewed: set[int] = set()
     if review_path.exists():
-        for line_no, line in enumerate(review_path.read_text(encoding="utf-8").splitlines(), start=1):
+        for line_no, line in enumerate(review_path.read_text(encoding="utf-8-sig").splitlines(), start=1):
             entry = line.strip()
             if not entry or entry.startswith("#"):
                 continue

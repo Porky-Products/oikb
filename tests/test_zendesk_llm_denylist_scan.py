@@ -173,6 +173,29 @@ def test_existing_denylist_strict_ascii_parse(scan, tmp_path, monkeypatch):
     assert excinfo.value.code == 1  # _die exit code (malformed denylist entry)
 
 
+def test_bom_prefixed_denylist_and_review_files_parse(scan, tmp_path, monkeypatch):
+    """A UTF-8 BOM on operator-edited denylist/review files must not abort
+    a resumed scan: entries parse and dedup normally."""
+    (tmp_path / "deny.txt").write_text("\ufeff1\n", encoding="utf-8")
+    (tmp_path / "review.txt").write_text("\ufeff2  # unsure: prior run\n", encoding="utf-8")
+    zendesk = FakeZendeskClient(
+        tickets={1: _ticket(1), 2: _ticket(2)},
+        comments={1: ([], False), 2: ([], False)},
+    )
+    llm = FakeLLMClient(
+        responses=[
+            json.dumps({"ticket_id": 1, "verdict": "deny", "reason": "x"}),
+            json.dumps({"ticket_id": 2, "verdict": "unsure", "reason": "y"}),
+        ]
+    )
+    _run_scan(tmp_path, monkeypatch, scan, stop_id="2", llm=llm, zendesk=zendesk)
+    # Both tickets were classified: parsing did not abort the run.
+    assert len(llm.calls) == 2
+    # Dedup held: neither file gained a duplicate entry.
+    assert (tmp_path / "deny.txt").read_text(encoding="utf-8") == "\ufeff1\n"
+    assert (tmp_path / "review.txt").read_text(encoding="utf-8") == "\ufeff2  # unsure: prior run\n"
+
+
 def test_paginated_comments_force_unsure_without_llm(scan, tmp_path, monkeypatch):
     # Ticket 1: 250 comments -> Zendesk paginates; comments beyond page 1
     # are NOT fetched; classification must skip the LLM and record unsure.
