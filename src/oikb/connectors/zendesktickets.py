@@ -585,7 +585,7 @@ class ZendeskTicketsConnector(BaseConnector):
                 return comments
             if not isinstance(candidate, str) or _foreign_zendesk_url(candidate, self._subdomain):
                 log.warning(
-                    "ZendeskTicketsConnector: ticket %s returned a unusable comments next_page (%r); skipping ticket",
+                    "ZendeskTicketsConnector: ticket %s returned an unusable comments next_page (%r); skipping ticket",
                     ticket_id,
                     candidate,
                 )
