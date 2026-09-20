@@ -47,8 +47,11 @@ def _foreign_zendesk_url(url: str, subdomain: str) -> bool:
     next_page URLs are only followed on the authenticated client's own
     host; anything else must not receive the token credentials.
     """
-    netloc = urlparse(url).netloc
-    return bool(netloc) and netloc != f"{subdomain}.zendesk.com"
+    parsed = urlparse(url)
+    return bool(parsed.netloc) and (
+        parsed.scheme.lower() != "https"
+        or parsed.netloc.lower() != f"{subdomain.lower()}.zendesk.com"
+    )
 
 
 class ZendeskTicketsConnector(BaseConnector):
