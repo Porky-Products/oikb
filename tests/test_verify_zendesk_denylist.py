@@ -165,3 +165,81 @@ def test_huge_digit_denylist_entry_exits_2(verify, tmp_path):
     with pytest.raises(SystemExit) as excinfo:
         verify._load_deny_ids([str(huge)])
     assert excinfo.value.code == 2
+
+
+def _run_main_with_kb(verify, denylist, monkeypatch, body: bytes):
+    """Drive main() against a stubbed KB listing; return (exit_code, stdout)."""
+    import contextlib
+    import io
+
+    env = {
+        "OPEN_WEBUI_URL": "http://openwebui",
+        "OPEN_WEBUI_API_KEY": "k",
+        "VERIFY_TIMEOUT_SECONDS": "30",
+    }
+    captured = io.StringIO()
+    with mock.patch.dict(os.environ, env):
+        with mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]):
+            with mock.patch.object(
+                verify.urllib.request, "urlopen", lambda *a, **k: _FakeResponse(body)
+            ):
+                with contextlib.redirect_stdout(captured):
+                    try:
+                        verify.main()
+                        code = 0
+                    except SystemExit as exc:
+                        code = exc.code
+    return code, captured.getvalue()
+
+
+def test_clean_listing_exits_0(verify, denylist, monkeypatch):
+    """R2-F-cd48e4b3: a complete KB listing containing no denied-ID
+    filenames is the exit-0 CLEAN path (previously untested)."""
+    import json
+
+    body = json.dumps(
+        {
+            "items": [
+                {"meta": {"name": "1001-order.md"}},
+                {"meta": {"name": "1002-notes.md"}},
+            ],
+            "total": 2,
+        }
+    ).encode()
+    code, out = _run_main_with_kb(verify, denylist, monkeypatch, body)
+    assert code == 0
+    assert "VERDICT: CLEAN" in out
+
+
+def test_leaked_listing_exits_1_with_filenames(verify, denylist, monkeypatch):
+    """R2-F-cd48e4b3: a denied ticket's KB files are the exit-1 LEAKED path;
+    both filename forms (<id>.md and <id>-prefixed) are reported."""
+    import json
+
+    body = json.dumps(
+        {
+            "items": [
+                {"meta": {"name": "1001-order.md"}},
+                {"meta": {"name": "45748.md"}},
+                {"meta": {"name": "45748-attachment.png"}},
+            ],
+            "total": 3,
+        }
+    ).encode()
+    code, out = _run_main_with_kb(verify, denylist, monkeypatch, body)
+    assert code == 1
+    assert "VERDICT: LEAKED" in out
+    assert "45748.md" in out
+    assert "45748-attachment.png" in out
+
+
+def test_leaked_item_filename_fallback_field(verify, denylist, monkeypatch):
+    """Items without meta.name fall back to the filename field; a denied
+    ID surfaced only that way still reports LEAKED (exit 1)."""
+    import json
+
+    body = json.dumps({"items": [{"filename": "45748.md"}], "total": 1}).encode()
+    code, out = _run_main_with_kb(verify, denylist, monkeypatch, body)
+    assert code == 1
+    assert "VERDICT: LEAKED" in out
+    assert "45748.md" in out
