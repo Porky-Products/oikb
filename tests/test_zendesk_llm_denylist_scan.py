@@ -656,3 +656,73 @@ def test_parse_retry_after_values(scan):
     assert scan._parse_retry_after({"Retry-After": "0"}) is None
     assert scan._parse_retry_after({"Retry-After": "-5"}) is None
     assert scan._parse_retry_after(None) is None
+
+
+def test_load_sensitive_requesters_parses_and_dedupes(scan, monkeypatch):
+    """Comma-separated runtime list: whitespace stripped, empty tokens
+    dropped, duplicates removed case-insensitively (first spelling wins)."""
+    monkeypatch.setenv(
+        "LLM_SCAN_SENSITIVE_REQUESTERS",
+        " First.User@Porky.com , , second.user@porky.com ,first.user@porky.com",
+    )
+    assert scan._load_sensitive_requesters() == [
+        "First.User@Porky.com",
+        "second.user@porky.com",
+    ]
+
+
+def test_load_sensitive_requesters_unset_or_blank(scan, monkeypatch):
+    monkeypatch.delenv("LLM_SCAN_SENSITIVE_REQUESTERS", raising=False)
+    assert scan._load_sensitive_requesters() == []
+    monkeypatch.setenv("LLM_SCAN_SENSITIVE_REQUESTERS", " , , ")
+    assert scan._load_sensitive_requesters() == []
+
+
+def test_sensitive_requesters_reach_llm_payload(scan, tmp_path, monkeypatch):
+    """R2-F-fc6bc25e: real sensitive-tied requester addresses are supplied
+    at runtime via LLM_SCAN_SENSITIVE_REQUESTERS (never committed in the
+    prompt file) and must reach the LLM payload as a supporting signal."""
+    monkeypatch.setenv("LLM_SCAN_SENSITIVE_REQUESTERS", "credit.lead@porky.com")
+    zendesk = FakeZendeskClient(tickets={1: _ticket(1)}, comments={1: ([], False)})
+    llm = FakeLLMClient(
+        responses=[json.dumps({"ticket_id": 1, "verdict": "deny", "reason": "credit staff"})]
+    )
+    _run_scan(tmp_path, monkeypatch, scan, stop_id="1", llm=llm, zendesk=zendesk)
+    assert len(llm.calls) == 1
+    assert "credit.lead@porky.com" in llm.calls[0]
+    assert "supporting signal only" in llm.calls[0]
+
+
+def test_sensitive_requesters_unset_keeps_payload_clean(scan, tmp_path, monkeypatch):
+    monkeypatch.delenv("LLM_SCAN_SENSITIVE_REQUESTERS", raising=False)
+    zendesk = FakeZendeskClient(tickets={1: _ticket(1)}, comments={1: ([], False)})
+    llm = FakeLLMClient(
+        responses=[json.dumps({"ticket_id": 1, "verdict": "allow", "reason": "ok"})]
+    )
+    _run_scan(tmp_path, monkeypatch, scan, stop_id="1", llm=llm, zendesk=zendesk)
+    assert len(llm.calls) == 1
+    assert "sensitive-information-tied" not in llm.calls[0]
+
+
+def test_sensitive_requesters_change_aborts_resume(scan, tmp_path, monkeypatch):
+    """The state's prompt_sha256 covers the effective instruction text
+    (prompt file + runtime list): changing the list between runs of the
+    same pass must abort, not silently mix classification policies."""
+    import contextlib
+    import io
+
+    zendesk = FakeZendeskClient(tickets={1: _ticket(1)}, comments={1: ([], False)})
+    llm = FakeLLMClient(
+        responses=[json.dumps({"ticket_id": 1, "verdict": "allow", "reason": "ok"})]
+    )
+    monkeypatch.setenv("LLM_SCAN_SENSITIVE_REQUESTERS", "a@porky.com")
+    _run_scan(tmp_path, monkeypatch, scan, stop_id="1", llm=llm, zendesk=zendesk)
+
+    monkeypatch.setenv("LLM_SCAN_SENSITIVE_REQUESTERS", "b@porky.com")
+    captured = io.StringIO()
+    with contextlib.redirect_stderr(captured):
+        with pytest.raises(SystemExit) as excinfo:
+            _run_scan(tmp_path, monkeypatch, scan, stop_id="1", llm=llm, zendesk=zendesk)
+    assert excinfo.value.code == 1
+    assert "classification policy changed" in captured.getvalue()
+    assert "LLM_SCAN_SENSITIVE_REQUESTERS" in captured.getvalue()

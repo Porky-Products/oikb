@@ -87,7 +87,13 @@ Optional: `LLM_SCAN_MAX_PER_RUN` (default `1000`, `0` = unlimited),
 (default `3`), `LLM_SCAN_DESC_CHAR_CAP` (default `6000`; oversized
 descriptions are truncated and forced to `unsure`),
 `LLM_SCAN_COMMENTS_CHAR_CAP` (default `6000`; total comment-body chars per
-ticket, same forced-`unsure` rule).
+ticket, same forced-`unsure` rule), and
+`LLM_SCAN_SENSITIVE_REQUESTERS` (comma-separated requester addresses
+highly tied to sensitive information, e.g. credit-department staff; the
+scanner appends them to the classification prompt at runtime as a
+supporting signal, so real employee addresses never need to be committed
+to the repository). Changing the prompt file or this list between runs of
+the same pass aborts the run (use `--reset` to restart intentionally).
 
 Behavior:
 

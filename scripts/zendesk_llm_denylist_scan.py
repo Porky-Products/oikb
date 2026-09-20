@@ -41,9 +41,11 @@ Fail-closed policy
 No numeric confidence: verdicts are categorical (deny/unsure/allow) only.
 
 Statefile (JSON): {"next_id", "stop_id", "prompt_sha256", "stats", "saved_at"}.
-Resume continues from next_id. Changing the prompt file between runs is
-detected via prompt_sha256 and aborts (classification policy changed; restart
-with --reset or keep prompts stable across a full pass).
+Resume continues from next_id. Changing the prompt file or the
+LLM_SCAN_SENSITIVE_REQUESTERS list between runs is detected via
+prompt_sha256 (which covers the effective instruction text) and aborts
+(classification policy changed; restart with --reset or keep the policy
+stable across a full pass).
 
 Env vars
 --------
@@ -70,6 +72,12 @@ Scanner:
                                    per ticket; larger -> forced unsure
   LLM_SCAN_COMMENTS_CHAR_CAP       optional; default 6000 chars of comment
                                    bodies per ticket; larger -> forced unsure
+  LLM_SCAN_SENSITIVE_REQUESTERS        optional; comma-separated requester
+                                   addresses highly tied to sensitive
+                                   information (e.g. credit-department staff);
+                                   appended to the classification prompt at
+                                   runtime so real addresses never need to be
+                                   committed to the repository
 
 Stdlib only; no backend imports, runs anywhere Python 3.9+ runs.
 """
@@ -167,8 +175,25 @@ def _env_float(name: str, default: float, minimum: float) -> float:
     return parsed
 
 
-def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _load_sensitive_requesters() -> list[str]:
+    """Comma-separated requester addresses highly tied to sensitive
+    information (e.g. credit-department staff), supplied at runtime so real
+    addresses stay out of the committed prompt file. Whitespace is stripped,
+    empty tokens dropped, duplicates removed (case-insensitive, first
+    spelling wins)."""
+    raw = os.environ.get("LLM_SCAN_SENSITIVE_REQUESTERS", "")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if token and token.lower() not in seen:
+            seen.add(token.lower())
+            ordered.append(token)
+    return ordered
 
 
 def _parse_retry_after(headers: Any) -> float | None:
@@ -570,7 +595,17 @@ def main() -> None:
     prompt_text = prompt_path.read_text(encoding="utf-8").strip()
     if not prompt_text:
         _die(f"prompt file is empty: {prompt_path}")
-    prompt_sha = _sha256_file(prompt_path)
+    sensitive_requesters = _load_sensitive_requesters()
+    if sensitive_requesters:
+        prompt_text += (
+            "\n\nKnown sensitive-information-tied requester addresses "
+            "(supporting signal only — these requesters also file ordinary "
+            "support tickets): " + ", ".join(sensitive_requesters)
+        )
+    # Hash the EFFECTIVE instruction text (prompt file + runtime injection):
+    # the resume guard must catch a changed sensitive-requester list between
+    # runs, not just a changed prompt file.
+    prompt_sha = _sha256_text(prompt_text)
 
     # ---- State / resume -------------------------------------------------
     # --reset intentionally accepts a changed prompt file or stop ID: it is
@@ -581,9 +616,10 @@ def main() -> None:
     if state is not None and not reset_requested:
         if state.get("prompt_sha256") not in (None, prompt_sha):
             _die(
-                "prompt file changed since the state file was written "
-                "(classification policy must stay constant within one pass); "
-                "use --reset to restart from ID 1, or keep the prompt file unchanged"
+                "classification policy changed since the state file was "
+                "written (prompt file or LLM_SCAN_SENSITIVE_REQUESTERS "
+                "list); use --reset to restart from ID 1, or keep the "
+                "policy unchanged across a full pass"
             )
         if int(state.get("stop_id") or 0) != stop_id:
             _die(
