@@ -1289,6 +1289,66 @@ def test_denylisted_carried_forward_ticket_is_purged_from_kb_on_next_sync(
     connector.close()
 
 
+def test_aggressive_checkpoint_midrun_state_excludes_denylisted_prior_tickets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The mid-run snapshot written at aggressive-checkpoint page boundaries
+    must apply the denylist filter to carried-forward tickets: a denylisted
+    prior ticket must not survive into manifest_state.json via the
+    crash-recovery path."""
+    state_dir = _make_state_dir(tmp_path, "denylist-midrun-aggressive")
+    (state_dir / "manifest_state.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "2024-01-01T00:00:00Z",
+                "attachments_enabled": True,
+                "ticket_files": {
+                    "999": {
+                        "updated_at": "2024-01-01T00:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "999.md", "checksum": "c999", "size": 10},
+                        ],
+                    },
+                    "1000": {
+                        "updated_at": "2024-01-01T00:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "1000.md", "checksum": "c1000", "size": 10},
+                        ],
+                    },
+                },
+            }
+        )
+    )
+    (state_dir / "resume_checkpoint.txt").write_text("2024-01-02T02:00:00Z")
+    denylist = _write_denylist(tmp_path, "deny.txt", [1000])
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    # One page served with next_page set: the run aborts on the second
+    # fetch (FakeHTTPClient raises), so the on-disk state is exactly the
+    # mid-run snapshot written at the page boundary.
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?start_time=1704164645",
+            },
+        ],
+        comments={1001: []},
+    )
+
+    with pytest.raises(AssertionError, match="No more ticket pages configured"):
+        connector.build_manifest()
+
+    saved_state = json.loads((state_dir / "manifest_state.json").read_text())
+    assert "1000" not in saved_state["ticket_files"]
+    assert "999" in saved_state["ticket_files"]
+    assert "1001" in saved_state["ticket_files"]
+    connector.close()
+
+
 def test_singular_tag_env_vars_are_supported_for_compatibility(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "singular-tag-filter")
     monkeypatch.delenv("ZENDESKTICKET_INCLUDETAGS", raising=False)
