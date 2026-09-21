@@ -47,12 +47,12 @@ warn and sync a sensitive ticket.
 
 ## Running the scanner
 
-The scanner classifies `1..LLM_SCAN_STOP_TICKET_ID` — set the stop ID to the
-first Zendesk ticket ID covered by the auto-tagging rules; tickets at or
-above it are handled by the normal tag filters. IDs are walked in creation
-order (verified: `tickets/show_many.json` serves archived tickets, so no
-ticket in the range is unreachable) rather than by date: a date cutoff on
-the incremental stream would mis-bound old tickets that received late
+The scanner classifies `1..LLM_SCAN_STOP_TICKET_ID` inclusive — set the stop
+ID to the LAST Zendesk ticket ID NOT covered by the auto-tagging rules;
+tickets above it are handled by the normal tag filters. IDs are walked in
+creation order (verified: `tickets/show_many.json` serves archived tickets,
+so no ticket in the range is unreachable) rather than by date: a date cutoff
+on the incremental stream would mis-bound old tickets that received late
 comments. IDs that `show_many` nonetheless omits are cross-checked with a
 single `GET /tickets/{id}.json` before being treated as missing — the
 archive-blindness signal `zendesk_archive_smoke.py` exit-2 tests for.
@@ -70,7 +70,7 @@ records"). Budget one extra API call per ticket.
 export ZENDESKTICKET_SUBDOMAIN=porky
 export ZENDESKTICKET_USER=you@porky.com   # email; /token appended
 export ZENDESKTICKET_TOKEN=...
-export LLM_SCAN_STOP_TICKET_ID=70000      # boundary ID: first auto-tagged ticket
+export LLM_SCAN_STOP_TICKET_ID=69999      # last ticket NOT covered by auto-tagging
 export LLM_SCAN_PROMPT_FILE=scripts/prompts/zendesk_legacy_deny.prompt.md
 export LLM_SCAN_DENYLIST_FILE=/path/to/legacy_deny.txt
 export LLM_SCAN_REVIEW_FILE=/path/to/review.txt
