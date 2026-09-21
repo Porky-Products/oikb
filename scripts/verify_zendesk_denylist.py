@@ -118,7 +118,8 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
     Exits 2 on failure or an indeterminate (empty/zero-total/partial)
     listing: only a complete, non-empty listing can support a CLEAN verdict.
     """
-    items: list[dict[str, Any]] = []
+    items_by_id: dict[Any, dict[str, Any]] = {}
+    raw_entry_count = 0
     seen_total: int | None = None
     for page in range(1, _MAX_PAGES + 1):
         qs = urllib.parse.urlencode({"page": page})
@@ -170,23 +171,55 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
             _die(f"KB response 'items' was not a list: {type(page_items).__name__}")
         if not isinstance(total, int) or total < 0:
             _die(f"KB response 'total' missing/invalid: {total!r}")
-        items.extend(entry for entry in page_items if isinstance(entry, dict))
+        if seen_total is not None and total != seen_total:
+            # A total that changes mid-pagination means the listing is a
+            # moving target: the pages we hold may no longer be the complete
+            # set, so a CLEAN verdict would rest on unverifiable evidence.
+            _die(f"KB response 'total' changed between pages: {seen_total!r} -> {total!r}")
+        # Null-tolerated non-dict entries are skipped (this server has served
+        # explicit nulls), but every dict entry must carry a usable id:
+        # deduplication keys on it, and without it completeness cannot be
+        # verified.
+        page_new = 0
+        for entry in page_items:
+            if not isinstance(entry, dict):
+                continue
+            raw_entry_count += 1
+            entry_id = entry.get("id")
+            if entry_id is None:
+                _die(f"KB file entry without id: {str(entry)[:200]}")
+            try:
+                if entry_id not in items_by_id:
+                    page_new += 1
+                items_by_id[entry_id] = entry
+            except TypeError as exc:
+                _die(f"KB file entry with unusable id {entry_id!r}: {exc}")
         seen_total = total
-        if len(items) >= total:
+        if len(items_by_id) >= total:
             break
-    if seen_total is None or seen_total == 0 or not items:
+        if page_new == 0:
+            # A page that adds no new unique ids while the listing is still
+            # incomplete means pagination is not advancing (duplicate or
+            # shifting pages): looping further cannot produce a complete
+            # listing, so refuse to report CLEAN on it.
+            _die(
+                f"KB pagination stalled at {len(items_by_id)} of {total} unique files "
+                f"after page {page}: no new items"
+            )
+    if seen_total is None or seen_total == 0 or not items_by_id:
         _die(
             "INDETERMINATE: KB file listing is empty (total="
             f"{seen_total!r}). An empty listing is not evidence that "
             "denylisted tickets were purged — check the kb id, credentials, "
             "and that this KB actually synced the zendesktickets source."
         )
-    if len(items) < (seen_total or 0):
+    if len(items_by_id) < (seen_total or 0):
         _die(
-            f"listing incomplete: fetched {len(items)} of {seen_total} files; "
+            f"listing incomplete: fetched {len(items_by_id)} of {seen_total} unique files "
+            f"(from {raw_entry_count} page entries); "
             "refusing to report CLEAN on a partial listing"
         )
-    return items
+    return list(items_by_id.values())
 
 
 def _items_from_response(payload: dict[str, Any]) -> list[dict[str, Any]]:

@@ -3,7 +3,9 @@
 Covers the exit-code contract: 0=CLEAN, 1=LEAKED, 2=ERROR. In particular,
 operator configuration errors (bad VERIFY_TIMEOUT_SECONDS: non-numeric,
 nan, inf, non-positive) must exit 2 — never 1, which CI gates would read
-as a confirmed leak (R1-F-54e37363).
+as a confirmed leak (R1-F-54e37363). Pagination completeness is judged on
+unique entry ids: duplicate/overlapping/shifting pages can never fake a
+CLEAN verdict (R4 findings).
 """
 
 from __future__ import annotations
@@ -132,19 +134,30 @@ def test_schemeless_openwebui_url_exits_2(verify, denylist, bad_url):
 
 
 def test_timeout_valid_value_accepted(verify, denylist):
+    """A valid VERIFY_TIMEOUT_SECONDS must be parsed and actually reach the
+    socket call as urlopen's timeout; transport then fails deterministically
+    (mocked — no live network dependency) and routes to exit 2."""
+    import urllib.error
+
+    captured: dict = {}
+
+    def _boom(request, timeout=None):
+        captured["timeout"] = timeout
+        raise urllib.error.URLError("deterministic transport failure")
+
     env = {
         "OPEN_WEBUI_URL": "http://openwebui",
         "OPEN_WEBUI_API_KEY": "k",
         "VERIFY_TIMEOUT_SECONDS": "30",
     }
-    # A valid timeout must get past config; it will then fail on transport
-    # (no live server), which the script routes to exit 2 as well.
     with mock.patch.dict(os.environ, env):
         with mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]):
-            with pytest.raises(SystemExit) as excinfo:
-                verify.main()
+            with mock.patch.object(verify.urllib.request, "urlopen", _boom):
+                with pytest.raises(SystemExit) as excinfo:
+                    verify.main()
     assert excinfo.value.code == 2
-    # main() reached transport with a parsed timeout: config was accepted.
+    # main() reached transport with the parsed timeout: config was accepted.
+    assert captured["timeout"] == 30.0
 
 
 def test_bom_prefixed_denylist_parses(verify, tmp_path):
@@ -200,8 +213,8 @@ def test_clean_listing_exits_0(verify, denylist, monkeypatch):
     body = json.dumps(
         {
             "items": [
-                {"meta": {"name": "1001-order.md"}},
-                {"meta": {"name": "1002-notes.md"}},
+                {"id": "f1", "meta": {"name": "1001-order.md"}},
+                {"id": "f2", "meta": {"name": "1002-notes.md"}},
             ],
             "total": 2,
         }
@@ -219,9 +232,9 @@ def test_leaked_listing_exits_1_with_filenames(verify, denylist, monkeypatch):
     body = json.dumps(
         {
             "items": [
-                {"meta": {"name": "1001-order.md"}},
-                {"meta": {"name": "45748.md"}},
-                {"meta": {"name": "45748-attachment.png"}},
+                {"id": "f1", "meta": {"name": "1001-order.md"}},
+                {"id": "f2", "meta": {"name": "45748.md"}},
+                {"id": "f3", "meta": {"name": "45748-attachment.png"}},
             ],
             "total": 3,
         }
@@ -238,8 +251,113 @@ def test_leaked_item_filename_fallback_field(verify, denylist, monkeypatch):
     ID surfaced only that way still reports LEAKED (exit 1)."""
     import json
 
-    body = json.dumps({"items": [{"filename": "45748.md"}], "total": 1}).encode()
+    body = json.dumps({"items": [{"id": "f1", "filename": "45748.md"}], "total": 1}).encode()
     code, out = _run_main_with_kb(verify, denylist, monkeypatch, body)
     assert code == 1
     assert "VERDICT: LEAKED" in out
     assert "45748.md" in out
+
+
+def _run_main_with_kb_pages(verify, denylist, monkeypatch, pages: list[bytes]):
+    """Drive main() against a page-aware stubbed KB listing: the page=N
+    query parameter in the request URL selects the response body. Returns
+    (exit_code, combined stdout+stderr)."""
+    import contextlib
+    import io
+    import urllib.parse
+
+    def _fake_urlopen(request, timeout=None):
+        query = urllib.parse.urlparse(request.full_url).query
+        page = int(urllib.parse.parse_qs(query).get("page", ["1"])[0])
+        return _FakeResponse(pages[page - 1])
+
+    env = {
+        "OPEN_WEBUI_URL": "http://openwebui",
+        "OPEN_WEBUI_API_KEY": "k",
+        "VERIFY_TIMEOUT_SECONDS": "30",
+    }
+    captured = io.StringIO()
+    try:
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env):
+            with mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]):
+                with mock.patch.object(verify.urllib.request, "urlopen", _fake_urlopen):
+                    with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(err):
+                        try:
+                            verify.main()
+                            code = 0
+                        except SystemExit as exc:
+                            code = exc.code
+        return code, captured.getvalue() + err.getvalue()
+    finally:
+        captured.close()
+
+
+def _page(items, total):
+    import json
+
+    return json.dumps({"items": items, "total": total}).encode()
+
+
+def test_duplicate_pages_cannot_fake_completion(verify, denylist, monkeypatch):
+    """A server re-serving the same page while the listing is incomplete
+    used to satisfy len(items) >= total with duplicated entries and report
+    a false CLEAN; pagination must stall-detect and exit 2 instead."""
+    pages = [
+        _page([{"id": "f1", "meta": {"name": "1001-order.md"}},
+               {"id": "f2", "meta": {"name": "1002-notes.md"}}], 3),
+        _page([{"id": "f1", "meta": {"name": "1001-order.md"}},
+               {"id": "f2", "meta": {"name": "1002-notes.md"}}], 3),
+    ]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 2
+    assert "no new items" in out
+
+
+def test_overlapping_pages_complete_by_unique_count(verify, denylist, monkeypatch):
+    """Overlapping pages that nonetheless cover every unique file verify
+    CLEAN: completion is judged on unique ids, not raw entry count."""
+    pages = [
+        _page([{"id": "f1", "meta": {"name": "1001-order.md"}},
+               {"id": "f2", "meta": {"name": "1002-notes.md"}}], 3),
+        _page([{"id": "f2", "meta": {"name": "1002-notes.md"}},
+               {"id": "f3", "meta": {"name": "1003-notes.md"}}], 3),
+    ]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 0
+    assert "VERDICT: CLEAN" in out
+
+
+def test_total_changing_between_pages_exits_2(verify, denylist, monkeypatch):
+    """A total that changes mid-pagination means the listing is a moving
+    target; a CLEAN verdict on it would rest on unverifiable evidence."""
+    pages = [
+        _page([{"id": "f1", "meta": {"name": "1001-order.md"}},
+               {"id": "f2", "meta": {"name": "1002-notes.md"}}], 3),
+        _page([{"id": "f3", "meta": {"name": "1003-notes.md"}}], 4),
+    ]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 2
+    assert "total' changed between pages" in out
+
+
+def test_entry_without_id_exits_2(verify, denylist, monkeypatch):
+    """Every dict entry must carry a usable id: deduplication keys on it,
+    and without it completeness cannot be verified (fail closed, exit 2)."""
+    pages = [_page([{"meta": {"name": "1001-order.md"}}], 1)]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 2
+    assert "without id" in out
+
+
+def test_incomplete_listing_exits_2(verify, denylist, monkeypatch):
+    """A listing that never reaches its declared total must refuse to
+    report CLEAN, even when pagination keeps advancing without error."""
+    pages = [
+        _page([{"id": "f1", "meta": {"name": "1001-order.md"}}], 3),
+        _page([{"id": "f2", "meta": {"name": "1002-notes.md"}}], 3),
+        _page([], 3),  # server stops serving new items before the total
+    ]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 2
+    assert "no new items" in out
