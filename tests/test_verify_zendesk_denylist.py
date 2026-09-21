@@ -361,3 +361,34 @@ def test_incomplete_listing_exits_2(verify, denylist, monkeypatch):
     code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
     assert code == 2
     assert "no new items" in out
+
+
+def test_unmatchable_item_refuses_clean_exits_2(verify, denylist, monkeypatch):
+    """R1-F-742f665e: an item with id but neither meta.name nor filename
+    cannot be matched against the denylist; a complete listing of such
+    items must refuse CLEAN (exit 2) instead of reporting a vacuous pass."""
+    pages = [_page([{"id": "f1", "hash": "abc"}], 1)]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 2
+    assert "VERDICT: CLEAN" not in out
+    assert "no resolvable filename" in out
+    assert "f1" in out
+
+
+def test_leak_wins_over_unmatchable_items(verify, denylist, monkeypatch):
+    """R1-F-742f665e: when a real leak is found among matchable items, the
+    LEAKED verdict (exit 1) takes precedence — unmatchable items must not
+    mask a confirmed leak behind an INDETERMINATE error."""
+    pages = [
+        _page(
+            [
+                {"id": "f1", "meta": {"name": "45748.md"}},
+                {"id": "f2", "hash": "abc"},
+            ],
+            2,
+        )
+    ]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 1
+    assert "VERDICT: LEAKED" in out
+    assert "45748.md" in out

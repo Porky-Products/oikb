@@ -33,12 +33,14 @@ numeric prefix (45748- cannot false-match 457480-).
 
 Verdicts
 --------
-  CLEAN   exit 0 — full KB listing retrieved and no denylisted match
+  CLEAN   exit 0 — full KB listing retrieved, every item matched by filename,
+          and no denylisted match
   LEAKED  exit 1 — denylisted ticket files still exist in the KB
-  ERROR   exit 2 — unreadable denylist, unreachable/invalid KB response, or
-          an INDETERMINATE listing: an empty/zero-total payload is not
-          evidence of purge (wrong kb id, credentials, or a KB that never
-          synced zendesktickets)
+  ERROR   exit 2 — unreadable denylist, unreachable/invalid KB response, an
+          INDETERMINATE listing: an empty/zero-total payload is not evidence
+          of purge (wrong kb id, credentials, or a KB that never synced
+          zendesktickets), or items with no resolvable filename, which cannot
+          be matched so CLEAN cannot be confirmed
 
 Run after a sync that follows a denylist change; also useful as a periodic
 safety net. It does NOT delete leaked files: if LEAKED is reported, re-run
@@ -236,17 +238,24 @@ def _item_filename(item: dict[str, Any]) -> str:
     return str(name or item.get("filename") or "")
 
 
-def _leaked_files(denied: set[str], items: list[dict[str, Any]]) -> dict[str, list[str]]:
-    """Map denylisted ticket ID -> KB item filenames still present."""
+def _leaked_files(
+    denied: set[str], items: list[dict[str, Any]]
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Map denylisted ticket ID -> KB item filenames still present, plus the
+    ids of items whose filename cannot be resolved (neither meta.name nor
+    filename). Unmatchable items make a CLEAN verdict unverifiable."""
     leaked: dict[str, list[str]] = {}
+    unmatchable: list[str] = []
     for item in items:
         filename = _item_filename(item)
         if not filename:
+            item_id = item.get("id")
+            unmatchable.append(str(item_id) if item_id is not None else "<no id>")
             continue
         for ticket_id in denied:
             if filename == f"{ticket_id}.md" or filename.startswith(f"{ticket_id}-"):
                 leaked.setdefault(ticket_id, []).append(filename)
-    return leaked
+    return leaked, unmatchable
 
 
 def _auth_header(api_key: str) -> str:
@@ -291,24 +300,32 @@ def main() -> None:
         return
 
     items = _list_kb_files(base_url, api_key, kb_id, timeout)
-    leaked = _leaked_files(denied, items)
+    leaked, unmatchable = _leaked_files(denied, items)
 
     print(f"Denylisted ticket IDs: {len(denied)} (from {', '.join(denylist_paths)})")
     print(f"KB files listed:       {len(items)}")
-    if not leaked:
-        print("\nVERDICT: CLEAN — no denylisted ticket has files in the KB. (exit 0)")
-        return
-    print(f"\nVERDICT: LEAKED — {len(leaked)} denylisted ticket(s) still have KB files: (exit 1)")
-    for ticket_id in sorted(leaked, key=lambda v: int(v)):
-        print(f"  ticket {ticket_id}:")
-        for filename in leaked[ticket_id]:
-            print(f"    - {filename}")
-    print(
-        "\nDo NOT hand-delete these: run the oikb sync (the connector's "
-        "carried-forward denylist filter purges them and keeps "
-        "manifest_state.json consistent)."
-    )
-    sys.exit(1)
+    if leaked:
+        print(f"\nVERDICT: LEAKED — {len(leaked)} denylisted ticket(s) still have KB files: (exit 1)")
+        for ticket_id in sorted(leaked, key=lambda v: int(v)):
+            print(f"  ticket {ticket_id}:")
+            for filename in leaked[ticket_id]:
+                print(f"    - {filename}")
+        print(
+            "\nDo NOT hand-delete these: run the oikb sync (the connector's "
+            "carried-forward denylist filter purges them and keeps "
+            "manifest_state.json consistent)."
+        )
+        sys.exit(1)
+    if unmatchable:
+        # Fail closed: items we cannot match are not evidence of a purge, so
+        # CLEAN cannot be confirmed (same philosophy as the INDETERMINATE
+        # listing guards in _list_kb_files).
+        _die(
+            f"{len(unmatchable)} KB item(s) have no resolvable filename "
+            f"(ids: {', '.join(unmatchable)}); they cannot be matched against "
+            "the denylist, so CLEAN cannot be confirmed"
+        )
+    print("\nVERDICT: CLEAN — no denylisted ticket has files in the KB. (exit 0)")
 
 
 if __name__ == "__main__":
