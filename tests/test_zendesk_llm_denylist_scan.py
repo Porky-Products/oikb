@@ -382,6 +382,77 @@ def test_missing_ticket_counted_and_cursor_advances(scan, tmp_path, monkeypatch)
     assert state["next_id"] == 3
 
 
+def _seed_resume_state(scan, tmp_path, *, next_id, stop_id):
+    """Write a state file whose prompt_sha256 matches the prompt.md that
+    _run_scan seeds, so the resume path reaches the next_id guard."""
+    state = {
+        "next_id": next_id,
+        "stop_id": stop_id,
+        "prompt_sha256": scan._sha256_text("deny credit applications"),
+        "stats": {},
+    }
+    (tmp_path / "state.json").write_text(json.dumps(state))
+
+
+def test_resume_next_id_out_of_range_dies(scan, tmp_path, monkeypatch, capsys):
+    # A damaged cursor (next_id=999 with stop_id=10) used to fall straight
+    # into the completion path and report a full pass without scanning IDs
+    # 1..10; values below 1 silently restarted from 1. Both must die with
+    # a --reset pointer instead.
+    for bad in (999, 0, -3):
+        _seed_resume_state(scan, tmp_path, next_id=bad, stop_id=10)
+        with pytest.raises(SystemExit) as excinfo:
+            _run_scan(
+                tmp_path,
+                monkeypatch,
+                scan,
+                stop_id="10",
+                llm=FakeLLMClient(responses=[]),
+                zendesk=FakeZendeskClient(tickets={}, comments={}),
+            )
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "outside the plausible range" in err
+        assert "--reset" in err
+
+
+def test_resume_next_id_non_integer_dies(scan, tmp_path, monkeypatch, capsys):
+    # A non-integer cursor (string, float, or JSON boolean) is damaged
+    # state: int() coercion used to crash with a traceback on strings and
+    # silently truncate floats. Die cleanly instead.
+    for bad in ("abc", 5.7, True):
+        _seed_resume_state(scan, tmp_path, next_id=bad, stop_id=10)
+        with pytest.raises(SystemExit) as excinfo:
+            _run_scan(
+                tmp_path,
+                monkeypatch,
+                scan,
+                stop_id="10",
+                llm=FakeLLMClient(responses=[]),
+                zendesk=FakeZendeskClient(tickets={}, comments={}),
+            )
+        assert excinfo.value.code == 1
+        assert "not an integer" in capsys.readouterr().err
+
+
+def test_resume_completed_pass_still_completes(scan, tmp_path, monkeypatch, capsys):
+    # next_id == stop_id + 1 is the legitimate completed-pass cursor written
+    # by _write_completion; the range guard must keep accepting it.
+    _seed_resume_state(scan, tmp_path, next_id=11, stop_id=10)
+    _run_scan(
+        tmp_path,
+        monkeypatch,
+        scan,
+        stop_id="10",
+        llm=FakeLLMClient(responses=[]),
+        zendesk=FakeZendeskClient(tickets={}, comments={}),
+    )
+    out = capsys.readouterr()
+    assert "pass complete" in out.out
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["next_id"] == 11
+
+
 def test_huge_digit_stop_id_rejected_cleanly(scan, tmp_path, monkeypatch):
     # isdigit() passes a 4301-digit string, but CPython's int/str
     # conversion limit raises ValueError; must _die (exit 1), not traceback.

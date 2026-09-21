@@ -42,7 +42,9 @@ Fail-closed policy
 No numeric confidence: verdicts are categorical (deny/unsure/allow) only.
 
 Statefile (JSON): {"next_id", "stop_id", "prompt_sha256", "stats", "saved_at"}.
-Resume continues from next_id. Changing the prompt file or the
+Resume continues from next_id, which must be an integer in 1..stop_id+1
+(stop_id+1 marks a completed pass); anything else is treated as damaged
+state and aborts (use --reset). Changing the prompt file or the
 LLM_SCAN_SENSITIVE_REQUESTERS list between runs is detected via
 prompt_sha256 (which covers the effective instruction text) and aborts
 (classification policy changed; restart with --reset or keep the policy
@@ -657,7 +659,25 @@ def main() -> None:
                 f"(state has {state.get('stop_id')!r}, env has {stop_id}); use --reset to accept the new bound"
             )
     if state is not None and not reset_requested:
-        next_id = int(state.get("next_id") or 1)
+        # next_id must be a plausible integer cursor: the scanner only ever
+        # writes 1..stop_id+1 (stop_id+1 marks a completed pass). Anything
+        # else — a non-integer, an out-of-range value like next_id=999 with
+        # stop_id=10 — is damaged state that would either crash with a
+        # traceback or report a false "pass complete" without scanning the
+        # omitted IDs, so fail closed and point at --reset.
+        raw_next_id = state.get("next_id")
+        if not isinstance(raw_next_id, int) or isinstance(raw_next_id, bool):
+            _die(
+                f"state file next_id is not an integer: {raw_next_id!r}; "
+                "use --reset to restart from ID 1"
+            )
+        if not 1 <= raw_next_id <= stop_id + 1:
+            _die(
+                f"state file next_id {raw_next_id} is outside the plausible range "
+                f"1..{stop_id + 1} (stop_id={stop_id}); the state is damaged — "
+                "use --reset to restart from ID 1"
+            )
+        next_id = raw_next_id
         stats = dict(state.get("stats") or {})
         print(f"Resuming from ID {next_id} (saved stats: {stats})")
     else:
