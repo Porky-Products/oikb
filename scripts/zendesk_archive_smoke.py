@@ -42,8 +42,8 @@ Exit codes
 ----------
   0  show_many returned every requested ID (single GET status irrelevant)
   2  show_many omitted at least one ID that single GET found -> archive-
-     blind; the scanner must use the incremental-walk + created_at cutoff
-     fallback instead of ID-order show_many batches
+     blind; the scanner must cross-check every show_many omission with a
+     single GET /tickets/{id}.json before treating the ID as missing
   3  requested IDs missing from BOTH paths (deleted / never existed?)
   1  transport failure or bad credentials; nothing concluded
 
@@ -224,7 +224,9 @@ def main() -> None:
         print()
 
     # ---- 3. requester user resolution -----------------------------------
-    found = show_many or by_single
+    # show_many is authoritative for shared IDs; single-GET-only tickets
+    # (show_many omissions) must still contribute their requesters.
+    found = {**by_single, **show_many}
     requester_ids = sorted(
         {
             str(ticket.get("requester_id"))
@@ -278,8 +280,9 @@ def main() -> None:
         print(
             f"VERDICT: show_many omitted {len(missing)} ID(s) that single GET "
             f"found ({', '.join(missing)}) — show_many appears archive-blind; "
-            "scanner must fall back to the incremental walk + created_at "
-            "cutoff design. (exit 2)"
+            "the scanner must cross-check every show_many omission with a "
+            "single GET /tickets/{id}.json before treating the ID as missing. "
+            "(exit 2)"
         )
         sys.exit(2)
     missing = [i for i in ids if i not in show_many and i not in by_single]
