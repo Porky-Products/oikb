@@ -429,6 +429,7 @@ Optional settings:
 | `ZENDESKTICKET_STATUS` | Comma-separated statuses to include (for example `open,solved,closed`) |
 | `ZENDESKTICKET_INCLUDETAGS` | Comma-separated tags; include tickets matching any listed tag |
 | `ZENDESKTICKET_EXCLUDETAGS` | Comma-separated tags to skip |
+| `ZENDESKTICKET_DENYLIST_FILES` | Comma-separated plaintext denylist files of numeric ticket IDs (`#` comments/blank lines ignored); denylisted tickets are excluded from sync and purged from the KB by the next sync run — see `docs/denylist.md`. Missing or malformed files fail the run (fail-closed) |
 | `ZENDESKTICKET_VERBOSE_HTTP` | Print Zendesk request URLs/params for debugging when true |
 | `ZENDESKTICKET_MAX_RETRIES` | Max retries for `429 Too Many Requests`, defaults to `5` |
 | `ZENDESKTICKET_BACKOFF_BASE_SECONDS` | Base exponential backoff delay in seconds, defaults to `1.0` |
@@ -440,6 +441,7 @@ Behavior notes:
 - If no checkpoint exists on disk, sync starts from the minimum datetime.
 - Checkpoints advance only after a successful sync run.
 - Tickets filtered out by tags or removed from Zendesk are removed from the KB on later syncs.
+- Denylisted tickets (`ZENDESKTICKET_DENYLIST_FILES`) are removed from the KB on the next sync run even if they are never re-served by the incremental crawl — the denylist is also applied to carried-forward state. A missing or malformed denylist file aborts the run rather than risking a sensitive ticket being synced.
 - Turning `ZENDESKTICKET_DOWNLOAD_ATTACHMENTS` off removes previously synced attachment files on the next run.
 - Attachments are matched against `ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS` by filename extension (not content type). Attachments without an extension are blocked while an allowlist is active. Tightening the allowlist removes previously synced attachment files that no longer match on the next run. Setting the variable to an empty value disables filtering and downloads every attachment.
 

@@ -1100,6 +1100,40 @@ def test_include_and_exclude_tags_filter_ticket_set(monkeypatch: pytest.MonkeyPa
     connector.close()
 
 
+def _write_denylist(tmp_path: Path, name: str, ticket_ids: list[int]) -> Path:
+    denylist = tmp_path / name
+    denylist.write_text(
+        "# denylist\n" + "".join(f"{ticket_id}\n" for ticket_id in ticket_ids)
+    )
+    return denylist
+
+
+def test_denylist_filters_newly_crawled_tickets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "denylist-new")
+    denylist = _write_denylist(tmp_path, "deny.txt", [1002])
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:04:05Z"),
+                    _ticket(1002, "2024-01-02T03:05:05Z"),
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
+    assert "1002" not in connector._manifest_snapshot["ticket_files"]
+    connector.close()
+
+
 def test_parse_tags_strips_inner_quotes_and_adjacent_whitespace():
     # Quoted env values (e.g. EXCLUDETAG="a, b") must not leak quote
     # characters or whitespace adjacent to quotes into parsed tags.
@@ -1138,6 +1172,236 @@ def test_exclude_tag_env_var_with_inner_quotes_filters_tickets(monkeypatch: pyte
     manifest = connector.build_manifest()
 
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
+    connector.close()
+
+
+def test_denylist_files_are_merged_and_deduplicated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "denylist-merge")
+    first = _write_denylist(tmp_path, "deny1.txt", [1001, 1003])
+    second = _write_denylist(tmp_path, "deny2.txt", [1002, 1003])
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", f"{first},{second}")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comments={},
+    )
+
+    assert connector._denied_ticket_ids == {"1001", "1002", "1003"}
+    connector.close()
+
+
+def test_leading_zero_denylist_entry_still_denies_ticket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Non-canonical-but-numeric entries ('045748' from CSV/Excel round-trips)
+    must canonicalize on load so they actually match the ticket id."""
+    state_dir = _make_state_dir(tmp_path, "denylist-leading-zero")
+    denylist = tmp_path / "deny.txt"
+    denylist.write_text("045748\n")
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comments={},
+    )
+
+    assert connector._denied_ticket_ids == {"45748"}
+    assert connector._denied("45748") is True
+    connector.close()
+
+
+def test_non_ascii_digit_denylist_entry_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Fullwidth/Arabic-Indic digits pass str.isdigit() but can never equal
+    the ASCII str(ticket id); they must be rejected, not accepted-and-silent."""
+    state_dir = _make_state_dir(tmp_path, "denylist-non-ascii")
+    denylist = tmp_path / "deny.txt"
+    denylist.write_text("４５７４８\n")  # fullwidth digits
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+
+    with pytest.raises(ValueError, match="Malformed denylist line"):
+        ZendeskTicketsConnector(state_dir=str(state_dir))
+
+
+def test_huge_digit_denylist_entry_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A 4301-digit entry passes isdigit() but overflows CPython's int/str
+    conversion limit; the connector must raise its controlled ValueError,
+    not a raw traceback."""
+    state_dir = _make_state_dir(tmp_path, "denylist-huge")
+    denylist = tmp_path / "deny.txt"
+    denylist.write_text("9" * 4301 + "\n")
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+
+    with pytest.raises(ValueError, match="Malformed denylist line"):
+        ZendeskTicketsConnector(state_dir=str(state_dir))
+
+
+def test_missing_denylist_file_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "denylist-missing")
+    missing = tmp_path / "does-not-exist.txt"
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(missing))
+
+    with pytest.raises(ValueError, match="not found"):
+        ZendeskTicketsConnector(state_dir=str(state_dir))
+
+
+def test_malformed_denylist_line_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "denylist-malformed")
+    bad = tmp_path / "deny.txt"
+    bad.write_text("1001\nnot-a-ticket-id\n")
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(bad))
+
+    with pytest.raises(ValueError, match="Malformed denylist line"):
+        ZendeskTicketsConnector(state_dir=str(state_dir))
+
+
+def test_bom_prefixed_denylist_file_parses(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A UTF-8 BOM (a common editor artifact) must not fail the run: the
+    entries are valid, so they load. Fail-closed applies to malformed data
+    lines, not encoding artifacts."""
+    state_dir = _make_state_dir(tmp_path, "denylist-bom")
+    denylist = tmp_path / "deny.txt"
+    denylist.write_text("\ufeff45748\n1002\n", encoding="utf-8")
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comments={},
+    )
+
+    assert connector._denied_ticket_ids == {"45748", "1002"}
+    connector.close()
+
+
+def test_invalid_utf8_denylist_file_fails_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A non-UTF-8 denylist must abort with a controlled ValueError naming
+    the file, not an uncaught UnicodeDecodeError traceback."""
+    state_dir = _make_state_dir(tmp_path, "denylist-invalid-utf8")
+    bad = tmp_path / "deny.txt"
+    bad.write_bytes(b"\xff\xfe45748\n")
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(bad))
+
+    with pytest.raises(ValueError, match="Cannot read Zendesk tickets denylist file"):
+        ZendeskTicketsConnector(state_dir=str(state_dir))
+
+
+def test_denylisted_carried_forward_ticket_is_purged_from_kb_on_next_sync(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    state_dir = _make_state_dir(tmp_path, "denylist-carry-forward")
+    existing_files = [
+        {"path": "tickets", "filename": "1001.md", "checksum": "old", "file_id": "file-1"},
+        {"path": "attachments/1001", "filename": "1001-bank.png", "checksum": "old2", "file_id": "file-2"},
+        {"path": "tickets", "filename": "2002.md", "checksum": "old3", "file_id": "file-3"},
+    ]
+    (state_dir / "manifest_state.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "2024-01-01T00:00:00Z",
+                "attachments_enabled": True,
+                "ticket_files": {
+                    "1001": {
+                        "updated_at": "2024-01-01T00:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "1001.md", "checksum": "old", "size": 10},
+                            {"path": "attachments/1001", "filename": "1001-bank.png", "checksum": "old2", "size": 4},
+                        ],
+                    },
+                    "2002": {
+                        "updated_at": "2024-01-01T00:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "2002.md", "checksum": "old3", "size": 10},
+                        ],
+                    },
+                },
+            }
+        )
+    )
+    denylist = _write_denylist(tmp_path, "deny.txt", [1001])
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+    # No pages served beyond the checkpoint: 1001 must still be purged from
+    # carried-forward state, without any re-crawl of it.
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comments={},
+    )
+    client = FakeClient(existing_files=existing_files)
+
+    result = run_sync(client=client, connector=connector, kb_id="kb-1", quiet=True)
+
+    assert client.cleanup_calls == [{"kb_id": "kb-1", "file_ids": ["file-1", "file-2"], "dir_ids": None}]
+    assert result.deleted == 2
+    # Denylisted ticket left stored state too; surviving ticket untouched.
+    assert "1001" not in connector._manifest_snapshot["ticket_files"]
+    assert "2002" in connector._manifest_snapshot["ticket_files"]
+    connector.close()
+
+
+def test_aggressive_checkpoint_midrun_state_excludes_denylisted_prior_tickets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The mid-run snapshot written at aggressive-checkpoint page boundaries
+    must apply the denylist filter to carried-forward tickets: a denylisted
+    prior ticket must not survive into manifest_state.json via the
+    crash-recovery path."""
+    state_dir = _make_state_dir(tmp_path, "denylist-midrun-aggressive")
+    (state_dir / "manifest_state.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "2024-01-01T00:00:00Z",
+                "attachments_enabled": True,
+                "ticket_files": {
+                    "999": {
+                        "updated_at": "2024-01-01T00:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "999.md", "checksum": "c999", "size": 10},
+                        ],
+                    },
+                    "1000": {
+                        "updated_at": "2024-01-01T00:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "1000.md", "checksum": "c1000", "size": 10},
+                        ],
+                    },
+                },
+            }
+        )
+    )
+    (state_dir / "resume_checkpoint.txt").write_text("2024-01-02T02:00:00Z")
+    denylist = _write_denylist(tmp_path, "deny.txt", [1000])
+    monkeypatch.setenv("ZENDESKTICKET_DENYLIST_FILES", str(denylist))
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    # One page served with next_page set: the run aborts on the second
+    # fetch (FakeHTTPClient raises), so the on-disk state is exactly the
+    # mid-run snapshot written at the page boundary.
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z")],
+                "end_time": 1704164645,
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?start_time=1704164645",
+            },
+        ],
+        comments={1001: []},
+    )
+
+    with pytest.raises(AssertionError, match="No more ticket pages configured"):
+        connector.build_manifest()
+
+    saved_state = json.loads((state_dir / "manifest_state.json").read_text())
+    assert "1000" not in saved_state["ticket_files"]
+    assert "999" in saved_state["ticket_files"]
+    assert "1001" in saved_state["ticket_files"]
     connector.close()
 
 

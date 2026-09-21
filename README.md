@@ -198,6 +198,7 @@ Options:
 | `ZENDESKTICKET_STATUS` | Comma-separated statuses to include (for example `open,solved,closed`) |
 | `ZENDESKTICKET_INCLUDETAGS` | Comma-separated tags; include tickets matching any listed tag |
 | `ZENDESKTICKET_EXCLUDETAGS` | Comma-separated tags to skip |
+| `ZENDESKTICKET_DENYLIST_FILES` | Comma-separated plaintext denylist files of numeric ticket IDs (`#` comments/blank lines ignored); denylisted tickets are excluded from sync and purged from the KB by the next sync run — see `docs/denylist.md`. Missing or malformed files fail the run (fail-closed) |
 | `ZENDESKTICKET_VERBOSE_HTTP` | Print Zendesk request URLs/params for debugging when true |
 | `ZENDESKTICKET_MAX_RETRIES` | Max retries for `429 Too Many Requests`, defaults to `5` |
 | `ZENDESKTICKET_BACKOFF_BASE_SECONDS` | Base exponential backoff delay in seconds, defaults to `1.0` |
