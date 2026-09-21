@@ -392,3 +392,23 @@ def test_leak_wins_over_unmatchable_items(verify, denylist, monkeypatch):
     assert code == 1
     assert "VERDICT: LEAKED" in out
     assert "45748.md" in out
+
+
+def test_non_dict_entry_refuses_clean_exits_2(verify, denylist, monkeypatch):
+    """A non-object entry inside a non-null items list has no filename to
+    check; skipping it would let the remaining objects reach `total` and
+    report a vacuous CLEAN. Malformed entries must make the listing
+    INDETERMINATE (exit 2) instead."""
+    pages = [
+        _page(
+            [
+                {"id": "f1", "meta": {"name": "1001-order.md"}},
+                None,
+            ],
+            2,
+        )
+    ]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 2
+    assert "VERDICT: CLEAN" not in out
+    assert "not a JSON object" in out

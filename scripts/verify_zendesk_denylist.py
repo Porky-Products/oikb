@@ -39,8 +39,9 @@ Verdicts
   ERROR   exit 2 — unreadable denylist, unreachable/invalid KB response, an
           INDETERMINATE listing: an empty/zero-total payload is not evidence
           of purge (wrong kb id, credentials, or a KB that never synced
-          zendesktickets), or items with no resolvable filename, which cannot
-          be matched so CLEAN cannot be confirmed
+          zendesktickets), a non-object entry in the items list, or items
+          with no resolvable filename, which cannot be matched so CLEAN
+          cannot be confirmed
 
 Run after a sync that follows a denylist change; also useful as a periodic
 safety net. It does NOT delete leaked files: if LEAKED is reported, re-run
@@ -178,14 +179,18 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
             # moving target: the pages we hold may no longer be the complete
             # set, so a CLEAN verdict would rest on unverifiable evidence.
             _die(f"KB response 'total' changed between pages: {seen_total!r} -> {total!r}")
-        # Null-tolerated non-dict entries are skipped (this server has served
-        # explicit nulls), but every dict entry must carry a usable id:
-        # deduplication keys on it, and without it completeness cannot be
-        # verified.
+        # Every entry must be a JSON object with a usable id: a non-dict
+        # entry has no filename to match against the denylist, so it must
+        # make the listing INDETERMINATE (exit 2) rather than be skipped —
+        # skipped entries could let the remaining objects reach `total` and
+        # report a vacuous CLEAN. (The documented server null quirk is the
+        # collection-level `"files": null` on GET /api/v1/knowledge/{id},
+        # normalized above via `payload.get("items") or []`; entries inside
+        # this endpoint's items list have never been observed to be null.)
         page_new = 0
         for entry in page_items:
             if not isinstance(entry, dict):
-                continue
+                _die(f"KB file entry is not a JSON object: {str(entry)[:200]}")
             raw_entry_count += 1
             entry_id = entry.get("id")
             if entry_id is None:
@@ -222,12 +227,6 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
             "refusing to report CLEAN on a partial listing"
         )
     return list(items_by_id.values())
-
-
-def _items_from_response(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Null-tolerant item extraction shared with tests."""
-    page_items = payload.get("items") or []
-    return [entry for entry in page_items if isinstance(entry, dict)]
 
 
 def _item_filename(item: dict[str, Any]) -> str:
