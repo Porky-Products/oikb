@@ -9,6 +9,11 @@ and ``GET .../sync/diff`` responds 200 with no server-side error.  oikb's
 an explicit null value, so iteration over the ``None`` crashed the sync in
 the dedup guard (the only code path between the ``GET /knowledge/{id}``
 call and the error).
+
+The ``list_kb_files`` tests below target the paginated
+``GET /knowledge/{id}/files`` endpoint (#43): that method previously called
+``GET /knowledge/{id}``, which returns ``"files": null`` on current
+open-webui builds, silently disabling the duplicate-upload guard.
 """
 
 from __future__ import annotations
@@ -39,41 +44,95 @@ class _FakeResponse:
 
 
 class _FakeHttp:
-    """Stands in for the httpx.Client inside OikbClient."""
+    """Stands in for the httpx.Client inside OikbClient.
 
-    def __init__(self, payload: dict[str, Any]):
-        self._payload = payload
-        self.requests: list[tuple[str, str]] = []
+    A single payload dict is returned for every request; a list of
+    payloads is consumed one per request — an exhausted list raises
+    IndexError, which fails any test whose client loop misbehaves.
+    """
 
-    def get(self, url: str) -> _FakeResponse:
-        self.requests.append(("GET", url))
-        return _FakeResponse(self._payload)
+    def __init__(self, payload: dict[str, Any] | list[dict[str, Any]]):
+        self._payloads = payload if isinstance(payload, list) else [payload]
+        self.requests: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def get(self, url: str, params: dict[str, Any] | None = None) -> _FakeResponse:
+        self.requests.append(("GET", url, params))
+        return _FakeResponse(self._payloads.pop(0))
 
     def post(self, url: str, json: dict[str, Any] | None = None) -> _FakeResponse:
-        self.requests.append(("POST", url))
-        return _FakeResponse(self._payload)
+        self.requests.append(("POST", url, None))
+        return _FakeResponse(self._payloads[0])
 
 
-def _client_with(payload: dict[str, Any]) -> tuple[OikbClient, _FakeHttp]:
+def _client_with(
+    payload: dict[str, Any] | list[dict[str, Any]],
+) -> tuple[OikbClient, _FakeHttp]:
     client = OikbClient.__new__(OikbClient)  # skip __init__ (no real HTTP)
     client._http = _FakeHttp(payload)  # type: ignore[assignment]
     return client, client._http  # type: ignore[return-value]
 
 
-class TestListKbFilesNullTolerance:
-    def test_files_explicit_null_returns_empty_list(self):
-        """Exact live-server shape: KB with `"files": null`."""
-        client, _ = _client_with({"id": "kb1", "name": "Zendesk Tickets", "files": None})
+def _file(fid: str, file_hash: str) -> dict[str, Any]:
+    return {"id": fid, "hash": file_hash, "meta": {"file_hash": file_hash}}
+
+
+class TestListKbFiles:
+    def test_hits_files_endpoint_not_kb_endpoint(self):
+        # Regression for #43: the duplicate-upload guard enumerates the
+        # KB via GET /knowledge/{id}/files.  GET /knowledge/{id} never
+        # returns a file list on current open-webui builds ("files": null
+        # even for a KB with 42k linked files), which silently disabled
+        # the guard.
+        client, http = _client_with({"items": [], "total": 0})
+        assert client.list_kb_files("kb1") == []
+        assert [u for _m, u, _p in http.requests] == ["/knowledge/kb1/files"]
+
+    def test_single_page_stops_at_total(self):
+        files = [_file("f1", "h1"), _file("f2", "h2")]
+        client, http = _client_with({"items": files, "total": 2})
+        assert client.list_kb_files("kb1") == files
+        assert len(http.requests) == 1
+
+    def test_paginates_until_total_reached(self):
+        page1 = {"items": [_file("f1", "h1")], "total": 2}
+        page2 = {"items": [_file("f2", "h2")], "total": 2}
+        client, http = _client_with([page1, page2])
+        result = client.list_kb_files("kb1")
+        assert [f["id"] for f in result] == ["f1", "f2"]
+        assert [p["page"] for _m, _u, p in http.requests] == [1, 2]
+
+    def test_stops_on_empty_page_without_total(self):
+        client, http = _client_with(
+            [{"items": [_file("f1", "h1")]}, {"items": [], "total": 99}]
+        )
+        assert [f["id"] for f in client.list_kb_files("kb1")] == ["f1"]
+        assert len(http.requests) == 2
+
+    def test_repeated_page_terminates(self):
+        # A page whose items were all seen means no progress — the loop
+        # must stop rather than spin (e.g. against shifting results).
+        page = {"items": [_file("f1", "h1")], "total": 9999}
+        client, http = _client_with([page, page])
+        assert [f["id"] for f in client.list_kb_files("kb1")] == ["f1"]
+        assert len(http.requests) == 2
+
+    def test_items_null_returns_empty_list(self):
+        client, _ = _client_with({"items": None, "total": 0})
         assert client.list_kb_files("kb1") == []
 
-    def test_files_missing_returns_empty_list(self):
+    def test_items_missing_returns_empty_list(self):
         client, _ = _client_with({"id": "kb1"})
         assert client.list_kb_files("kb1") == []
 
-    def test_files_present_passed_through(self):
-        files = [{"id": "f1", "hash": "abc"}]
-        client, _ = _client_with({"id": "kb1", "files": files})
-        assert client.list_kb_files("kb1") == files
+    def test_page_size_passed_as_limit(self):
+        client, http = _client_with({"items": [], "total": 0})
+        client.list_kb_files("kb1", page_size=500)
+        assert http.requests[0][2] == {"page": 1, "limit": 500}
+
+    def test_default_request_omits_limit(self):
+        client, http = _client_with({"items": [], "total": 0})
+        client.list_kb_files("kb1")
+        assert http.requests[0][2] == {"page": 1}
 
 
 class _NullDiffClient(OikbClient):

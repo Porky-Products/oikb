@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -19,10 +20,13 @@ from oikb.connectors.zendesktickets import (
     _DEFAULT_ATTACHMENT_EXTENSIONS,
     _extensions_from_state,
     _parse_attachment_extensions,
+    _parse_tags,
     ZendeskTicketsConnector,
     parse_zendesktickets_source,
 )
 from oikb.sync import run_sync
+
+_COMMENT_PATH_RE = re.compile(r"/tickets/(\d+)/comments\.json")
 
 
 class FakeResponse:
@@ -43,11 +47,14 @@ class FakeResponse:
 
 
 class FakeHTTPClient:
-    def __init__(self, ticket_pages: list[dict], comments: dict[int, list[dict]] | None = None, attachments: dict[str, bytes] | None = None, comment_status_codes: dict[int, list[int]] | None = None):
+    def __init__(self, ticket_pages: list[dict], comments: dict[int, list[dict]] | None = None, attachments: dict[str, bytes] | None = None, comment_status_codes: dict[int, list[int]] | None = None, comment_pages: dict[int, list[dict | int]] | None = None):
         self._ticket_pages = list(ticket_pages)
         self._comments = comments or {}
         self._attachments = attachments or {}
         self._comment_status_codes: dict[int, list[int]] = comment_status_codes or {}
+        # Per-ticket queue of comment page payloads served in request order;
+        # an int entry answers that request with the given status code.
+        self._comment_pages: dict[int, list[dict | int]] = comment_pages or {}
         self.calls: list[dict] = []
         self.is_closed = False
 
@@ -57,11 +64,19 @@ class FakeHTTPClient:
             if not self._ticket_pages:
                 raise AssertionError("No more ticket pages configured")
             return FakeResponse(self._ticket_pages.pop(0))
-        if path.endswith("/comments.json"):
-            ticket_id = int(path.split("/")[2])
+        comment_match = _COMMENT_PATH_RE.search(path)
+        if comment_match:
+            ticket_id = int(comment_match.group(1))
             if ticket_id in self._comment_status_codes and self._comment_status_codes[ticket_id]:
                 status = self._comment_status_codes[ticket_id].pop(0)
                 return FakeResponse({}, status_code=status)
+            if ticket_id in self._comment_pages:
+                if not self._comment_pages[ticket_id]:
+                    raise AssertionError(f"No more comment pages configured for ticket {ticket_id}")
+                item = self._comment_pages[ticket_id].pop(0)
+                if isinstance(item, int):
+                    return FakeResponse({}, status_code=item)
+                return FakeResponse(item)
             return FakeResponse({"comments": self._comments.get(ticket_id, [])})
         if path.startswith("https://attachments.example/") or path.startswith("https://acme.zendesk.com/attachments/"):
             name = path.rsplit("/", 1)[-1]
@@ -207,12 +222,12 @@ def _attachment(name: str, *, url: str | None = None) -> dict:
     }
 
 
-def _build_connector(monkeypatch: pytest.MonkeyPatch, state_dir: Path, *, pages: list[dict], comments: dict[int, list[dict]] | None = None, attachments: dict[str, bytes] | None = None) -> ZendeskTicketsConnector:
+def _build_connector(monkeypatch: pytest.MonkeyPatch, state_dir: Path, *, pages: list[dict], comments: dict[int, list[dict]] | None = None, comment_pages: dict[int, list] | None = None, attachments: dict[str, bytes] | None = None) -> ZendeskTicketsConnector:
     monkeypatch.setenv("ZENDESKTICKET_SUBDOMAIN", "acme")
     monkeypatch.setenv("ZENDESKTICKET_USER", "agent@example.com")
     monkeypatch.setenv("ZENDESKTICKET_TOKEN", "secret")
     connector = ZendeskTicketsConnector(state_dir=str(state_dir))
-    connector._http = FakeHTTPClient(ticket_pages=pages, comments=comments, attachments=attachments)
+    connector._http = FakeHTTPClient(ticket_pages=pages, comments=comments, comment_pages=comment_pages, attachments=attachments)
     return connector
 
 
@@ -1116,6 +1131,47 @@ def test_denylist_filters_newly_crawled_tickets(monkeypatch: pytest.MonkeyPatch,
 
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     assert "1002" not in connector._manifest_snapshot["ticket_files"]
+    connector.close()
+
+
+def test_parse_tags_strips_inner_quotes_and_adjacent_whitespace():
+    # Quoted env values (e.g. EXCLUDETAG="a, b") must not leak quote
+    # characters or whitespace adjacent to quotes into parsed tags.
+    assert _parse_tags('"a, b"') == {"a", "b"}
+    assert _parse_tags('" a, b "') == {"a", "b"}
+    assert _parse_tags("a,b") == {"a", "b"}
+    assert _parse_tags("  ") == set()
+    # str.strip() semantics preserved: non-ASCII whitespace (NBSP, VT, FF)
+    # is stripped, not just ASCII space/tab/newline.
+    assert _parse_tags("\xa0ops\xa0") == {"ops"}
+    assert _parse_tags("\x0bops\x0c") == {"ops"}
+    assert _parse_tags('"\u2003wide\u202f"') == {"wide"}
+
+
+def test_exclude_tag_env_var_with_inner_quotes_filters_tickets(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    state_dir = _make_state_dir(tmp_path, "quoted-exclude-tag")
+    monkeypatch.delenv("ZENDESKTICKET_INCLUDETAGS", raising=False)
+    monkeypatch.delenv("ZENDESKTICKET_EXCLUDETAGS", raising=False)
+    # Deployed-compose style value: inner quotes plus spaces after commas.
+    monkeypatch.setenv("ZENDESKTICKET_EXCLUDETAG", '"ignore-me, sap:material_request "')
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(1001, "2024-01-02T03:04:05Z", tags=["ops"]),
+                    _ticket(1002, "2024-01-02T03:05:05Z", tags=["sap:material_request"]),
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     connector.close()
 
 
@@ -2037,6 +2093,142 @@ def test_inaccessible_ticket_comments_5xx_retries_then_skips_without_aborting_sy
 
     assert [entry.display_path for entry in manifest] == ["tickets/1001.md"]
     assert len(sleep_calls) == 2  # two retries before giving up
+    connector.close()
+
+
+def test_multipage_comments_follow_next_page_into_manifest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Comments and attachments on pages 2+ must land in the KB (issue #41)."""
+    state_dir = _make_state_dir(tmp_path, "multipage-comments")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "pdf")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comment_pages={
+            1001: [
+                {
+                    "comments": [_comment(501, "First page comment.")],
+                    "next_page": "https://acme.zendesk.com/api/v2/tickets/1001/comments.json?page=2",
+                },
+                {
+                    "comments": [
+                        _comment(
+                            502,
+                            "Second page comment with the ACH form.",
+                            attachments=[_attachment("ach-form.pdf", url="https://acme.zendesk.com/attachments/ach-form.pdf")],
+                        )
+                    ],
+                    "next_page": None,
+                },
+            ]
+        },
+        attachments={"ach-form.pdf": b"ach-bytes"},
+    )
+
+    manifest = connector.build_manifest()
+
+    short_hash = hashlib.sha1(b"ach-bytes").hexdigest()[:6]  # noqa: S324
+    assert sorted(entry.display_path for entry in manifest) == [
+        f"attachments/1001/1001-{short_hash}-ach-form.pdf",
+        "tickets/1001.md",
+    ]
+    markdown = connector.read_file("tickets", "1001.md").decode("utf-8")
+    assert "First page comment." in markdown
+    assert "Second page comment with the ACH form." in markdown
+    comment_gets = [c["path"] for c in connector._http.calls if _COMMENT_PATH_RE.search(c["path"])]
+    assert comment_gets == [
+        "/tickets/1001/comments.json",
+        "https://acme.zendesk.com/api/v2/tickets/1001/comments.json?page=2",
+    ]
+    connector.close()
+
+
+def test_multipage_comments_page2_failure_skips_ticket_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A page that cannot be fetched excludes the whole ticket, never partial content."""
+    state_dir = _make_state_dir(tmp_path, "multipage-page2-failure")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z"), _ticket(1002, "2024-01-02T04:00:00Z")],
+                "next_page": None,
+            }
+        ],
+        comment_pages={
+            1001: [
+                {
+                    "comments": [_comment(501, "First page comment.")],
+                    "next_page": "https://acme.zendesk.com/api/v2/tickets/1001/comments.json?page=2",
+                },
+                503,
+                503,
+                503,
+            ]
+        },
+        comments={1002: []},
+    )
+    connector._max_retries = 2
+    connector._backoff_base_seconds = 0.1
+    connector._backoff_max_seconds = 1.0
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr("oikb.connectors.zendesktickets.time.sleep", lambda d: sleep_calls.append(d))
+
+    manifest = connector.build_manifest()
+
+    # Ticket 1001 is excluded entirely (fail-closed); 1002 still syncs.
+    assert [entry.display_path for entry in manifest] == ["tickets/1002.md"]
+    assert len(sleep_calls) == 2  # two retries on the failing second page
+    connector.close()
+
+
+def test_multipage_comments_repeated_next_page_skips_ticket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A non-advancing next_page cursor must loop-guard and skip the ticket."""
+    state_dir = _make_state_dir(tmp_path, "multipage-cursor-loop")
+    repeat_url = "https://acme.zendesk.com/api/v2/tickets/1001/comments.json?page=2"
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comment_pages={
+            1001: [
+                {"comments": [_comment(501, "First page.")], "next_page": repeat_url},
+                {"comments": [_comment(502, "Second page.")], "next_page": repeat_url},
+            ]
+        },
+    )
+
+    manifest = connector.build_manifest()
+
+    assert manifest == []
+    comment_gets = [c["path"] for c in connector._http.calls if _COMMENT_PATH_RE.search(c["path"])]
+    assert len(comment_gets) == 2  # loop stopped at the repeated cursor
+    connector.close()
+
+
+def test_multipage_comments_foreign_next_page_skips_ticket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A next_page pointing off the Zendesk host must not be followed."""
+    state_dir = _make_state_dir(tmp_path, "multipage-foreign-host")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [_ticket(1001, "2024-01-02T03:04:05Z")], "next_page": None}],
+        comment_pages={
+            1001: [
+                {
+                    "comments": [_comment(501, "First page.")],
+                    "next_page": "https://evil.example/api/v2/tickets/1001/comments.json?page=2",
+                }
+            ]
+        },
+    )
+
+    manifest = connector.build_manifest()
+
+    assert manifest == []
+    assert not [c for c in connector._http.calls if "evil.example" in (c["path"] or "")]
     connector.close()
 
 
