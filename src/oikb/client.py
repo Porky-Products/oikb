@@ -147,16 +147,19 @@ class OikbClient:
 
         Paginated: walks ``page`` until the reported ``total`` is reached —
         or, when the server reports no ``total``, until a page yields no
-        new files (natural exhaustion).  The listing is complete-or-raise:
-        a server that stops serving new files before ``total`` is reached,
-        or that exhausts the page-safety cap, raises ``ValueError`` rather
-        than returning a partial list as if it were complete (#43/#46).
-        ``page_size`` is passed as ``limit``, which the server only honors
-        for admin keys — non-admin callers get the default 30-item page
-        size and the loop simply takes more iterations.
+        new files (natural exhaustion).  The first non-null ``total`` is
+        binding for the whole listing: a later page that changes or omits
+        it raises.  The listing is complete-or-raise: a server that stops
+        serving new files before ``total`` is reached, or that exhausts the
+        page-safety cap, raises ``ValueError`` rather than returning a
+        partial list as if it were complete (#43/#46).  ``page_size`` is
+        passed as ``limit``, which the
+        server only honors for admin keys — non-admin callers get the
+        default 30-item page size and the loop simply takes more iterations.
         """
         files: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
+        reported_total: int | None = None
         page = 1
         while True:
             params: dict[str, Any] = {"page": page}
@@ -194,6 +197,23 @@ class OikbClient:
                 raise ValueError(
                     f"Malformed KB file listing for {kb_id}: 'total' must be a non-negative integer, got {total!r}"
                 )
+            if total is not None:
+                if reported_total is None:
+                    reported_total = total
+                elif total != reported_total:
+                    # A total that changes mid-pagination is a moving
+                    # target: the pages held so far may no longer be the
+                    # complete set, and honoring the new (smaller) total
+                    # would return a partial listing as complete.
+                    raise ValueError(
+                        f"Malformed KB file listing for {kb_id}: 'total' changed mid-pagination from {reported_total!r} to {total!r} on page {page}"
+                    )
+            elif reported_total is not None:
+                # A total that disappears mid-pagination would downgrade
+                # complete-or-raise to lenient natural exhaustion.
+                raise ValueError(
+                    f"Malformed KB file listing for {kb_id}: 'total' disappeared on page {page} after {reported_total!r} was reported"
+                )
             new_items: list[dict[str, Any]] = []
             for f in items:
                 if not isinstance(f, dict):
@@ -208,14 +228,14 @@ class OikbClient:
                     if fid is not None:
                         seen_ids.add(fid)
             files.extend(new_items)
-            if total is None:
+            if reported_total is None:
                 if not new_items:
                     break  # natural exhaustion: no total, nothing new
-            elif len(files) >= total:
+            elif len(files) >= reported_total:
                 break
             elif not new_items:
                 raise ValueError(
-                    f"KB file listing for {kb_id} stalled: page {page} returned no new files after collecting {len(files)} of {total} reported"
+                    f"KB file listing for {kb_id} stalled: page {page} returned no new files after collecting {len(files)} of {reported_total} reported"
                 )
             if page >= _KB_FILES_MAX_PAGES:
                 raise ValueError(
