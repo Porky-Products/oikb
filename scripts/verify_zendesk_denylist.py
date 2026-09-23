@@ -172,7 +172,10 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
         total = payload.get("total")
         if not isinstance(page_items, list):
             _die(f"KB response 'items' was not a list: {type(page_items).__name__}")
-        if not isinstance(total, int) or total < 0:
+        # bool is a subclass of int, so the isinstance check alone accepts
+        # true/false totals (True even counts as 1 and can support a
+        # vacuous CLEAN); a boolean total is malformed data, so fail closed.
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
             _die(f"KB response 'total' missing/invalid: {total!r}")
         if seen_total is not None and total != seen_total:
             # A total that changes mid-pagination means the listing is a
@@ -245,15 +248,29 @@ def _leaked_files(
     filename). Unmatchable items make a CLEAN verdict unverifiable."""
     leaked: dict[str, list[str]] = {}
     unmatchable: list[str] = []
+    # Canonical string forms, compared as strings — never via int(), which
+    # would erase leading zeros and make "045748.md" falsely match 45748.
+    denied_strs = {str(i) for i in denied}
     for item in items:
         filename = _item_filename(item)
         if not filename:
             item_id = item.get("id")
             unmatchable.append(str(item_id) if item_id is not None else "<no id>")
             continue
-        for ticket_id in denied:
-            if filename == f"{ticket_id}.md" or filename.startswith(f"{ticket_id}-"):
-                leaked.setdefault(ticket_id, []).append(filename)
+        # A filename leaks iff it is exactly "<id>.md" or starts with
+        # "<id>-" for some denied id; at most one denied id can match, so a
+        # single pass per filename replaces the per-denied-id nested loop.
+        # partition at the first dash: the separator binds the numeric
+        # prefix (a bare "45748" has no dash and must not match), then a
+        # trailing ".md" stem covers the exact-match form.
+        head, sep, _ = filename.partition("-")
+        if sep and head.isdigit() and head in denied_strs:
+            leaked.setdefault(head, []).append(filename)
+            continue
+        if filename.endswith(".md"):
+            stem = filename[:-3]
+            if stem.isdigit() and stem in denied_strs:
+                leaked.setdefault(stem, []).append(filename)
     return leaked, unmatchable
 
 
@@ -305,7 +322,7 @@ def main() -> None:
     print(f"KB files listed:       {len(items)}")
     if leaked:
         print(f"\nVERDICT: LEAKED — {len(leaked)} denylisted ticket(s) still have KB files: (exit 1)")
-        for ticket_id in sorted(leaked, key=lambda v: int(v)):
+        for ticket_id in sorted(leaked, key=int):
             print(f"  ticket {ticket_id}:")
             for filename in leaked[ticket_id]:
                 print(f"    - {filename}")
