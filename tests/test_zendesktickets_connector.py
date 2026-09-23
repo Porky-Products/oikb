@@ -30,10 +30,18 @@ _COMMENT_PATH_RE = re.compile(r"/tickets/(\d+)/comments\.json")
 
 
 class FakeResponse:
-    def __init__(self, payload: dict, status_code: int = 200, headers: dict[str, str] | None = None):
+    def __init__(
+        self,
+        payload: object = None,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        *,
+        json_error: Exception | None = None,
+    ):
         self._payload = payload
         self.status_code = status_code
         self.headers = headers or {}
+        self._json_error = json_error
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
@@ -42,19 +50,23 @@ class FakeResponse:
             raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=request, response=response)
         return None
 
-    def json(self) -> dict:
+    def json(self) -> object:
+        if self._json_error is not None:
+            raise self._json_error
         return self._payload
 
 
 class FakeHTTPClient:
-    def __init__(self, ticket_pages: list[dict], comments: dict[int, list[dict]] | None = None, attachments: dict[str, bytes] | None = None, comment_status_codes: dict[int, list[int]] | None = None, comment_pages: dict[int, list[dict | int]] | None = None):
+    def __init__(self, ticket_pages: list[dict], comments: dict[int, list[dict]] | None = None, attachments: dict[str, bytes] | None = None, comment_status_codes: dict[int, list[int]] | None = None, comment_pages: dict[int, list[object]] | None = None):
         self._ticket_pages = list(ticket_pages)
         self._comments = comments or {}
         self._attachments = attachments or {}
         self._comment_status_codes: dict[int, list[int]] = comment_status_codes or {}
         # Per-ticket queue of comment page payloads served in request order;
-        # an int entry answers that request with the given status code.
-        self._comment_pages: dict[int, list[dict | int]] = comment_pages or {}
+        # an int entry answers that request with the given status code, a
+        # FakeResponse entry is served as-is, and any other entry is served
+        # as the raw JSON payload (dict, list, None, ...).
+        self._comment_pages: dict[int, list[object]] = comment_pages or {}
         self.calls: list[dict] = []
         self.is_closed = False
 
@@ -74,6 +86,8 @@ class FakeHTTPClient:
                 if not self._comment_pages[ticket_id]:
                     raise AssertionError(f"No more comment pages configured for ticket {ticket_id}")
                 item = self._comment_pages[ticket_id].pop(0)
+                if isinstance(item, FakeResponse):
+                    return item
                 if isinstance(item, int):
                     return FakeResponse({}, status_code=item)
                 return FakeResponse(item)
@@ -2229,6 +2243,154 @@ def test_multipage_comments_foreign_next_page_skips_ticket(monkeypatch: pytest.M
 
     assert manifest == []
     assert not [c for c in connector._http.calls if "evil.example" in (c["path"] or "")]
+    connector.close()
+
+
+def test_fetch_ticket_comments_non_json_body_returns_none(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A comments response that is not valid JSON must fail closed, not crash."""
+    state_dir = _make_state_dir(tmp_path, "comments-non-json-body")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comment_pages={1001: [FakeResponse(json_error=json.JSONDecodeError("Expecting value", "<html>", 0))]},
+    )
+
+    assert connector._fetch_ticket_comments(1001) is None
+    connector.close()
+
+
+def test_fetch_ticket_comments_payload_not_a_dict_returns_none(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A JSON list or null payload must not be treated as zero comments."""
+    state_dir = _make_state_dir(tmp_path, "comments-payload-not-dict")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comment_pages={
+            1001: [[_comment(501, "A list payload, not an object.")]],
+            1002: [None],
+        },
+    )
+
+    assert connector._fetch_ticket_comments(1001) is None
+    assert connector._fetch_ticket_comments(1002) is None
+    connector.close()
+
+
+def test_fetch_ticket_comments_missing_comments_key_returns_none(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """An object payload without a comments key must not be treated as zero comments."""
+    state_dir = _make_state_dir(tmp_path, "comments-key-missing")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comment_pages={1001: [{}]},
+    )
+
+    assert connector._fetch_ticket_comments(1001) is None
+    connector.close()
+
+
+def test_fetch_ticket_comments_comments_not_a_list_returns_none(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A non-list comments value must not be treated as zero comments."""
+    state_dir = _make_state_dir(tmp_path, "comments-not-a-list")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comment_pages={1001: [{"comments": "not-a-list"}]},
+    )
+
+    assert connector._fetch_ticket_comments(1001) is None
+    connector.close()
+
+
+def test_fetch_ticket_comments_non_dict_comment_element_returns_none(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A comments list containing a non-object element must fail closed."""
+    state_dir = _make_state_dir(tmp_path, "comments-non-dict-element")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comment_pages={1001: [{"comments": [_comment(501, "Valid comment."), 502]}]},
+    )
+
+    assert connector._fetch_ticket_comments(1001) is None
+    connector.close()
+
+
+def test_fetch_ticket_comments_valid_payload_returns_all_comments(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A well-formed payload still returns the full comment list."""
+    state_dir = _make_state_dir(tmp_path, "comments-valid-payload")
+    expected = [_comment(501, "First comment."), _comment(502, "Second comment.")]
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comment_pages={1001: [{"comments": expected, "next_page": None}]},
+    )
+
+    assert connector._fetch_ticket_comments(1001) == expected
+    connector.close()
+
+
+def test_fetch_ticket_comments_well_formed_empty_comments_returns_empty_list(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A well-formed zero-comment payload is valid and distinct from a malformed one."""
+    state_dir = _make_state_dir(tmp_path, "comments-well-formed-empty")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comment_pages={1001: [{"comments": [], "next_page": None}]},
+    )
+
+    assert connector._fetch_ticket_comments(1001) == []
+    connector.close()
+
+
+def test_fetch_ticket_comments_404_returns_none(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A genuine 404 still skips the ticket (existing behavior preserved)."""
+    state_dir = _make_state_dir(tmp_path, "comments-404-direct")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comment_pages={1001: [404]},
+    )
+
+    assert connector._fetch_ticket_comments(1001) is None
+    connector.close()
+
+
+def test_malformed_comments_page2_skips_ticket_fail_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """A malformed page after a good page excludes the whole ticket, never partial content."""
+    state_dir = _make_state_dir(tmp_path, "malformed-page2-fail-closed")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [_ticket(1001, "2024-01-02T03:04:05Z"), _ticket(1002, "2024-01-02T04:00:00Z")],
+                "next_page": None,
+            }
+        ],
+        comment_pages={
+            1001: [
+                {
+                    "comments": [_comment(501, "First page comment.")],
+                    "next_page": "https://acme.zendesk.com/api/v2/tickets/1001/comments.json?page=2",
+                },
+                {"comments": [_comment(502, "Valid comment."), 503]},
+            ]
+        },
+        comments={1002: []},
+    )
+
+    manifest = connector.build_manifest()
+
+    # Ticket 1001 is excluded entirely (fail-closed); 1002 still syncs.
+    assert [entry.display_path for entry in manifest] == ["tickets/1002.md"]
     connector.close()
 
 

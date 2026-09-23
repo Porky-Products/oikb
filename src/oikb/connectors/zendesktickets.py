@@ -587,9 +587,10 @@ class ZendeskTicketsConnector(BaseConnector):
     def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]] | None:
         """Fetch every comments page for a ticket, following next_page.
 
-        Returns None on 404 or when any page cannot be fetched after
-        exhausting retries (fail-closed: a ticket is never synced with a
-        partial comment set, matching the excluded-ticket contract).
+        Returns None on 404, when any page cannot be fetched after
+        exhausting retries, or when a page payload is malformed
+        (fail-closed: a ticket is never synced with a partial comment
+        set, matching the excluded-ticket contract).
         """
         comments: list[dict[str, Any]] = []
         next_page: str | None = None
@@ -598,8 +599,22 @@ class ZendeskTicketsConnector(BaseConnector):
             response = self._get_comments_page(ticket_id, next_page)
             if response is None:
                 return None
-            payload = response.json()
-            comments.extend(payload.get("comments", []))
+            try:
+                payload = response.json()
+            except ValueError:
+                # A non-JSON body (httpx raises a ValueError subclass) is
+                # malformed, not "zero comments" -- fail closed.
+                payload = None
+            page_comments = payload.get("comments") if isinstance(payload, dict) else None
+            if not isinstance(page_comments, list) or not all(
+                isinstance(comment, dict) for comment in page_comments
+            ):
+                log.warning(
+                    "ZendeskTicketsConnector: ticket %s returned a malformed comments payload; skipping ticket",
+                    ticket_id,
+                )
+                return None
+            comments.extend(page_comments)
             candidate = payload.get("next_page")
             if not candidate:
                 return comments
