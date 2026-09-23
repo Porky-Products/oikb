@@ -8,6 +8,12 @@ and one of:
     encrypted PEM keys.
 
 The two auth methods are mutually exclusive.
+
+Select Microsoft Endpoints. Use SHAREPOINT_CLOUD set to
+one of:
+  - SHAREPOINT_CLOUD=commercial // default
+  - SHAREPOINT_CLOUD=gcc_high
+  - SHAREPOINT_CLOUD=dod
 """
 
 from __future__ import annotations
@@ -24,6 +30,21 @@ from urllib.parse import quote, urljoin, urlparse
 import httpx
 
 from oikb.connectors import BaseConnector, ManifestEntry
+
+_CLOUD_ENDPOINTS: dict[str, dict[str, str]] = {
+    "commercial": {
+        "authority": "https://login.microsoftonline.com",
+        "graph": "https://graph.microsoft.com/v1.0",
+    },
+    "gcc_high": {
+        "authority": "https://login.microsoftonline.us",
+        "graph": "https://graph.microsoft.us/v1.0",
+    },
+    "dod": {
+        "authority": "https://login.microsoftonline.us",
+        "graph": "https://dod-graph.microsoft.us/v1.0",
+    },
+}
 
 
 def _encode_drive_path(path: str) -> str:
@@ -61,14 +82,17 @@ class SharePointConnector(BaseConnector):
     def __init__(
         self,
         site: str,
+        site_path: str = "",
         library: str = "Documents",
         tenant_id: str | None = None,
         client_id: str | None = None,
         client_secret: str | None = None,
         certificate_path: str | None = None,
         certificate_password: str | None = None,
+        cloud: str | None = None,
     ):
         self.site = site
+        self.site_path = site_path.strip("/")
         self.library = library
 
         tid = tenant_id or os.environ.get("SHAREPOINT_TENANT_ID", "")
@@ -76,6 +100,11 @@ class SharePointConnector(BaseConnector):
         secret = client_secret or os.environ.get("SHAREPOINT_CLIENT_SECRET", "")
         cert_path = certificate_path or os.environ.get("SHAREPOINT_CERTIFICATE_PATH", "")
         cert_password = certificate_password or os.environ.get("SHAREPOINT_CERTIFICATE_PASSWORD", "")
+
+        sharepoint_cloud = cloud or os.environ.get("SHAREPOINT_CLOUD", "commercial")
+        if sharepoint_cloud not in _CLOUD_ENDPOINTS:
+            raise ValueError(f"SHAREPOINT_CLOUD must be one of {list(_CLOUD_ENDPOINTS)}, got '{sharepoint_cloud}'")
+        endpoints = _CLOUD_ENDPOINTS[sharepoint_cloud]
 
         if not tid or not cid:
             raise ValueError(
@@ -97,7 +126,7 @@ class SharePointConnector(BaseConnector):
                 "  SHAREPOINT_CERTIFICATE_PATH  (certificate)"
             )
 
-        token_url = f"https://login.microsoftonline.com/{tid}/oauth2/v2.0/token"
+        token_url = f"{endpoints['authority']}/{tid}/oauth2/v2.0/token"
 
         if cert_path:
             access_token = _get_token_via_certificate(
@@ -105,22 +134,25 @@ class SharePointConnector(BaseConnector):
                 client_id=cid,
                 certificate_path=cert_path,
                 certificate_password=cert_password or None,
+                graph_base=endpoints["graph"]
             )
         else:
             access_token = _get_token_via_secret(
                 token_url=token_url,
                 client_id=cid,
                 client_secret=secret,
+                graph_base=endpoints["graph"]
             )
 
         self._http = httpx.Client(
-            base_url="https://graph.microsoft.com/v1.0",
+            base_url=endpoints["graph"],
             headers={"Authorization": f"Bearer {access_token}"},
             timeout=60.0,
         )
 
         # Resolve site ID.
-        site_resp = self._http.get(f"/sites/{self.site}")
+        site_identifier = f"{self.site}:/{self.site_path}" if self.site_path else self.site
+        site_resp = self._http.get(f"/sites/{site_identifier}")
         site_resp.raise_for_status()
         self._site_id = site_resp.json()["id"]
 
@@ -318,7 +350,7 @@ class SharePointConnector(BaseConnector):
 # ── Auth helpers ────────────────────────────────────────────────
 
 
-def _get_token_via_secret(token_url: str, client_id: str, client_secret: str) -> str:
+def _get_token_via_secret(token_url: str, client_id: str, client_secret: str, graph_base: str) -> str:
     """Obtain an access token using client ID + client secret."""
     token_resp = httpx.post(
         token_url,
@@ -326,7 +358,7 @@ def _get_token_via_secret(token_url: str, client_id: str, client_secret: str) ->
             "grant_type": "client_credentials",
             "client_id": client_id,
             "client_secret": client_secret,
-            "scope": "https://graph.microsoft.com/.default",
+            "scope": f"{graph_base.rsplit('/v1.0', 1)[0]}/.default",
         },
     )
     token_resp.raise_for_status()
@@ -337,6 +369,7 @@ def _get_token_via_certificate(
     token_url: str,
     client_id: str,
     certificate_path: str,
+    graph_base: str,
     certificate_password: str | None = None,
 ) -> str:
     """Obtain an access token using client ID + certificate (JWT assertion).
@@ -347,7 +380,7 @@ def _get_token_via_certificate(
     """
     try:
         from cryptography import x509
-        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives import hashes, serialization
     except ImportError:
         raise ImportError(
             "Certificate auth requires the 'cryptography' package.\n"
@@ -375,9 +408,11 @@ def _get_token_via_certificate(
     # Load private key.
     private_key = serialization.load_pem_private_key(pem_data, password=password_bytes)
 
-    # Load certificate to extract thumbprint.
+    # Load certificate to extract thumbprint. The x5t header identifies the registered
+    # key by its SHA-1 thumbprint, whatever algorithm the certificate itself is signed
+    # with — a SHA-256 digest here is rejected with AADSTS700027 ("key was not found").
     cert = x509.load_pem_x509_certificate(pem_data)
-    thumbprint = cert.fingerprint(cert.signature_hash_algorithm or x509.hashes.SHA256())
+    thumbprint = cert.fingerprint(hashes.SHA1())
     x5t = base64.urlsafe_b64encode(thumbprint).rstrip(b"=").decode("ascii")
 
     # Build JWT assertion.
@@ -405,7 +440,7 @@ def _get_token_via_certificate(
             "client_id": client_id,
             "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
             "client_assertion": assertion,
-            "scope": "https://graph.microsoft.com/.default",
+            "scope": f"{graph_base.rsplit('/v1.0', 1)[0]}/.default",
         },
     )
     token_resp.raise_for_status()
@@ -414,13 +449,50 @@ def _get_token_via_certificate(
 
 # ── Source parser ───────────────────────────────────────────────
 
+_SITE_PATH_PREFIXES = ("sites", "teams")
+_SEPARATOR = "::"
 
-def parse_sharepoint_source(source: str) -> dict[str, str | None]:
-    """Parse sharepoint:site/library or sharepoint:site."""
+def parse_sharepoint_source(source: str) -> dict[str, str]:
+    """Parse a SharePoint source string. Supports:
+      sharepoint:<hostname>/<library>
+      sharepoint:<hostname>/sites/<site_name>/<library>
+      sharepoint:<hostname>/sites/<site_name>/<subsite>::<library>
+    """
     source = source.removeprefix("sharepoint:")
-    parts = source.split("/", 1)
-    site = parts[0]
-    library = parts[1] if len(parts) > 1 else "Documents"
-    if not site:
-        raise ValueError("Invalid SharePoint source. Expected: sharepoint:<site>[/library]")
-    return {"site": site, "library": library}
+    host, _, rest = source.partition("/")
+    if not host:
+        raise ValueError(
+            "Invalid SharePoint source. Expected one of:\n"
+            "  sharepoint:<hostname>/<library>\n"
+            "  sharepoint:<hostname>/sites/<site_name>/<library>\n"
+            "  sharepoint:<hostname>/sites/<site_name>/<subsite>::<library>"
+        )
+
+    if _SEPARATOR in rest:
+        site_path_str, _, library = rest.partition(_SEPARATOR)
+        site_path = site_path_str.strip("/")
+        if not library:
+            raise ValueError(f"Invalid SharePoint source: '{_SEPARATOR}' must be followed by a library name.")
+        return {"site": host, "site_path": site_path, "library": library}
+
+    segments = [s for s in rest.split("/") if s]
+
+    if segments and segments[0] in _SITE_PATH_PREFIXES:
+        if len(segments) < 3:
+            raise ValueError(
+                f"Invalid SharePoint source. '{segments[0]}/...' requires a site name and "
+                f"library, e.g. sharepoint:{host}/{segments[0]}/TeamSite/Documents"
+            )
+        if len(segments) > 3:
+            raise ValueError(
+                "Ambiguous SharePoint source with a subsite path — separate the site path "
+                f"from the library explicitly with '{_SEPARATOR}', e.g.\n"
+                f"  sharepoint:{host}/{'/'.join(segments[:-1])}{_SEPARATOR}{segments[-1]}"
+            )
+        site_path = "/".join(segments[:2])   # e.g. "sites/TeamSite"
+        library = segments[2]
+    else:
+        site_path = ""
+        library = "/".join(segments) if segments else "Documents"
+
+    return {"site": host, "site_path": site_path, "library": library}

@@ -129,7 +129,12 @@ class OikbClient:
         return resp.json()
 
     def get_kb(self, kb_id: str) -> dict[str, Any]:
-        """GET /knowledge/{id} — get KB info."""
+        """GET /knowledge/{id} — get KB metadata.
+
+        Note: this endpoint returns metadata only. Its ``files`` field is a
+        server-hydrated convenience that some Open WebUI versions return as
+        null; use ``list_kb_files``/``count_kb_files`` for the file list.
+        """
         resp = self._http.get(f"/knowledge/{kb_id}")
         resp.raise_for_status()
         return resp.json()
@@ -174,3 +179,9 @@ class OikbClient:
                 break
             page += 1
         return files
+
+    def count_kb_files(self, kb_id: str) -> int:
+        """GET /knowledge/{id}/files — total file count for a KB."""
+        resp = self._http.get(f"/knowledge/{kb_id}/files")
+        resp.raise_for_status()
+        return resp.json().get("total", 0)

@@ -211,8 +211,9 @@ Options:
 export ZOTERO_LIBRARY_ID=123456
 export ZOTERO_API_KEY=...
 
-oikb sync "zotero:" --kb-id your-kb-id                 # all top-level collections plus _unfiled
-oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id
+oikb sync "zotero:" --kb-id your-kb-id # syncs all top-level collections plus _unfiled
+oikb sync "zotero:Research" --kb-id your-kb-id # syncs only the 'Research' collection
+oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id # syncs only the 'Machine Learning' subcollection
 ```
 
 Options:
