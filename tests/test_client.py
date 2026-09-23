@@ -15,7 +15,6 @@ import httpx
 import pytest
 import respx
 
-import oikb.client as client_module
 from oikb.client import OikbClient
 
 _BASE = "https://owui.example.com"
@@ -87,7 +86,7 @@ def test_repeated_page_before_total_raises() -> None:
 @respx.mock
 def test_page_cap_before_total_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     # The safety cap must never silently return a partial listing.
-    monkeypatch.setattr(client_module, "_KB_FILES_MAX_PAGES", 3)
+    monkeypatch.setattr("oikb.client._KB_FILES_MAX_PAGES", 3)
     route = respx.get(_FILES_URL).mock(
         side_effect=[
             _page([_file("f1")], total=100),
@@ -173,3 +172,48 @@ def test_issue43_never_returns_partial_as_complete() -> None:
     with _client() as client, pytest.raises(ValueError, match="stalled"):
         client.list_kb_files("kb1")
     assert route.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# PR #47 Copilot review findings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("body", [["not", "an", "object"], "a string", 123])
+@respx.mock
+def test_non_object_response_body_raises(body: Any) -> None:
+    # A 200 whose body is not a JSON object used to coerce to {} and
+    # return [] as if it were the complete listing.
+    respx.get(_FILES_URL).mock(return_value=httpx.Response(200, json=body))
+    with _client() as client, pytest.raises(ValueError, match="JSON object"):
+        client.list_kb_files("kb1")
+
+
+@respx.mock
+def test_json_null_response_body_raises() -> None:
+    # JSON null is not an object: it must not coerce to {} and return []
+    # as if complete.
+    respx.get(_FILES_URL).mock(return_value=httpx.Response(200, content=b"null"))
+    with _client() as client, pytest.raises(ValueError, match="JSON object"):
+        client.list_kb_files("kb1")
+
+
+@pytest.mark.parametrize("total", ["100", -1, 1.5])
+@respx.mock
+def test_malformed_total_raises(total: Any) -> None:
+    # A non-integer total used to be tolerated as absent, silently swapping
+    # complete-or-raise for lenient natural exhaustion; a negative total
+    # satisfied len(files) >= total on page 1 and returned a partial list
+    # as complete. Both must raise.
+    respx.get(_FILES_URL).mock(return_value=_page([_file("f1")], total=total))
+    with _client() as client, pytest.raises(ValueError, match="total"):
+        client.list_kb_files("kb1")
+
+
+@respx.mock
+def test_non_object_entry_raises() -> None:
+    # A non-object entry used to traceback with AttributeError on f.get;
+    # it is malformed data, consistent with the other listing guards.
+    respx.get(_FILES_URL).mock(return_value=_page(["not-an-object"], total=1))
+    with _client() as client, pytest.raises(ValueError, match="entry"):
+        client.list_kb_files("kb1")
