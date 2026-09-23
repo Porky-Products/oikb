@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import replace
-from typing import Callable
 
 from oikb.client import OikbClient
 from oikb.connectors import BaseConnector, ManifestEntry
-from oikb.sync import SyncCancelled, SyncResult, build_manifest_filter, parse_size, run_sync
+from oikb.sync import (
+    SyncCancelled,
+    SyncResult,
+    build_manifest_filter,
+    parse_size,
+    run_sync,
+)
 
 
 def group_entries_by_kb(entries: list[dict]) -> list[list[dict]]:
@@ -28,9 +34,11 @@ class _CombinedConnector(BaseConnector):
         self,
         manifest: list[ManifestEntry],
         routes: dict[tuple[str, str], tuple[BaseConnector, str]],
+        children: list[BaseConnector],
     ):
         self._manifest = manifest
         self._routes = routes
+        self._children = children
 
     def build_manifest(self) -> list[ManifestEntry]:
         return self._manifest
@@ -38,6 +46,22 @@ class _CombinedConnector(BaseConnector):
     def read_file(self, path: str, filename: str) -> bytes:
         connector, original_path = self._routes[(path, filename)]
         return connector.read_file(original_path, filename)
+
+    @property
+    def content_addressed_checksums(self) -> bool:
+        # sync gates its duplicate-upload guard on this flag; expose it only
+        # when every child guarantees checksum equality implies content equality.
+        return all(
+            getattr(child, "content_addressed_checksums", False) for child in self._children
+        )
+
+    def mark_sync_complete(self) -> None:
+        # sync invokes this once per completed run; forward to each child
+        # exactly once so checkpointing connectors persist their progress.
+        for child in self._children:
+            mark = getattr(child, "mark_sync_complete", None)
+            if callable(mark):
+                mark()
 
 
 def run_entries_sync(
@@ -63,6 +87,7 @@ def run_entries_sync(
         raise ValueError("Expected sources for exactly one KB")
     manifest: list[ManifestEntry] = []
     routes: dict[tuple[str, str], tuple[BaseConnector, str]] = {}
+    children: list[BaseConnector] = []
     with ExitStack() as stack:
         for entry in entries:
             if cancel_requested and cancel_requested():
@@ -85,6 +110,7 @@ def run_entries_sync(
                 entry["source"], branch=entry.get("branch"), path=entry.get("path"),
                 auth=entry.get("auth", {}),
             ))
+            children.append(connector)
             source_manifest = connector.build_manifest()
             if manifest_filter:
                 source_manifest = manifest_filter(source_manifest)
@@ -98,7 +124,7 @@ def run_entries_sync(
 
         return run_sync(
             client=client,
-            connector=_CombinedConnector(manifest, routes),
+            connector=_CombinedConnector(manifest, routes, children),
             kb_id=entries[0]["kb-id"],
             dry_run=dry_run,
             verbose=verbose,

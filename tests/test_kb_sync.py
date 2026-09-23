@@ -1,11 +1,11 @@
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import httpx
 import pytest
 from click.testing import CliRunner
 
+from oikb import kb_sync
 from oikb.connectors import BaseConnector, ManifestEntry
-from oikb.kb_sync import group_entries_by_kb, run_entries_sync
 from oikb.sync import SyncCancelled, SyncResult
 
 
@@ -37,7 +37,7 @@ def test_combined_manifest_filters_routing_and_auth():
         {"source": "confluence:ENG", "kb-id": "kb", "filter": {"include": ["*.txt"]}, "auth": {"token": "one"}},
         {"source": "confluence:HR", "kb-id": "kb", "auth": {"token": "two"}},
     ]
-    result = run_entries_sync(client, entries, resolve_connector=resolver, quiet=True)
+    result = kb_sync.run_entries_sync(client, entries, resolve_connector=resolver, quiet=True)
     assert result.added == 2
     assert [e["path"] for e in client.sync_diff.call_args.args[1]] == ["ENG", "HR"]
     assert [call.kwargs["file_content"] for call in client.upload_file.call_args_list] == [b"first", b"second"]
@@ -57,7 +57,7 @@ def test_failure_prevents_any_kb_mutation_and_closes_sources(failure):
         entries[1]["filter"] = {"max-size": "bad"}
     client = Mock()
     with pytest.raises((ValueError, RuntimeError)):
-        run_entries_sync(client, entries, resolve_connector=resolver, quiet=True)
+        kb_sync.run_entries_sync(client, entries, resolve_connector=resolver, quiet=True)
     assert not client.mock_calls
     assert first.closed
     if failure not in {"resolve", "filter"}:
@@ -69,7 +69,7 @@ def test_single_source_keeps_paths_and_target_path_is_optional():
         client = Mock()
         client.sync_diff.return_value = {}
         source = Source({"a.txt": b"a"})
-        run_entries_sync(client, [{"source": "confluence:ENG", "kb-id": "kb", **extra}], resolve_connector=lambda *a, **kw: source, quiet=True)
+        kb_sync.run_entries_sync(client, [{"source": "confluence:ENG", "kb-id": "kb", **extra}], resolve_connector=lambda *a, **kw: source, quiet=True)
         assert client.sync_diff.call_args.args[1][0]["path"] == expected
         assert source.closed
 
@@ -78,24 +78,23 @@ def test_single_source_keeps_paths_and_target_path_is_optional():
 def test_invalid_target_path_fails_before_scan(prefix):
     resolver = Mock()
     with pytest.raises(ValueError, match="target-path"):
-        run_entries_sync(Mock(), [{"source": "one", "kb-id": "kb", "target-path": prefix}], resolve_connector=resolver)
+        kb_sync.run_entries_sync(Mock(), [{"source": "one", "kb-id": "kb", "target-path": prefix}], resolve_connector=resolver)
     resolver.assert_not_called()
 
 
 def test_group_validation_and_cancellation():
     with pytest.raises(ValueError, match="source and kb-id"):
-        group_entries_by_kb([{"source": "one"}])
+        kb_sync.group_entries_by_kb([{"source": "one"}])
     with pytest.raises(ValueError, match="same url and token"):
-        group_entries_by_kb([{"source": "one", "kb-id": "kb", "url": "a"}, {"source": "two", "kb-id": "kb", "url": "b"}])
+        kb_sync.group_entries_by_kb([{"source": "one", "kb-id": "kb", "url": "a"}, {"source": "two", "kb-id": "kb", "url": "b"}])
     client, resolver = Mock(), Mock()
     with pytest.raises(SyncCancelled):
-        run_entries_sync(client, [{"source": "one", "kb-id": "kb"}], resolve_connector=resolver, cancel_requested=lambda: True)
+        kb_sync.run_entries_sync(client, [{"source": "one", "kb-id": "kb"}], resolve_connector=resolver, cancel_requested=lambda: True)
     assert not client.mock_calls and not resolver.mock_calls
 
 
 def test_cli_name_selects_entire_kb_group_and_closes_client(monkeypatch):
     import oikb.cli as cli
-    import oikb.kb_sync as kb_sync
     entries = [{"name": "one", "source": "one", "kb-id": "kb"}, {"source": "two", "kb-id": "kb"}, {"source": "other", "kb-id": "other"}]
     monkeypatch.setattr(cli, "_load_oikb_yaml", lambda: entries)
     client = Mock()
@@ -114,7 +113,6 @@ def test_cli_name_selects_entire_kb_group_and_closes_client(monkeypatch):
 async def test_daemon_triggers_include_sibling_sources(monkeypatch, trigger):
     import oikb.cli as cli
     import oikb.daemon as daemon
-    import oikb.kb_sync as kb_sync
     entries = [{"name": "one", "source": "one", "kb-id": "kb"}, {"source": "two", "kb-id": "kb"}]
     monkeypatch.setattr(daemon, "_entries", entries)
     monkeypatch.setattr(daemon, "_sync_locks", {})
@@ -143,5 +141,49 @@ def test_upload_error_includes_server_detail():
     client.sync_diff.side_effect = lambda kb, manifest: {"added": manifest}
     response = httpx.Response(400, json={"detail": "extraction failed"}, request=httpx.Request("POST", "https://webui.example/files"))
     client.upload_file.side_effect = httpx.HTTPStatusError("Bad Request", request=response.request, response=response)
-    result = run_entries_sync(client, [{"source": "one", "kb-id": "kb"}], resolve_connector=lambda *a, **kw: Source({"a.txt": b"a"}), quiet=True)
+    result = kb_sync.run_entries_sync(client, [{"source": "one", "kb-id": "kb"}], resolve_connector=lambda *a, **kw: Source({"a.txt": b"a"}), quiet=True)
     assert "extraction failed" in result.errors[0]
+
+
+def test_combined_connector_exposes_checksums_only_when_every_child_does():
+    providing = Mock()
+    providing.content_addressed_checksums = True
+    lacking = Mock()
+    lacking.content_addressed_checksums = False
+    assert kb_sync._CombinedConnector([], {}, [providing]).content_addressed_checksums is True
+    assert kb_sync._CombinedConnector([], {}, [providing, lacking]).content_addressed_checksums is False
+
+
+def test_combined_connector_mark_sync_complete_forwards_once_per_child():
+    first, second = Mock(), Mock()
+    plain = Mock(spec=BaseConnector)  # Most connectors define no mark_sync_complete.
+    combined = kb_sync._CombinedConnector([], {}, [first, second, plain])
+    combined.mark_sync_complete()
+    first.mark_sync_complete.assert_called_once_with()
+    second.mark_sync_complete.assert_called_once_with()
+
+
+def _mock_child(manifest):
+    child = MagicMock()
+    child.__enter__.return_value = child
+    child.__exit__.return_value = False
+    child.build_manifest.return_value = manifest
+    child.content_addressed_checksums = False
+    child.mark_sync_complete = Mock()
+    return child
+
+
+def test_run_entries_sync_advances_checkpoints_on_every_child_including_empty_ones():
+    full = _mock_child([ManifestEntry("a.txt", "", "1", 1)])
+    full.read_file.return_value = b"a"
+    empty = _mock_child([])
+    client = Mock()
+    client.sync_diff.side_effect = lambda kb, manifest: {"added": manifest}
+    kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}, {"source": "two", "kb-id": "kb"}],
+        resolve_connector=Mock(side_effect=[full, empty]),
+        quiet=True,
+    )
+    full.mark_sync_complete.assert_called_once_with()
+    empty.mark_sync_complete.assert_called_once_with()
