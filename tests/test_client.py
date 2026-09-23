@@ -217,3 +217,56 @@ def test_non_object_entry_raises() -> None:
     respx.get(_FILES_URL).mock(return_value=_page(["not-an-object"], total=1))
     with _client() as client, pytest.raises(ValueError, match="entry"):
         client.list_kb_files("kb1")
+
+
+# ---------------------------------------------------------------------------
+# PR #47 follow-up Copilot review findings
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_total_downgrade_mid_pagination_raises() -> None:
+    # Page 1 reports total=3, page 2 reports total=2: honoring the
+    # smaller total would return the first two files as a complete
+    # listing. The first non-null total is binding for the whole listing.
+    route = respx.get(_FILES_URL).mock(
+        side_effect=[
+            _page([_file("f1"), _file("f2")], total=3),
+            _page([_file("f3")], total=2),
+        ]
+    )
+    with _client() as client, pytest.raises(ValueError, match="changed mid-pagination"):
+        client.list_kb_files("kb1")
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_total_disappearing_mid_pagination_raises() -> None:
+    # A later page omitting `total` used to downgrade the loop to lenient
+    # natural exhaustion; the first reported total stays binding.
+    route = respx.get(_FILES_URL).mock(
+        side_effect=[
+            _page([_file("f1"), _file("f2")], total=3),
+            _page([_file("f3")]),
+        ]
+    )
+    with _client() as client, pytest.raises(ValueError, match="disappeared"):
+        client.list_kb_files("kb1")
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_total_first_reported_late_is_adopted() -> None:
+    # Behavior preservation: a listing that starts without a total and
+    # reports one later adopts the first non-null total and completes
+    # against it.
+    route = respx.get(_FILES_URL).mock(
+        side_effect=[
+            _page([_file("f1")]),
+            _page([_file("f2")], total=2),
+        ]
+    )
+    with _client() as client:
+        result = client.list_kb_files("kb1")
+    assert [f["id"] for f in result] == ["f1", "f2"]
+    assert route.call_count == 2
