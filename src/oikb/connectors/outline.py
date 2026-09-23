@@ -9,11 +9,14 @@ import httpx
 
 from oikb.connectors import BaseConnector, ManifestEntry
 
-# documents.list serves at most 100 documents per request, so 100 pages bounds
-# a sync at 10,000 documents. A server that keeps returning full pages of new
-# documents forever is pathological -- fail closed instead of looping endlessly
-# (mirrors the zendesktickets _MAX_COMMENT_PAGES guard).
-_MAX_PAGES = 100
+# documents.list serves at most 100 documents per request. Unlike the
+# zendesktickets _MAX_COMMENT_PAGES guard, which bounds comments within a
+# single ticket, this is a workspace-wide listing, so the cap must tolerate
+# large workspaces: 10,000 pages bounds a sync at 1,000,000 documents,
+# matching the whole-listing hard stop in verify_zendesk_denylist.py. A
+# server that keeps returning full pages of new documents forever is
+# pathological -- fail closed instead of looping endlessly.
+_MAX_PAGES = 10_000
 
 
 class OutlineConnector(BaseConnector):
