@@ -164,7 +164,14 @@ class OikbClient:
                 params["limit"] = page_size
             resp = self._http.get(f"/knowledge/{kb_id}/files", params=params)
             resp.raise_for_status()
-            data = resp.json() or {}
+            data = resp.json()
+            if not isinstance(data, dict):
+                # A non-object body (JSON list/string/null) is malformed:
+                # coercing it to {} would return an empty list as if it
+                # were the complete listing.
+                raise ValueError(  # noqa: TRY004 -- repo convention: malformed API payloads raise ValueError
+                    f"Malformed KB file listing for {kb_id}: response body must be a JSON object, got {type(data).__name__}"
+                )
             # "items" may be an explicit JSON null — .get's default only
             # covers a missing key, not a null value.
             items = data.get("items")
@@ -175,16 +182,24 @@ class OikbClient:
                     f"Malformed KB file listing for {kb_id}: 'items' must be a list, got {type(items).__name__}"
                 )
             total = data.get("total")
-            if isinstance(total, bool):
-                # bool is an int subclass, so a JSON `true` total would
-                # otherwise slip through the int checks below.
-                raise ValueError(  # noqa: TRY004  -- repo convention: malformed API payloads raise ValueError
-                    f"Malformed KB file listing for {kb_id}: 'total' must be an integer, got {total!r}"
+            if total is not None and (
+                isinstance(total, bool) or not isinstance(total, int) or total < 0
+            ):
+                # Fail closed on a malformed total: bool is an int subclass
+                # (JSON `true` would pass isinstance), a non-integer total
+                # must not silently swap complete-or-raise for lenient
+                # natural exhaustion, and a negative total would satisfy
+                # `len(files) >= total` on page 1 and return a partial
+                # listing as complete.
+                raise ValueError(
+                    f"Malformed KB file listing for {kb_id}: 'total' must be a non-negative integer, got {total!r}"
                 )
-            if total is not None and not isinstance(total, int):
-                total = None  # tolerate non-integer totals as absent
             new_items: list[dict[str, Any]] = []
             for f in items:
+                if not isinstance(f, dict):
+                    raise ValueError(  # noqa: TRY004 -- repo convention: malformed API payloads raise ValueError
+                        f"Malformed KB file listing for {kb_id}: entry must be a JSON object, got {type(f).__name__}"
+                    )
                 fid = f.get("id")
                 # Items without an id are kept as-is (not deduped);
                 # duplicates are dropped within a page and across pages.
