@@ -665,7 +665,7 @@ def _append_review(path: Path, ticket_id: int, reason: str, reviewed: set[int]) 
     reviewed.add(ticket_id)
 
 
-def _load_state(state_path: Path) -> dict[str, Any] | None:
+def _load_state(state_path: Path, *, reset_requested: bool = False) -> dict[str, Any] | None:
     if not state_path.exists():
         return None
     state: Any = None
@@ -676,7 +676,11 @@ def _load_state(state_path: Path) -> dict[str, Any] | None:
     if not isinstance(state, dict):
         # Valid JSON that is not an object (list/string/number/null) would
         # traceback on the first state.get(...) instead of dying with the
-        # documented --reset remedy.
+        # documented --reset remedy. With --reset that remedy must actually
+        # work: treat the damaged file as absent so main()'s reset block can
+        # unlink it and restart from ID 1.
+        if reset_requested:
+            return None
         _die(
             f"state file corrupt ({state_path}): top-level JSON must be an object; "
             "use --reset to restart from ID 1"
@@ -744,7 +748,7 @@ def main() -> None:
     # the documented remedy for exactly those mismatches, so the guards must
     # let it through rather than _die before the reset block can run.
     reset_requested = "--reset" in sys.argv[1:]
-    state = _load_state(state_path)
+    state = _load_state(state_path, reset_requested=reset_requested)
     if state is not None and not reset_requested:
         if state.get("prompt_sha256") not in (None, prompt_sha):
             _die(
