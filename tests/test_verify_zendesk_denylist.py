@@ -11,10 +11,9 @@ CLEAN verdict (R4 findings).
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 from unittest import mock
-
-import os
 
 import pytest
 
@@ -42,10 +41,12 @@ def test_timeout_nonnumeric_exits_2(verify, denylist, tmp_path, monkeypatch):
         "OPEN_WEBUI_API_KEY": "k",
         "VERIFY_TIMEOUT_SECONDS": "abc",
     }
-    with mock.patch.dict(os.environ, env):
-        with mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]):
-            with pytest.raises(SystemExit) as excinfo:
-                verify.main()
+    with (
+        mock.patch.dict(os.environ, env),
+        mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        verify.main()
     assert excinfo.value.code == 2
 
 
@@ -56,29 +57,33 @@ def test_timeout_nonfinite_or_nonpositive_exits_2(verify, denylist, monkeypatch,
         "OPEN_WEBUI_API_KEY": "k",
         "VERIFY_TIMEOUT_SECONDS": bad,
     }
-    with mock.patch.dict(os.environ, env):
-        with mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]):
-            with pytest.raises(SystemExit) as excinfo:
-                verify.main()
+    with (
+        mock.patch.dict(os.environ, env),
+        mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        verify.main()
     assert excinfo.value.code == 2
 
 
 def _run_list_kb_files(verify, monkeypatch, transport_side_effect):
     """Drive _list_kb_files with a fake transport; return (exit_code, stderr)."""
-    import io
     import contextlib
+    import io
 
     captured = io.StringIO()
     with mock.patch.object(verify, "_http_get", side_effect=transport_side_effect) if hasattr(verify, "_http_get") else contextlib.nullcontext():
         pass
     # The module uses urllib.request.urlopen directly; stub it.
-    with mock.patch.object(verify.urllib.request, "urlopen", side_effect=transport_side_effect):
-        with contextlib.redirect_stderr(captured):
-            try:
-                verify._list_kb_files("http://openwebui", "key", "kb1", timeout=30.0)
-                code = 0
-            except SystemExit as exc:
-                code = exc.code
+    with (
+        mock.patch.object(verify.urllib.request, "urlopen", side_effect=transport_side_effect),
+        contextlib.redirect_stderr(captured),
+    ):
+        try:
+            verify._list_kb_files("http://openwebui", "key", "kb1", timeout=30.0)
+            code = 0
+        except SystemExit as exc:
+            code = exc.code
     return code, captured.getvalue()
 
 
@@ -126,10 +131,12 @@ def test_schemeless_openwebui_url_exits_2(verify, denylist, bad_url):
         "OPEN_WEBUI_URL": bad_url,
         "OPEN_WEBUI_API_KEY": "k",
     }
-    with mock.patch.dict(os.environ, env):
-        with mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]):
-            with pytest.raises(SystemExit) as excinfo:
-                verify.main()
+    with (
+        mock.patch.dict(os.environ, env),
+        mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        verify.main()
     assert excinfo.value.code == 2
 
 
@@ -150,11 +157,13 @@ def test_timeout_valid_value_accepted(verify, denylist):
         "OPEN_WEBUI_API_KEY": "k",
         "VERIFY_TIMEOUT_SECONDS": "30",
     }
-    with mock.patch.dict(os.environ, env):
-        with mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]):
-            with mock.patch.object(verify.urllib.request, "urlopen", _boom):
-                with pytest.raises(SystemExit) as excinfo:
-                    verify.main()
+    with (
+        mock.patch.dict(os.environ, env),
+        mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]),
+        mock.patch.object(verify.urllib.request, "urlopen", _boom),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        verify.main()
     assert excinfo.value.code == 2
     # main() reached transport with the parsed timeout: config was accepted.
     assert captured["timeout"] == 30.0
@@ -191,17 +200,17 @@ def _run_main_with_kb(verify, denylist, monkeypatch, body: bytes):
         "VERIFY_TIMEOUT_SECONDS": "30",
     }
     captured = io.StringIO()
-    with mock.patch.dict(os.environ, env):
-        with mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]):
-            with mock.patch.object(
-                verify.urllib.request, "urlopen", lambda *a, **k: _FakeResponse(body)
-            ):
-                with contextlib.redirect_stdout(captured):
-                    try:
-                        verify.main()
-                        code = 0
-                    except SystemExit as exc:
-                        code = exc.code
+    with (
+        mock.patch.dict(os.environ, env),
+        mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]),
+        mock.patch.object(verify.urllib.request, "urlopen", lambda *a, **k: _FakeResponse(body)),
+        contextlib.redirect_stdout(captured),
+    ):
+        try:
+            verify.main()
+            code = 0
+        except SystemExit as exc:
+            code = exc.code
     return code, captured.getvalue()
 
 
@@ -279,15 +288,18 @@ def _run_main_with_kb_pages(verify, denylist, monkeypatch, pages: list[bytes]):
     captured = io.StringIO()
     try:
         err = io.StringIO()
-        with mock.patch.dict(os.environ, env):
-            with mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]):
-                with mock.patch.object(verify.urllib.request, "urlopen", _fake_urlopen):
-                    with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(err):
-                        try:
-                            verify.main()
-                            code = 0
-                        except SystemExit as exc:
-                            code = exc.code
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch.object(verify.sys, "argv", ["prog", "kb1", str(denylist)]),
+            mock.patch.object(verify.urllib.request, "urlopen", _fake_urlopen),
+            contextlib.redirect_stdout(captured),
+            contextlib.redirect_stderr(err),
+        ):
+            try:
+                verify.main()
+                code = 0
+            except SystemExit as exc:
+                code = exc.code
         return code, captured.getvalue() + err.getvalue()
     finally:
         captured.close()
@@ -412,3 +424,134 @@ def test_non_dict_entry_refuses_clean_exits_2(verify, denylist, monkeypatch):
     assert code == 2
     assert "VERDICT: CLEAN" not in out
     assert "not a JSON object" in out
+
+
+def _named_items(*names):
+    """KB file items whose meta.name is each given filename (ids f0..fN)."""
+    return [{"id": f"f{i}", "meta": {"name": name}} for i, name in enumerate(names)]
+
+
+@pytest.mark.parametrize("bad_total", [True, False])
+def test_boolean_total_exits_2(verify, monkeypatch, bad_total):
+    """F10 (issue #46): bool is a subclass of int, so total=true/false used
+    to pass the isinstance(total, int) guard — True even counted as 1 and
+    could support a vacuous CLEAN. A boolean total is malformed data and
+    must fail closed through the malformed-total error path."""
+    import json
+
+    body = json.dumps(
+        {"items": [{"id": "f1", "meta": {"name": "1001-order.md"}}], "total": bad_total}
+    ).encode()
+    code, err = _run_list_kb_files(verify, monkeypatch, lambda *a, **k: _FakeResponse(body))
+    assert code == 2
+    assert "total' missing/invalid" in err
+
+
+def test_valid_int_total_proceeds(verify, monkeypatch):
+    """F10 (issue #46) counterpart: a genuine int total passes the
+    malformed-total guard and the complete listing is returned (no
+    SystemExit), so verification proceeds."""
+    import json
+
+    body = json.dumps(
+        {"items": [{"id": "f1", "meta": {"name": "1001-order.md"}}], "total": 1}
+    ).encode()
+    code, _err = _run_list_kb_files(verify, monkeypatch, lambda *a, **k: _FakeResponse(body))
+    assert code == 0
+
+
+def test_leaked_files_exact_md_match(verify):
+    """F11 (issue #46): "<id>.md" is the exact-match leak form."""
+    leaked, unmatchable = verify._leaked_files({"45748"}, _named_items("45748.md"))
+    assert leaked == {"45748": ["45748.md"]}
+    assert unmatchable == []
+
+
+def test_leaked_files_dash_prefix_matches(verify):
+    """F11 (issue #46): "<id>-" prefixes leak, including the attachment
+    upload form <id>-<hash>-<name> with further dashes; leaked filenames
+    keep item order."""
+    items = _named_items("45748-attachment.txt", "45748-deadbeef-report.pdf")
+    leaked, unmatchable = verify._leaked_files({"45748"}, items)
+    assert leaked == {"45748": ["45748-attachment.txt", "45748-deadbeef-report.pdf"]}
+    assert unmatchable == []
+
+
+def test_leaked_files_bare_id_does_not_leak(verify):
+    """F11 (issue #46): a bare "45748" is neither "<id>.md" nor "<id>-...";
+    the dash separator is what binds the numeric prefix."""
+    leaked, unmatchable = verify._leaked_files({"45748"}, _named_items("45748"))
+    assert leaked == {}
+    assert unmatchable == []
+
+
+def test_leaked_files_leading_zero_does_not_leak(verify):
+    """F11 (issue #46): matching is string-based; int() semantics would
+    erase the leading zero and falsely leak "045748.md" for denied 45748."""
+    leaked, _ = verify._leaked_files({"45748"}, _named_items("045748.md", "045748-x.txt"))
+    assert leaked == {}
+
+
+def test_leaked_files_digit_prefix_without_dash_does_not_leak(verify):
+    """F11 (issue #46): "4574.md", "457480.md", and "457480-att.txt" share
+    digits with 45748 but are different ids; without the exact "<id>.md" or
+    "<id>-" match there is no leak."""
+    items = _named_items("4574.md", "457480.md", "457480-att.txt")
+    leaked, _ = verify._leaked_files({"45748"}, items)
+    assert leaked == {}
+
+
+def test_leaked_files_multiple_denied_ids(verify):
+    """F11 (issue #46): every denied id is matched in a single pass per
+    filename; each leaked filename is filed under its own ticket id."""
+    items = _named_items("888.md", "45748.md", "999-att.png", "1001-order.md")
+    leaked, unmatchable = verify._leaked_files({"45748", "999", "888"}, items)
+    assert leaked == {"888": ["888.md"], "45748": ["45748.md"], "999": ["999-att.png"]}
+    assert unmatchable == []
+
+
+def test_leaked_files_empty_denied_set_leaks_nothing(verify):
+    """F11 (issue #46): with nothing denied, no filename leaks and
+    matchable items are not reported unmatchable."""
+    items = _named_items("45748.md", "45748-x.txt")
+    leaked, unmatchable = verify._leaked_files(set(), items)
+    assert leaked == {}
+    assert unmatchable == []
+
+
+def test_leaked_files_empty_filename_is_unmatchable(verify):
+    """F11 (issue #46): items with no resolvable filename cannot be matched;
+    they are reported unmatchable by id (or "<no id>") and never leak."""
+    items = [{"id": "f1", "hash": "abc"}, {"id": None, "hash": "abc"}]
+    leaked, unmatchable = verify._leaked_files({"45748"}, items)
+    assert leaked == {}
+    assert unmatchable == ["f1", "<no id>"]
+
+
+def test_leaked_files_int_denied_ids_canonicalized_to_strings(verify):
+    """F11 (issue #46): denied ids are canonicalized to strings up front, so
+    integer ids (if ever passed) match exactly like their string forms."""
+    leaked, _ = verify._leaked_files({45748}, _named_items("45748.md"))
+    assert leaked == {"45748": ["45748.md"]}
+
+
+def test_leaked_ticket_ids_sorted_numerically(verify, tmp_path, monkeypatch):
+    """F12 (issue #46): the leaked report orders ticket ids numerically
+    (2 before 10), which key=int preserves from the former lambda."""
+    import json
+
+    deny = tmp_path / "deny.txt"
+    deny.write_text("2\n10\n")
+    body = json.dumps(
+        {
+            "items": [
+                {"id": "f1", "meta": {"name": "10.md"}},
+                {"id": "f2", "meta": {"name": "2.md"}},
+            ],
+            "total": 2,
+        }
+    ).encode()
+    code, out = _run_main_with_kb(verify, deny, monkeypatch, body)
+    assert code == 1
+    assert "VERDICT: LEAKED" in out
+    assert out.index("ticket 2:") < out.index("ticket 10:")
