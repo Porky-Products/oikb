@@ -51,14 +51,6 @@ class OutlineConnector(BaseConnector):
 
         while True:
             pages += 1
-            # One request beyond the page budget lets a listing whose length is
-            # an exact multiple of the page size confirm completion with an
-            # empty page; anything longer still aborts.
-            if pages > _MAX_PAGES + 1:
-                raise ValueError(
-                    f"Outline documents.list exceeded {_MAX_PAGES} pages without completing; "
-                    "aborting to avoid an endless pagination loop"
-                )
             # Use 'offset' instead of 'page' as per the API spec
             params: dict = {
                 "offset": offset,
@@ -75,6 +67,18 @@ class OutlineConnector(BaseConnector):
 
             if not docs:
                 break
+
+            if pages > _MAX_PAGES:
+                # The one request beyond the page budget exists only so a
+                # listing whose length is an exact multiple of the page size
+                # can confirm completion with an EMPTY page (handled above).
+                # A non-empty page past the budget means the listing exceeds
+                # the cap: abort rather than process it and return an
+                # over-budget manifest as if complete.
+                raise ValueError(
+                    f"Outline documents.list exceeded {_MAX_PAGES} pages without completing; "
+                    "aborting to avoid an endless pagination loop"
+                )
 
             added = 0
             for doc in docs:
