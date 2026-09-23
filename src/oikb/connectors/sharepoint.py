@@ -19,7 +19,6 @@ one of:
 from __future__ import annotations
 
 import base64
-import hashlib
 import os
 import time
 import uuid
@@ -52,9 +51,17 @@ def _encode_drive_path(path: str) -> str:
     return quote(path, safe="/")
 
 
+# Download hosts for every supported cloud (see _CLOUD_ENDPOINTS):
+#   commercial — *.sharepoint.com / graph.microsoft.com
+#   gcc_high    — *.sharepoint.us / graph.microsoft.us
+#   dod         — *.sharepoint-mil.us / dod-graph.microsoft.us
 _ALLOWED_SHAREPOINT_DOWNLOAD_HOSTS = (
     "graph.microsoft.com",
+    "graph.microsoft.us",
+    "dod-graph.microsoft.us",
     "sharepoint.com",
+    "sharepoint.us",
+    "sharepoint-mil.us",
     "sharepoint-df.com",
     "sharepointonline.com",
 )
@@ -82,13 +89,13 @@ class SharePointConnector(BaseConnector):
     def __init__(
         self,
         site: str,
-        site_path: str = "",
         library: str = "Documents",
         tenant_id: str | None = None,
         client_id: str | None = None,
         client_secret: str | None = None,
         certificate_path: str | None = None,
         certificate_password: str | None = None,
+        site_path: str = "",
         cloud: str | None = None,
     ):
         self.site = site
@@ -195,21 +202,23 @@ class SharePointConnector(BaseConnector):
             payload = response.json()
 
             if not isinstance(payload, dict):
-                raise ValueError(
+                # ValueError (not TypeError): cli.py catches ValueError around
+                # connector construction to render a clean error message.
+                raise ValueError(  # noqa: TRY004
                     "Microsoft Graph collection response was not an object for "
                     f"{next_url}"
                 )
 
             values = payload.get("value")
             if not isinstance(values, list):
-                raise ValueError(
+                raise ValueError(  # noqa: TRY004
                     "Microsoft Graph collection response contained a non-list "
                     f"value for {next_url}"
                 )
 
             for item in values:
                 if not isinstance(item, dict):
-                    raise ValueError(
+                    raise ValueError(  # noqa: TRY004
                         "Microsoft Graph collection response contained a "
                         f"non-object item for {next_url}"
                     )
