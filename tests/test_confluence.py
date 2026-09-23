@@ -49,13 +49,10 @@ def test_resolves_space_key_to_id() -> None:
         "https://test.atlassian.net/wiki/api/v2/spaces/123456789/pages"
     ).mock(return_value=httpx.Response(200, json={"results": []}))
 
-    connector = ConfluenceConnector(
+    with ConfluenceConnector(
         space_key="ABC", base_url="https://test.atlassian.net", token="token"
-    )
-    try:
+    ) as connector:
         assert connector.build_manifest() == []
-    finally:
-        connector.close()
 
     assert lookup.calls[0].request.url.params["keys"] == "ABC"
     assert pages.called
@@ -103,16 +100,13 @@ def test_manifest_in_both_modes(structure: str, expected: list[str]) -> None:
         "https://test.atlassian.net/wiki/api/v2/spaces/123456789/pages"
     ).mock(return_value=httpx.Response(200, json={"results": _pages()}))
 
-    connector = ConfluenceConnector(
+    with ConfluenceConnector(
         space_key="123456789",
         base_url="https://test.atlassian.net",
         token="token",
         structure=structure,
-    )
-    try:
+    ) as connector:
         manifest = connector.build_manifest()
-    finally:
-        connector.close()
 
     assert [entry.display_path for entry in manifest] == expected
 
@@ -128,13 +122,12 @@ def test_hierarchical_paths_work_with_filter_and_read_file() -> None:
         )
     )
 
-    connector = ConfluenceConnector(
+    with ConfluenceConnector(
         space_key="123456789",
         base_url="https://test.atlassian.net",
         token="token",
         structure="hierarchical",
-    )
-    try:
+    ) as connector:
         manifest = connector.build_manifest()
         selected = build_manifest_filter(include=["FAQ*"])(manifest)
         assert [entry.display_path for entry in selected] == [
@@ -142,8 +135,6 @@ def test_hierarchical_paths_work_with_filter_and_read_file() -> None:
             "FAQ/Benefits.txt",
         ]
         assert connector.read_file("FAQ", "Benefits.txt") == b"Benefits"
-    finally:
-        connector.close()
 
     assert content.called
 
@@ -157,17 +148,13 @@ def test_hierarchical_mode_disambiguates_duplicate_paths() -> None:
     respx.get(
         "https://test.atlassian.net/wiki/api/v2/spaces/123456789/pages"
     ).mock(return_value=httpx.Response(200, json={"results": pages}))
-    connector = ConfluenceConnector(
+    with ConfluenceConnector(
         space_key="123456789",
         base_url="https://test.atlassian.net",
         token="token",
         structure="hierarchical",
-    )
-
-    try:
+    ) as connector:
         assert [e.display_path for e in connector.build_manifest()] == ["FAQ_1.txt", "FAQ_2.txt"]
-    finally:
-        connector.close()
 
 
 @respx.mock
@@ -175,18 +162,14 @@ def test_manifest_can_be_built_repeatedly() -> None:
     respx.get(
         "https://test.atlassian.net/wiki/api/v2/spaces/123456789/pages"
     ).mock(return_value=httpx.Response(200, json={"results": _pages()}))
-    connector = ConfluenceConnector(
+    with ConfluenceConnector(
         space_key="123456789",
         base_url="https://test.atlassian.net",
         token="token",
         structure="hierarchical",
-    )
-
-    try:
+    ) as connector:
         first = connector.build_manifest()
         second = connector.build_manifest()
-    finally:
-        connector.close()
 
     assert first == second
 
@@ -262,9 +245,11 @@ def test_invalid_pagination_fails_instead_of_returning_partial_manifest(next_lin
     respx.get("https://wiki.example/rest/api/content").respond(200, json={
         "results": [{"id": "1", "title": "One"}], "_links": {"next": next_link},
     })
-    with ConfluenceConnector("ENG", base_url="https://wiki.example", token="pat", api_version="v1") as connector:
-        with pytest.raises(ValueError, match="pagination"):
-            connector.build_manifest()
+    with (
+        ConfluenceConnector("ENG", base_url="https://wiki.example", token="pat", api_version="v1") as connector,
+        pytest.raises(ValueError, match="pagination"),
+    ):
+        connector.build_manifest()
 
 
 @respx.mock
