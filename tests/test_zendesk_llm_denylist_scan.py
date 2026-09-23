@@ -31,6 +31,14 @@ PR #45 review findings (issue #46):
   backoff and abort via LLMRequestError after max retries
 - boolean/float ticket_id echoes degrade to unsure, never allow
 - a damaged stored stop_id (non-integer) dies with a --reset pointer
+
+PR #47 review findings:
+- a 200 whose body is not a JSON object (show_many tickets/users, single
+  ticket fetch) aborts the run instead of tracebacking with AttributeError
+- boolean ids in show_many responses no longer alias ticket/user 1
+  (bool is an int subclass; True == 1 and hash(True) == hash(1))
+- a state file holding valid-but-non-object JSON dies with a --reset
+  pointer instead of tracebacking on the first state.get(...)
 """
 
 from __future__ import annotations
@@ -1090,3 +1098,108 @@ def test_resume_changed_stop_id_dies(scan, tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "LLM_SCAN_STOP_TICKET_ID changed" in err
     assert "--reset" in err
+
+
+# ---------------------------------------------------------------------------
+# PR #47 Copilot review findings
+# ---------------------------------------------------------------------------
+
+
+def test_show_many_tickets_non_object_payload_raises(scan):
+    """PR #47: a show_many 200 whose body is not a JSON object must abort
+    the run (RuntimeError reaches main's state-saving handler), not
+    traceback with AttributeError on (payload or {}).get."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for bad in (None, ["not", "a", "dict"], "oops"):
+            monkey.setattr(scan_type, "_get", lambda self, path, p=bad: (200, p, b"raw"))
+            with pytest.raises(RuntimeError, match="non-object payload"):
+                client.show_many_tickets([1, 2])
+    finally:
+        monkey.undo()
+
+
+def test_fetch_ticket_non_object_payload_raises(scan):
+    """PR #47: a ticket 200 whose body is not a JSON object must abort the
+    run, not traceback with AttributeError. None stays reserved for 404."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for bad in (None, ["not", "a", "dict"], "oops"):
+            monkey.setattr(scan_type, "_get", lambda self, path, p=bad: (200, p, b"raw"))
+            with pytest.raises(RuntimeError, match="non-object payload"):
+                client.fetch_ticket(1)
+        monkey.setattr(scan_type, "_get", lambda self, path: (404, {}, b"{}"))
+        assert client.fetch_ticket(1) is None
+    finally:
+        monkey.undo()
+
+
+def test_show_many_users_non_object_payload_raises(scan):
+    """PR #47: a users show_many 200 whose body is not a JSON object must
+    abort the run, not traceback with AttributeError."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for bad in (None, ["not", "a", "dict"], "oops"):
+            monkey.setattr(scan_type, "_get", lambda self, path, p=bad: (200, p, b"raw"))
+            with pytest.raises(RuntimeError, match="non-object payload"):
+                client.show_many_users([1, 2])
+    finally:
+        monkey.undo()
+
+
+def test_show_many_tickets_boolean_id_does_not_alias_ticket_one(scan):
+    """PR #47: bool is an int subclass, so a JSON `true` ticket id used to
+    be stored as out[True] — aliasing ticket 1 and attaching another
+    ticket's data to ID 1. It must be skipped; the single-fetch cross-check
+    covers IDs that show_many omits."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        page = {"tickets": [{"id": True, "subject": "boolean id"}]}
+        monkey.setattr(scan_type, "_get", lambda self, path: (200, page, b"{}"))
+        assert client.show_many_tickets([1]) == {}
+    finally:
+        monkey.undo()
+
+
+def test_show_many_users_boolean_id_does_not_alias_user_one(scan):
+    """PR #47: same bool-id aliasing guard for users show_many."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        page = {"users": [{"id": True, "email": "bool@example.com"}]}
+        monkey.setattr(scan_type, "_get", lambda self, path: (200, page, b"{}"))
+        assert client.show_many_users([1]) == {}
+    finally:
+        monkey.undo()
+
+
+def test_load_state_non_object_json_dies(scan, tmp_path, capsys):
+    """PR #47: a state file holding valid-but-non-object JSON (list/string/
+    null) used to traceback with AttributeError on the first state.get(...);
+    it must die with the documented --reset remedy."""
+    for bad in ("[1, 2]", '"a string"', "null"):
+        (tmp_path / "state.json").write_text(bad)
+        with pytest.raises(SystemExit) as excinfo:
+            scan._load_state(tmp_path / "state.json")
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "top-level JSON must be an object" in err
+        assert "--reset" in err
+
+
+def test_load_state_valid_object_round_trips(scan, tmp_path):
+    """PR #47 (behavior preservation): a well-formed object state file still
+    loads, and a missing file still means a fresh pass (None)."""
+    state = {"next_id": 3, "stop_id": 10}
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    assert scan._load_state(tmp_path / "state.json") == state
+    assert scan._load_state(tmp_path / "absent.json") is None
