@@ -152,8 +152,9 @@ class OikbClient:
         it raises.  The listing is complete-or-raise: a server that stops
         serving new files before ``total`` is reached, or that exhausts the
         page-safety cap, raises ``ValueError`` rather than returning a
-        partial list as if it were complete (#43/#46).  ``page_size`` is
-        passed as ``limit``, which the
+        partial list as if it were complete (#43/#46).  Entries must carry
+        non-empty string ids; duplicates are dropped within a page and
+        across pages.  ``page_size`` is passed as ``limit``, which the
         server only honors for admin keys — non-admin callers get the
         default 30-item page size and the loop simply takes more iterations.
         """
@@ -221,12 +222,22 @@ class OikbClient:
                         f"Malformed KB file listing for {kb_id}: entry must be a JSON object, got {type(f).__name__}"
                     )
                 fid = f.get("id")
-                # Items without an id are kept as-is (not deduped);
-                # duplicates are dropped within a page and across pages.
-                if fid is None or fid not in seen_ids:
+                # Every entry must carry a usable string id: an id-less
+                # entry cannot be deduped yet still counts toward
+                # ``total``, so duplicates of it can satisfy
+                # ``len(files) >= total`` and return a partial listing as
+                # complete; a non-string id breaks the set[str] dedup
+                # contract (and an unhashable one would raise an
+                # incidental TypeError instead of the documented
+                # ValueError).
+                if not isinstance(fid, str) or not fid:
+                    raise ValueError(
+                        f"Malformed KB file listing for {kb_id}: entry id must be a non-empty string, got {fid!r}"
+                    )
+                # Duplicates are dropped within a page and across pages.
+                if fid not in seen_ids:
                     new_items.append(f)
-                    if fid is not None:
-                        seen_ids.add(fid)
+                    seen_ids.add(fid)
             files.extend(new_items)
             if reported_total is None:
                 if not new_items:

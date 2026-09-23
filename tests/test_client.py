@@ -270,3 +270,25 @@ def test_total_first_reported_late_is_adopted() -> None:
         result = client.list_kb_files("kb1")
     assert [f["id"] for f in result] == ["f1", "f2"]
     assert route.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"hash": "h"},  # id key absent
+        {"hash": "h", "id": None},  # explicit JSON null
+        {"hash": "h", "id": ""},  # empty string
+        {"hash": "h", "id": 7},  # non-string
+        {"hash": "h", "id": True},  # bool is not a string
+        {"hash": "h", "id": ["x"]},  # unhashable: used to raise TypeError
+    ],
+)
+@respx.mock
+def test_unusable_entry_id_raises(entry: dict[str, Any]) -> None:
+    # An id-less entry cannot be deduped yet still counts toward total, so
+    # duplicates of it can satisfy len(files) >= total and return a
+    # partial listing as complete; a non-string id breaks the set[str]
+    # dedup contract (an unhashable one raised an incidental TypeError).
+    respx.get(_FILES_URL).mock(return_value=_page([entry], total=1))
+    with _client() as client, pytest.raises(ValueError, match="entry id"):
+        client.list_kb_files("kb1")
