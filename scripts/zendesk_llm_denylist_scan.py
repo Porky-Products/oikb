@@ -279,10 +279,25 @@ class ZendeskClient:
         status, payload, _ = self._get(f"/tickets/show_many.json?{qs}")
         if status != 200:
             raise RuntimeError(f"Zendesk show_many HTTP {status} for {len(ids)} ids")
+        if not isinstance(payload, dict):
+            # A 200 whose body is not a JSON object is malformed Zendesk
+            # data: (payload or {}).get would traceback with AttributeError,
+            # bypassing main's state-saving handler. Abort the run instead
+            # (state resumes at the batch boundary).
+            raise RuntimeError(  # noqa: TRY004 -- fail-closed abort needs RuntimeError; TypeError would bypass main's state-saving handler
+                f"Zendesk show_many HTTP 200 for {len(ids)} ids carried a non-object payload"
+            )
         out: dict[int, dict[str, Any]] = {}
-        for ticket in (payload or {}).get("tickets") or []:
-            if isinstance(ticket, dict) and isinstance(ticket.get("id"), int):
-                out[ticket["id"]] = ticket
+        for ticket in payload.get("tickets") or []:
+            if not isinstance(ticket, dict):
+                continue
+            tid = ticket.get("id")
+            # bool is an int subclass: a JSON `true` id would alias ticket 1
+            # (True == 1 and hash(True) == hash(1)), attaching another
+            # ticket's data to ID 1. Skip it; the single-fetch cross-check
+            # handles IDs that show_many omits.
+            if isinstance(tid, int) and not isinstance(tid, bool):
+                out[tid] = ticket
         return out
 
     def fetch_ticket(self, ticket_id: int) -> dict[str, Any] | None:
@@ -301,7 +316,15 @@ class ZendeskClient:
             return None
         if status != 200:
             raise RuntimeError(f"Zendesk ticket HTTP {status} for ticket {ticket_id}")
-        ticket = (payload or {}).get("ticket")
+        if not isinstance(payload, dict):
+            # A 200 whose body is not a JSON object is malformed Zendesk
+            # data: (payload or {}).get would traceback with AttributeError,
+            # bypassing main's state-saving handler. Abort the run instead
+            # (state resumes at the batch boundary).
+            raise RuntimeError(  # noqa: TRY004 -- fail-closed abort needs RuntimeError; TypeError would bypass main's state-saving handler
+                f"Zendesk ticket HTTP 200 for ticket {ticket_id} carried a non-object payload"
+            )
+        ticket = payload.get("ticket")
         if not isinstance(ticket, dict):
             # None is reserved for 404 (deleted/never-existed). A 200 whose
             # body lacks a ticket object is malformed Zendesk data: treating
@@ -376,10 +399,23 @@ class ZendeskClient:
         status, payload, _ = self._get(f"/users/show_many.json?{qs}")
         if status != 200:
             raise RuntimeError(f"Zendesk users show_many HTTP {status}")
+        if not isinstance(payload, dict):
+            # A 200 whose body is not a JSON object is malformed Zendesk
+            # data: (payload or {}).get would traceback with AttributeError,
+            # bypassing main's state-saving handler. Abort the run instead
+            # (state resumes at the batch boundary).
+            raise RuntimeError(  # noqa: TRY004 -- fail-closed abort needs RuntimeError; TypeError would bypass main's state-saving handler
+                "Zendesk users show_many HTTP 200 carried a non-object payload"
+            )
         out: dict[int, dict[str, Any]] = {}
-        for user in (payload or {}).get("users") or []:
-            if isinstance(user, dict) and isinstance(user.get("id"), int):
-                out[user["id"]] = user
+        for user in payload.get("users") or []:
+            if not isinstance(user, dict):
+                continue
+            uid = user.get("id")
+            # bool is an int subclass: a JSON `true` id would alias user 1
+            # (True == 1 and hash(True) == hash(1)). Skip it.
+            if isinstance(uid, int) and not isinstance(uid, bool):
+                out[uid] = user
         return out
 
 
@@ -632,11 +668,20 @@ def _append_review(path: Path, ticket_id: int, reason: str, reviewed: set[int]) 
 def _load_state(state_path: Path) -> dict[str, Any] | None:
     if not state_path.exists():
         return None
+    state: Any = None
     try:
-        return json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(state_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         _die(f"state file corrupt ({state_path}): {exc}; fix or delete it to restart from ID 1")
-    return None
+    if not isinstance(state, dict):
+        # Valid JSON that is not an object (list/string/number/null) would
+        # traceback on the first state.get(...) instead of dying with the
+        # documented --reset remedy.
+        _die(
+            f"state file corrupt ({state_path}): top-level JSON must be an object; "
+            "use --reset to restart from ID 1"
+        )
+    return state
 
 
 def _save_state(state_path: Path, state: dict[str, Any]) -> None:
