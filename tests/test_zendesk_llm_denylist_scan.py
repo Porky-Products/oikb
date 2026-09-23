@@ -1203,3 +1203,33 @@ def test_load_state_valid_object_round_trips(scan, tmp_path):
     (tmp_path / "state.json").write_text(json.dumps(state))
     assert scan._load_state(tmp_path / "state.json") == state
     assert scan._load_state(tmp_path / "absent.json") is None
+
+def test_load_state_non_object_json_reset_returns_none(scan, tmp_path):
+    """Review loop R1: --reset is the documented remedy for a non-object
+    state file, so _load_state must treat the damaged file as absent when
+    reset is requested instead of dying before main()'s reset block runs."""
+    for bad in ("[1, 2]", '"a string"', "null"):
+        (tmp_path / "state.json").write_text(bad)
+        assert scan._load_state(tmp_path / "state.json", reset_requested=True) is None
+
+
+def test_reset_recovers_from_non_object_state(scan, tmp_path, monkeypatch, capsys):
+    """Review loop R1 (end to end): running with --reset against a state
+    file holding valid-but-non-object JSON must unlink it and restart from
+    ID 1 rather than aborting in _load_state with the same error."""
+    (tmp_path / "state.json").write_text("[1, 2]")
+    _run_scan(
+        tmp_path,
+        monkeypatch,
+        scan,
+        stop_id="1",
+        llm=FakeLLMClient(responses=[]),
+        zendesk=FakeZendeskClient(tickets={}, comments={}),
+        reset=True,
+    )
+    out = capsys.readouterr().out
+    assert "--reset: restarting from ID 1" in out
+    assert "top-level JSON must be an object" not in out
+    # The damaged state file was replaced by the fresh pass's completion state.
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["next_id"] == 2
