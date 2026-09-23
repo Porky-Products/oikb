@@ -9,6 +9,12 @@ import httpx
 
 from oikb.connectors import BaseConnector, ManifestEntry
 
+# documents.list serves at most 100 documents per request, so 100 pages bounds
+# a sync at 10,000 documents. A server that keeps returning full pages of new
+# documents forever is pathological -- fail closed instead of looping endlessly
+# (mirrors the zendesktickets _MAX_COMMENT_PAGES guard).
+_MAX_PAGES = 100
+
 
 class OutlineConnector(BaseConnector):
     """Sync documents from Outline."""
@@ -38,10 +44,18 @@ class OutlineConnector(BaseConnector):
                 collection_id = col["id"]
 
         entries: list[ManifestEntry] = []
+        seen: set[str] = set()
         offset = 0
         limit = 100  # The maximum allowed by the server per request
+        pages = 0
 
         while True:
+            pages += 1
+            if pages > _MAX_PAGES:
+                raise ValueError(
+                    f"Outline documents.list exceeded {_MAX_PAGES} pages without completing; "
+                    "aborting to avoid an endless pagination loop"
+                )
             # Use 'offset' instead of 'page' as per the API spec
             params: dict = {
                 "offset": offset,
@@ -59,14 +73,30 @@ class OutlineConnector(BaseConnector):
             if not docs:
                 break
 
+            added = 0
             for doc in docs:
+                doc_id = doc.get("id")
+                if not doc_id:
+                    # Fail closed: without an id the file can neither be named
+                    # nor deduplicated, and silently skipping would hide content.
+                    raise ValueError(f"Outline document is missing an id: {doc.get('title', 'untitled')!r}")
+                if doc_id in seen:
+                    continue
+                seen.add(doc_id)
                 title = doc.get("title", "untitled")
                 text = doc.get("text", "")
                 content = f"# {title}\n\n{text}"
-                filename = f"{doc['id']}.md"
+                filename = f"{doc_id}.md"
                 checksum = hashlib.sha256(content.encode()).hexdigest()[:16]
                 entries.append(ManifestEntry(filename=filename, path="", checksum=checksum, size=len(content.encode())))
                 self._cache[filename] = content
+                added += 1
+
+            if not added:
+                raise ValueError(
+                    f"Outline pagination made no progress at offset {offset}: "
+                    "the page returned only already-seen documents"
+                )
 
             # If we received fewer than the limit, we've reached the end of the list
             if len(docs) < limit:
