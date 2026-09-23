@@ -463,6 +463,8 @@ def _run_sync_inner(
                     if isinstance(payload, dict) and payload.get("detail"):
                         detail = str(payload["detail"])
                 except ValueError:
+                    # Non-JSON error bodies are expected (plain-text or HTML
+                    # gateway errors); deliberately fall back to response.text.
                     pass
                 last_err = RuntimeError(f"{e} — {detail}") if detail else e
                 break
