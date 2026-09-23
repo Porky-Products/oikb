@@ -287,8 +287,21 @@ class ZendeskClient:
             raise RuntimeError(  # noqa: TRY004 -- fail-closed abort needs RuntimeError; TypeError would bypass main's state-saving handler
                 f"Zendesk show_many HTTP 200 for {len(ids)} ids carried a non-object payload"
             )
+        tickets = payload.get("tickets")
+        if tickets is None:
+            # Missing/null `tickets` is the documented empty-batch shape.
+            tickets = []
+        elif not isinstance(tickets, list):
+            # A present non-list `tickets` (e.g. JSON true) is malformed
+            # Zendesk data: iterating it would raise an uncaught TypeError
+            # that bypasses main's state-saving handler, or (string/dict)
+            # silently yield a non-dict "batch" treated as empty. Abort
+            # the run instead (state resumes at the batch boundary).
+            raise RuntimeError(
+                f"Zendesk show_many HTTP 200 for {len(ids)} ids carried a non-list 'tickets' field: {type(tickets).__name__}"
+            )
         out: dict[int, dict[str, Any]] = {}
-        for ticket in payload.get("tickets") or []:
+        for ticket in tickets:
             if not isinstance(ticket, dict):
                 continue
             tid = ticket.get("id")
@@ -407,8 +420,20 @@ class ZendeskClient:
             raise RuntimeError(  # noqa: TRY004 -- fail-closed abort needs RuntimeError; TypeError would bypass main's state-saving handler
                 "Zendesk users show_many HTTP 200 carried a non-object payload"
             )
+        users = payload.get("users")
+        if users is None:
+            # Missing/null `users` is the documented empty-batch shape.
+            users = []
+        elif not isinstance(users, list):
+            # Same fail-closed guard as show_many_tickets: a present
+            # non-list `users` would raise an uncaught TypeError that
+            # bypasses main's state-saving handler, or silently count as
+            # an empty batch.
+            raise RuntimeError(
+                f"Zendesk users show_many HTTP 200 carried a non-list 'users' field: {type(users).__name__}"
+            )
         out: dict[int, dict[str, Any]] = {}
-        for user in payload.get("users") or []:
+        for user in users:
             if not isinstance(user, dict):
                 continue
             uid = user.get("id")

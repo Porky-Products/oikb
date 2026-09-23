@@ -1182,6 +1182,69 @@ def test_show_many_users_boolean_id_does_not_alias_user_one(scan):
         monkey.undo()
 
 
+def test_show_many_tickets_non_list_tickets_field_raises(scan):
+    """PR #47 follow-up: a 200 whose `tickets` field is present but not a
+    list (e.g. JSON true) used to raise an uncaught TypeError at the loop,
+    bypassing main's state-saving handler; strings/dicts silently counted
+    as an empty batch. A present non-list must abort the run."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for bad in (True, 5, "abc", {"a": 1}):
+            monkey.setattr(
+                scan_type, "_get", lambda self, path, p=bad: (200, {"tickets": p}, b"raw")
+            )
+            with pytest.raises(RuntimeError, match="non-list 'tickets' field"):
+                client.show_many_tickets([1, 2])
+    finally:
+        monkey.undo()
+
+
+def test_show_many_tickets_missing_or_null_tickets_is_empty_batch(scan):
+    """Behavior preservation: missing/`null` `tickets` stays the documented
+    empty-batch shape."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for page in ({}, {"tickets": None}):
+            monkey.setattr(scan_type, "_get", lambda self, path, p=page: (200, p, b"raw"))
+            assert client.show_many_tickets([1, 2]) == {}
+    finally:
+        monkey.undo()
+
+
+def test_show_many_users_non_list_users_field_raises(scan):
+    """PR #47 follow-up: same fail-closed guard for the users field."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for bad in (True, 5, "abc", {"a": 1}):
+            monkey.setattr(
+                scan_type, "_get", lambda self, path, p=bad: (200, {"users": p}, b"raw")
+            )
+            with pytest.raises(RuntimeError, match="non-list 'users' field"):
+                client.show_many_users([1, 2])
+    finally:
+        monkey.undo()
+
+
+def test_show_many_users_missing_or_null_users_is_empty_batch(scan):
+    """Behavior preservation: missing/`null` `users` stays the documented
+    empty-batch shape."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for page in ({}, {"users": None}):
+            monkey.setattr(scan_type, "_get", lambda self, path, p=page: (200, p, b"raw"))
+            assert client.show_many_users([1, 2]) == {}
+    finally:
+        monkey.undo()
+
+
 def test_load_state_non_object_json_dies(scan, tmp_path, capsys):
     """PR #47: a state file holding valid-but-non-object JSON (list/string/
     null) used to traceback with AttributeError on the first state.get(...);
