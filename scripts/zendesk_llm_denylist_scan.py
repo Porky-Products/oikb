@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -97,7 +98,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -140,7 +141,7 @@ Rules for the verdict:
 - Do not report confidence or any other fields; the verdict is categorical."""
 
 
-def _die(message: str) -> "None":
+def _die(message: str) -> None:
     print(f"error: {message}", file=sys.stderr)
     sys.exit(1)
 
@@ -251,7 +252,7 @@ class ZendeskClient:
 
     def __init__(self, subdomain: str, user: str, token: str, timeout: float, max_retries: int):
         self._base = f"https://{subdomain}.zendesk.com/api/v2"
-        raw = f"{user}/token:{token}".encode("utf-8")
+        raw = f"{user}/token:{token}".encode()
         self._auth = "Basic " + base64.b64encode(raw).decode("ascii")
         self._timeout = timeout
         self._max_retries = max_retries
@@ -291,6 +292,9 @@ class ZendeskClient:
         zendesk_archive_smoke.py contract, omitted-but-single-fetchable is
         the archive-blindness signal, and such tickets must still be
         classified rather than silently consumed.
+
+        A 200 whose ticket object carries a different or missing id raises:
+        a verdict must never attach to the wrong ticket.
         """
         status, payload, _ = self._get(f"/tickets/{ticket_id}.json")
         if status == 404:
@@ -303,8 +307,20 @@ class ZendeskClient:
             # body lacks a ticket object is malformed Zendesk data: treating
             # it as "missing" would advance the cursor past an unclassified
             # ticket, so abort the run instead (state resumes at the batch).
-            raise RuntimeError(
+            raise RuntimeError(  # noqa: TRY004 -- fail-closed abort needs RuntimeError; TypeError would bypass main's state-saving handler
                 f"Zendesk ticket HTTP 200 for ticket {ticket_id} carried no ticket object"
+            )
+        got_id = ticket.get("id")
+        if not isinstance(got_id, int) or isinstance(got_id, bool) or got_id != ticket_id:
+            # A 200 serving a DIFFERENT ticket (mismatched, missing, or
+            # non-integer id; `True == 1` and `1.0 == 1` would pass a bare
+            # equality check) must not be classified under this ID: the
+            # verdict would attach to the wrong ticket while the cursor
+            # advanced past an unclassified one. Abort the run instead
+            # (state resumes at the batch boundary).
+            raise RuntimeError(
+                f"Zendesk ticket HTTP 200 for ticket {ticket_id} carried a ticket "
+                f"object with mismatched id {got_id!r}"
             )
         return ticket
 
@@ -320,15 +336,37 @@ class ZendeskClient:
         filenames / reply bodies are absent evidence. Either flag makes the
         caller force `unsure` (human review) rather than classify on partial
         evidence. Full traversal is tracked in issue #41.
+
+        A 200 whose body is not a JSON object carrying a comments list, or
+        whose entries are not objects, raises: coercing malformed data to an
+        empty list would present an empty COMPLETE comment set (absent
+        evidence) and could yield an automatic verdict.
         """
         status, payload, _ = self._get(f"/tickets/{ticket_id}/comments.json")
         if status == 404:
             return [], False, True
         if status != 200:
             raise RuntimeError(f"Zendesk comments HTTP {status} for ticket {ticket_id}")
-        comments = (payload or {}).get("comments") or []
-        more = bool((payload or {}).get("next_page"))
-        return [c for c in comments if isinstance(c, dict)], more, False
+        # A 200 whose body is not a JSON object carrying a comments list is
+        # malformed Zendesk data: coercing it to an empty list would present
+        # an empty COMPLETE comment set — absent evidence — and could yield
+        # an automatic verdict. Abort the run instead (state resumes at the
+        # batch boundary).
+        if not isinstance(payload, dict) or not isinstance(payload.get("comments"), list):
+            raise RuntimeError(  # noqa: TRY004 -- fail-closed abort needs RuntimeError; TypeError would bypass main's state-saving handler
+                f"Zendesk comments HTTP 200 for ticket {ticket_id} carried no comments list"
+            )
+        comments = payload["comments"]
+        for comment in comments:
+            if not isinstance(comment, dict):
+                # Same fail-closed rule one level down: a non-object entry
+                # is malformed data, not a silently-dropped comment.
+                raise RuntimeError(  # noqa: TRY004 -- fail-closed abort needs RuntimeError; TypeError would bypass main's state-saving handler
+                    f"Zendesk comments HTTP 200 for ticket {ticket_id} carried a "
+                    f"non-object comment entry ({comment!r})"
+                )
+        more = bool(payload.get("next_page"))
+        return comments, more, False
 
     def show_many_users(self, ids: list[int]) -> dict[int, dict[str, Any]]:
         ids = [i for i in ids if i]
@@ -381,7 +419,8 @@ class LLMClient:
         The trusted policy/format instructions travel as a system message and
         only the (untrusted) ticket data as the user message, so a ticket
         body cannot impersonate the classifier's instructions. Raises
-        RuntimeError on non-2xx after bounded retries (caller aborts).
+        LLMRequestError on non-2xx status or transport failure after
+        bounded retries (caller aborts).
         """
         request_body = json.dumps(
             {
@@ -407,9 +446,22 @@ class LLMClient:
         delay = 5.0
         last_error = ""
         for attempt in range(self._max_retries + 1):
-            status, payload, raw, _retry_after = _http_json(
-                self._url, method="POST", headers=headers, body=request_body, timeout=self._timeout
-            )
+            try:
+                status, payload, raw, _retry_after = _http_json(
+                    self._url, method="POST", headers=headers, body=request_body, timeout=self._timeout
+                )
+            except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+                # Transport failures (DNS, refused connection, socket
+                # timeout, mid-response reset) are as retryable as a 5xx:
+                # back off, retry, and abort via LLMRequestError once the
+                # budget is spent. Letting them escape the loop skipped the
+                # remaining retries.
+                last_error = f"transport error: {exc}"
+                if attempt == self._max_retries:
+                    break
+                time.sleep(delay)
+                delay = min(delay * 2, 60.0)
+                continue
             if 200 <= status < 300:
                 try:
                     choices = (payload or {}).get("choices") or []
@@ -446,10 +498,8 @@ def _parse_verdict(text: str, expected_ticket_id: int) -> tuple[str, str]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
         for fence in ("```json", "```"):
-            if cleaned.startswith(fence):
-                cleaned = cleaned[len(fence):]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[: -len("```")]
+            cleaned = cleaned.removeprefix(fence)
+        cleaned = cleaned.removesuffix("```")
         cleaned = cleaned.strip()
     try:
         parsed = json.loads(cleaned)
@@ -465,6 +515,11 @@ def _parse_verdict(text: str, expected_ticket_id: int) -> tuple[str, str]:
             # isdigit() passes absurdly long digit strings, but CPython's
             # int/str conversion limit (~4300 digits) still raises.
             return "unsure", f"ticket_id unparseable: {exc}"
+    if not isinstance(ticket_id, int) or isinstance(ticket_id, bool):
+        # `True == 1` and `1.0 == 1`, so a bare equality check would accept
+        # a boolean/float echo as ticket 1. Require a strict non-bool int;
+        # anything else degrades to unsure, never allow.
+        return "unsure", f"ticket_id is not an integer: {ticket_id!r}"
     if ticket_id != expected_ticket_id:
         return "unsure", f"ticket_id mismatch: got {ticket_id!r}, expected {expected_ticket_id}"
     verdict = str(parsed.get("verdict") or "").strip().lower()
@@ -569,7 +624,7 @@ def _append_dedup(path: Path, ticket_id: int, deny_ids: set[int]) -> None:
 def _append_review(path: Path, ticket_id: int, reason: str, reviewed: set[int]) -> None:
     if ticket_id in reviewed:
         return
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     _append_line(path, f"{ticket_id}  # unsure: {reason}  ({stamp})\n")
     reviewed.add(ticket_id)
 
@@ -588,7 +643,7 @@ def _save_state(state_path: Path, state: dict[str, Any]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_path.with_name(state_path.name + ".tmp")
     payload = dict(state)
-    payload["saved_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload["saved_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(tmp, state_path)
 
@@ -653,10 +708,20 @@ def main() -> None:
                 "list); use --reset to restart from ID 1, or keep the "
                 "policy unchanged across a full pass"
             )
-        if int(state.get("stop_id") or 0) != stop_id:
+        raw_stop_id = state.get("stop_id")
+        if not isinstance(raw_stop_id, int) or isinstance(raw_stop_id, bool):
+            # int() coercion used to traceback on strings ("abc") and
+            # silently truncate floats/bools (1.5 -> 1, True -> 1), which
+            # could resume a pass against a phantom bound. Damaged state
+            # must fail closed like the next_id guard below.
+            _die(
+                f"state file stop_id is not an integer: {raw_stop_id!r}; "
+                "use --reset to restart from ID 1"
+            )
+        if raw_stop_id != stop_id:
             _die(
                 "LLM_SCAN_STOP_TICKET_ID changed since the state file was written "
-                f"(state has {state.get('stop_id')!r}, env has {stop_id}); use --reset to accept the new bound"
+                f"(state has {raw_stop_id!r}, env has {stop_id}); use --reset to accept the new bound"
             )
     if state is not None and not reset_requested:
         # next_id must be a plausible integer cursor: the scanner only ever
@@ -825,7 +890,7 @@ def main() -> None:
                         users.update(zendesk.show_many_users([int(rid)]))
                 requester_email = str(users.get(ticket.get("requester_id"), {}).get("email") or "")
                 comments, comments_paginated, comments_unavailable = zendesk.fetch_ticket_comments(ticket_id)
-                block, attachment_names, desc_truncated, comments_truncated = _format_ticket_block(
+                block, _attachment_names, desc_truncated, comments_truncated = _format_ticket_block(
                     ticket, comments, requester_email, desc_cap, comments_cap
                 )
                 # Partial evidence — description cap hit, comment-bodies
