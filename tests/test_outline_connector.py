@@ -58,4 +58,22 @@ def test_page_cap_raises() -> None:
         pytest.raises(ValueError, match="pages without completing"),
     ):
         connector.build_manifest()
-    assert calls == _MAX_PAGES
+    assert calls == _MAX_PAGES + 1
+
+
+@respx.mock
+def test_exact_multiple_of_page_budget_completes() -> None:
+    calls = 0
+
+    def paged(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls <= _MAX_PAGES:
+            return httpx.Response(200, json={"data": _docs((calls - 1) * 100, 100)})
+        return httpx.Response(200, json={"data": []})
+
+    respx.post("https://outline.example/api/documents.list").mock(side_effect=paged)
+    with OutlineConnector(token="token", base_url="https://outline.example") as connector:
+        manifest = connector.build_manifest()
+    assert len(manifest) == _MAX_PAGES * 100
+    assert calls == _MAX_PAGES + 1

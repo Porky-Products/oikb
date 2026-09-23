@@ -51,7 +51,10 @@ class OutlineConnector(BaseConnector):
 
         while True:
             pages += 1
-            if pages > _MAX_PAGES:
+            # One request beyond the page budget lets a listing whose length is
+            # an exact multiple of the page size confirm completion with an
+            # empty page; anything longer still aborts.
+            if pages > _MAX_PAGES + 1:
                 raise ValueError(
                     f"Outline documents.list exceeded {_MAX_PAGES} pages without completing; "
                     "aborting to avoid an endless pagination loop"
