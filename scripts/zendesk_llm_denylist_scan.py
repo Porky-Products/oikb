@@ -98,7 +98,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -624,7 +624,7 @@ def _append_dedup(path: Path, ticket_id: int, deny_ids: set[int]) -> None:
 def _append_review(path: Path, ticket_id: int, reason: str, reviewed: set[int]) -> None:
     if ticket_id in reviewed:
         return
-    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _append_line(path, f"{ticket_id}  # unsure: {reason}  ({stamp})\n")
     reviewed.add(ticket_id)
 
@@ -643,7 +643,7 @@ def _save_state(state_path: Path, state: dict[str, Any]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_path.with_name(state_path.name + ".tmp")
     payload = dict(state)
-    payload["saved_at"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload["saved_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(tmp, state_path)
 
