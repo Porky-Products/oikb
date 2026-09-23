@@ -102,16 +102,22 @@ class TestListKbFiles:
         assert [p["page"] for _m, _u, p in http.requests] == [1, 2]
 
     def test_stops_on_empty_page_without_total(self):
+        # No total reported anywhere: an empty page is the legitimate
+        # end of the listing (natural exhaustion).  With a reported
+        # total, an empty page is truncation and must raise instead —
+        # covered in tests/test_client.py (#46 complete-or-raise).
         client, http = _client_with(
-            [{"items": [_file("f1", "h1")]}, {"items": [], "total": 99}]
+            [{"items": [_file("f1", "h1")]}, {"items": []}]
         )
         assert [f["id"] for f in client.list_kb_files("kb1")] == ["f1"]
         assert len(http.requests) == 2
 
     def test_repeated_page_terminates(self):
-        # A page whose items were all seen means no progress — the loop
-        # must stop rather than spin (e.g. against shifting results).
-        page = {"items": [_file("f1", "h1")], "total": 9999}
+        # A page whose items were all seen means no progress — without a
+        # reported total that is natural exhaustion, so the loop stops
+        # rather than spins.  (With a total, a no-progress page raises —
+        # covered in tests/test_client.py, #46.)
+        page = {"items": [_file("f1", "h1")]}
         client, http = _client_with([page, page])
         assert [f["id"] for f in client.list_kb_files("kb1")] == ["f1"]
         assert len(http.requests) == 2

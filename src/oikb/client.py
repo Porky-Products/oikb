@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Self
 
 import httpx
 
 # Safety cap for pathological servers that keep returning novel items;
-# 100k pages at even 1 item/page is far beyond any real KB.
+# 100k pages at even 1 item/page is far beyond any real KB.  Hitting the
+# cap raises rather than silently returning a possibly-partial listing.
 _KB_FILES_MAX_PAGES = 100_000
 
 
@@ -26,7 +27,7 @@ class OikbClient:
             timeout=timeout,
         )
 
-    def __enter__(self) -> OikbClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -144,11 +145,15 @@ class OikbClient:
     ) -> list[dict[str, Any]]:
         """GET /knowledge/{id}/files — list every file linked to a KB.
 
-        Paginated: walks ``page`` until the reported ``total`` is reached
-        or a page yields nothing new.  ``page_size`` is passed as ``limit``,
-        which the server only honors for admin keys — non-admin callers
-        get the default 30-item page size and the loop simply takes more
-        iterations.
+        Paginated: walks ``page`` until the reported ``total`` is reached —
+        or, when the server reports no ``total``, until a page yields no
+        new files (natural exhaustion).  The listing is complete-or-raise:
+        a server that stops serving new files before ``total`` is reached,
+        or that exhausts the page-safety cap, raises ``ValueError`` rather
+        than returning a partial list as if it were complete (#43/#46).
+        ``page_size`` is passed as ``limit``, which the server only honors
+        for admin keys — non-admin callers get the default 30-item page
+        size and the loop simply takes more iterations.
         """
         files: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
@@ -162,21 +167,45 @@ class OikbClient:
             data = resp.json() or {}
             # "items" may be an explicit JSON null — .get's default only
             # covers a missing key, not a null value.
-            items = data.get("items") or []
-            new_items = [
-                f for f in items if f.get("id") is None or f["id"] not in seen_ids
-            ]
-            if not new_items:
-                break  # empty page or a repeated page — no progress
-            for f in new_items:
-                if f.get("id") is not None:
-                    seen_ids.add(f["id"])
-            files.extend(new_items)
+            items = data.get("items")
+            if items is None:
+                items = []
+            elif not isinstance(items, list):
+                raise ValueError(
+                    f"Malformed KB file listing for {kb_id}: 'items' must be a list, got {type(items).__name__}"
+                )
             total = data.get("total")
-            if isinstance(total, int) and len(files) >= total:
+            if isinstance(total, bool):
+                # bool is an int subclass, so a JSON `true` total would
+                # otherwise slip through the int checks below.
+                raise ValueError(  # noqa: TRY004  -- repo convention: malformed API payloads raise ValueError
+                    f"Malformed KB file listing for {kb_id}: 'total' must be an integer, got {total!r}"
+                )
+            if total is not None and not isinstance(total, int):
+                total = None  # tolerate non-integer totals as absent
+            new_items: list[dict[str, Any]] = []
+            for f in items:
+                fid = f.get("id")
+                # Items without an id are kept as-is (not deduped);
+                # duplicates are dropped within a page and across pages.
+                if fid is None or fid not in seen_ids:
+                    new_items.append(f)
+                    if fid is not None:
+                        seen_ids.add(fid)
+            files.extend(new_items)
+            if total is None:
+                if not new_items:
+                    break  # natural exhaustion: no total, nothing new
+            elif len(files) >= total:
                 break
+            elif not new_items:
+                raise ValueError(
+                    f"KB file listing for {kb_id} stalled: page {page} returned no new files after collecting {len(files)} of {total} reported"
+                )
             if page >= _KB_FILES_MAX_PAGES:
-                break
+                raise ValueError(
+                    f"KB file listing for {kb_id} exceeded the {_KB_FILES_MAX_PAGES}-page safety cap after collecting {len(files)} files"
+                )
             page += 1
         return files
 
