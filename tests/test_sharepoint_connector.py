@@ -121,18 +121,15 @@ def test_read_file_downloads_gcc_high_redirect_target() -> None:
         return_value=httpx.Response(200, content=b"file-bytes")
     )
 
-    connector = SharePointConnector(
+    with SharePointConnector(
         site="contoso.sharepoint.us",
         library="Documents",
         tenant_id="tenant",
         client_id="client",
         client_secret="secret",
         cloud="gcc_high",
-    )
-    try:
+    ) as connector:
         assert connector.read_file("docs", "file.txt") == b"file-bytes"
-    finally:
-        connector.close()
 
 
 # ── __init__ positional compatibility (Finding 16) ───────────────
@@ -152,15 +149,12 @@ def test_init_positional_args_keep_pre_site_path_binding() -> None:
         library="Docs",
     )
 
-    connector = SharePointConnector(
+    with SharePointConnector(
         "contoso.sharepoint.com", "Docs", "tenant", "client", "secret"
-    )
-    try:
+    ) as connector:
         assert connector.site == "contoso.sharepoint.com"
         assert connector.library == "Docs"
         assert connector.site_path == ""
-    finally:
-        connector.close()
 
 
 @respx.mock
@@ -176,18 +170,15 @@ def test_init_keyword_args_still_supported() -> None:
         library="Documents",
     )
 
-    connector = SharePointConnector(
+    with SharePointConnector(
         site="contoso.sharepoint.com",
         site_path="sites/TeamSite",
         library="Documents",
         tenant_id="tenant",
         client_id="client",
         client_secret="secret",
-    )
-    try:
+    ) as connector:
         assert connector.site == "contoso.sharepoint.com"
         assert connector.site_path == "sites/TeamSite"
         assert connector.library == "Documents"
         assert site_route.called
-    finally:
-        connector.close()
