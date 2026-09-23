@@ -21,13 +21,25 @@ These cover the Copilot PR-#40 review findings:
 - trusted policy rides as the system message and untrusted ticket data as
   the user message (prompt-injection hardening)
 - LLM request failures propagate (abort) instead of consuming the range
+
+PR #45 review findings (issue #46):
+- a ticket 200 serving a different ticket (mismatched/missing/non-integer
+  id; `True == 1` and `1.0 == 1`) aborts the run, never mis-classifies
+- a comments 200 that is not an object with a comments list (or holds
+  non-object entries) aborts instead of degrading to an empty COMPLETE set
+- LLM transport failures (URLError/timeout/reset) retry with the existing
+  backoff and abort via LLMRequestError after max retries
+- boolean/float ticket_id echoes degrade to unsure, never allow
+- a damaged stored stop_id (non-integer) dies with a --reset pointer
 """
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import json
 import os
+import urllib.error
 from pathlib import Path
 from typing import Any
 
@@ -868,9 +880,213 @@ def test_sensitive_requesters_change_aborts_resume(scan, tmp_path, monkeypatch):
 
     monkeypatch.setenv("LLM_SCAN_SENSITIVE_REQUESTERS", "b@porky.com")
     captured = io.StringIO()
-    with contextlib.redirect_stderr(captured):
-        with pytest.raises(SystemExit) as excinfo:
-            _run_scan(tmp_path, monkeypatch, scan, stop_id="1", llm=llm, zendesk=zendesk)
+    with contextlib.redirect_stderr(captured), pytest.raises(SystemExit) as excinfo:
+        _run_scan(tmp_path, monkeypatch, scan, stop_id="1", llm=llm, zendesk=zendesk)
     assert excinfo.value.code == 1
     assert "classification policy changed" in captured.getvalue()
     assert "LLM_SCAN_SENSITIVE_REQUESTERS" in captured.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# PR #45 review findings (issue #46)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_ticket_http200_mismatched_id_raises(scan):
+    """Finding 5: a 200 whose ticket object is for a DIFFERENT ticket
+    (mismatched, missing, or non-integer id) must abort the run, never be
+    classified under the requested ID. `True == 1` and `1.0 == 1`, so a
+    bare equality check is not enough."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for bad in ({"id": 2}, {"subject": "id missing"}, {"id": True}, {"id": 1.0}):
+            monkey.setattr(
+                scan_type, "_get", lambda self, path, ticket=bad: (200, {"ticket": ticket}, b"{}")
+            )
+            with pytest.raises(RuntimeError, match="mismatched id"):
+                client.fetch_ticket(1)
+        monkey.setattr(scan_type, "_get", lambda self, path: (200, {"ticket": {"id": 1}}, b"{}"))
+        assert client.fetch_ticket(1) == {"id": 1}
+    finally:
+        monkey.undo()
+
+
+def test_fetch_ticket_comments_malformed_200_raises(scan):
+    """Finding 6: a comments 200 whose body is not an object with a
+    comments list — non-JSON body (payload None), non-dict payload,
+    missing/not-list comments — or holding non-object entries must abort
+    the run instead of degrading to an empty COMPLETE comment set."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for bad in (None, ["not", "a", "dict"], {}, {"comments": "not-a-list"}):
+            monkey.setattr(scan_type, "_get", lambda self, path, p=bad: (200, p, b"raw"))
+            with pytest.raises(RuntimeError, match="carried no comments list"):
+                client.fetch_ticket_comments(1)
+        monkey.setattr(
+            scan_type, "_get", lambda self, path: (200, {"comments": ["not-an-object"]}, b"{}")
+        )
+        with pytest.raises(RuntimeError, match="non-object comment entry"):
+            client.fetch_ticket_comments(1)
+    finally:
+        monkey.undo()
+
+
+def test_fetch_ticket_comments_valid_and_404_unchanged(scan):
+    """Finding 6 (behavior preservation): a well-formed 200 returns the
+    comments plus the pagination flag, and 404 keeps returning the
+    unavailable marker exactly as before."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        page = {"comments": [{"id": 9, "body": "b", "attachments": []}], "next_page": None}
+        monkey.setattr(scan_type, "_get", lambda self, path: (200, page, b"{}"))
+        comments, more, unavailable = client.fetch_ticket_comments(1)
+        assert comments == page["comments"]
+        assert more is False
+        assert unavailable is False
+
+        monkey.setattr(
+            scan_type, "_get", lambda self, path: (200, {"comments": [], "next_page": "http://n"}, b"{}")
+        )
+        _, more, _ = client.fetch_ticket_comments(1)
+        assert more is True
+
+        monkey.setattr(scan_type, "_get", lambda self, path: (404, {}, b"{}"))
+        assert client.fetch_ticket_comments(1) == ([], False, True)
+    finally:
+        monkey.undo()
+
+
+def test_classify_transport_error_retries_then_aborts(scan, monkeypatch):
+    """Finding 7: transport failures (URLError, socket timeout, reset) must
+    be retried with the existing backoff and raise LLMRequestError after
+    max retries — not escape the retry loop on the first failure."""
+    fake_time = _FakeTime()
+    monkeypatch.setattr(scan, "time", fake_time)
+
+    def boom(*args, **kwargs):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(scan, "_http_json", boom)
+    llm = scan.LLMClient("http://llm", "k", "m", timeout=1.0, max_retries=2)
+    with pytest.raises(scan.LLMRequestError, match="transport error"):
+        llm.classify("system", "user")
+    assert fake_time.sleeps == [5.0, 10.0]  # existing backoff between attempts
+
+
+def test_classify_transport_error_then_success_succeeds(scan, monkeypatch):
+    """Finding 7: a transport failure followed by a good response must
+    succeed within the retry budget (transient outage), not abort."""
+    fake_time = _FakeTime()
+    monkeypatch.setattr(scan, "time", fake_time)
+    calls: list[int] = []
+
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise urllib.error.URLError("connection reset")
+        return 200, {"choices": [{"message": {"content": "ok"}}]}, b"{}", None
+
+    monkeypatch.setattr(scan, "_http_json", flaky)
+    llm = scan.LLMClient("http://llm", "k", "m", timeout=1.0, max_retries=2)
+    assert llm.classify("system", "user") == "ok"
+    assert fake_time.sleeps == [5.0]
+
+
+def test_classify_retries_each_transport_exception_type(scan, monkeypatch):
+    """Finding 7: every transport exception class in the fix's catch list
+    (URLError, TimeoutError, OSError, http.client.HTTPException) is
+    retried inside the loop, not just URLError."""
+    fake_time = _FakeTime()
+    monkeypatch.setattr(scan, "time", fake_time)
+    for exc in (
+        urllib.error.URLError("dns failure"),
+        TimeoutError("socket timeout"),
+        OSError("connection reset"),
+        http.client.HTTPException("bad status line"),
+    ):
+        fake_time.sleeps.clear()
+
+        def boom(*args, _exc=exc, **kwargs):
+            raise _exc
+
+        monkeypatch.setattr(scan, "_http_json", boom)
+        llm = scan.LLMClient("http://llm", "k", "m", timeout=1.0, max_retries=1)
+        with pytest.raises(scan.LLMRequestError, match="transport error"):
+            llm.classify("system", "user")
+        assert fake_time.sleeps == [5.0]
+
+
+def test_parse_verdict_rejects_bool_float_ticket_id(scan):
+    """Finding 8: `True == 1` and `1.0 == 1`, so a bare equality check
+    accepted boolean/float echoes as ticket 1. Require a strict non-bool
+    int; anything else degrades to unsure, never allow."""
+    for bad in (True, 1.0, "1.0", None, [1]):
+        raw = json.dumps({"ticket_id": bad, "verdict": "deny"})
+        verdict, reason = scan._parse_verdict(raw, 1)
+        assert verdict == "unsure"
+        assert "not an integer" in reason
+    # Numeric strings keep the existing lenient conversion.
+    ok = json.dumps({"ticket_id": "1", "verdict": "deny"})
+    assert scan._parse_verdict(ok, 1) == ("deny", "")
+    # A strict-int mismatch still degrades to unsure.
+    verdict, reason = scan._parse_verdict(json.dumps({"ticket_id": 2, "verdict": "deny"}), 1)
+    assert verdict == "unsure"
+    assert "mismatch" in reason
+
+
+def test_resume_damaged_stop_id_dies(scan, tmp_path, monkeypatch, capsys):
+    """Finding 9: int(state["stop_id"]) used to traceback on "abc" and
+    silently truncate floats/bools (1.5 -> 1, True -> 1). A damaged stored
+    bound must die with a --reset pointer, mirroring the next_id guard."""
+    for bad in ("abc", 1.5, True, None):
+        _seed_resume_state(scan, tmp_path, next_id=1, stop_id=bad)
+        with pytest.raises(SystemExit) as excinfo:
+            _run_scan(
+                tmp_path,
+                monkeypatch,
+                scan,
+                stop_id="10",
+                llm=FakeLLMClient(responses=[]),
+                zendesk=FakeZendeskClient(tickets={}, comments={}),
+            )
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "stop_id is not an integer" in err
+        assert "--reset" in err
+
+
+def test_resume_valid_stop_id_proceeds(scan, tmp_path, monkeypatch):
+    """Finding 9 (behavior preservation): a well-formed stored stop_id
+    matching the env still resumes and classifies normally."""
+    _seed_resume_state(scan, tmp_path, next_id=1, stop_id=1)
+    zendesk = FakeZendeskClient(tickets={1: _ticket(1)}, comments={1: ([], False, False)})
+    llm = FakeLLMClient(responses=[json.dumps({"ticket_id": 1, "verdict": "allow", "reason": "ok"})])
+    _run_scan(tmp_path, monkeypatch, scan, stop_id="1", llm=llm, zendesk=zendesk)
+    assert len(llm.calls) == 1
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["next_id"] == 2
+
+
+def test_resume_changed_stop_id_dies(scan, tmp_path, monkeypatch, capsys):
+    """Finding 9 (behavior preservation): a well-formed but changed bound
+    still dies with the changed-bound message, not the damaged-state one."""
+    _seed_resume_state(scan, tmp_path, next_id=1, stop_id=10)
+    with pytest.raises(SystemExit) as excinfo:
+        _run_scan(
+            tmp_path,
+            monkeypatch,
+            scan,
+            stop_id="11",
+            llm=FakeLLMClient(responses=[]),
+            zendesk=FakeZendeskClient(tickets={}, comments={}),
+        )
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "LLM_SCAN_STOP_TICKET_ID changed" in err
+    assert "--reset" in err
