@@ -292,3 +292,31 @@ def test_unusable_entry_id_raises(entry: dict[str, Any]) -> None:
     respx.get(_FILES_URL).mock(return_value=_page([entry], total=1))
     with _client() as client, pytest.raises(ValueError, match="entry id"):
         client.list_kb_files("kb1")
+
+
+@respx.mock
+def test_count_exceeding_total_raises() -> None:
+    # PR #47 follow-up: a page yielding more unique entries than the
+    # binding total is internally inconsistent metadata — the total cannot
+    # be trusted to mark the listing complete, and later pages may still
+    # hold files. Complete-or-raise means raise, not early return.
+    respx.get(_FILES_URL).mock(return_value=_page([_file("f1"), _file("f2")], total=1))
+    with _client() as client, pytest.raises(ValueError, match="exceeding the reported total"):
+        client.list_kb_files("kb1")
+
+
+@respx.mock
+def test_exact_total_still_completes() -> None:
+    # Behavior preservation: reaching the total exactly still completes,
+    # including when the final page re-delivers earlier entries — dedup
+    # keeps the unique count at the total instead of overshooting it.
+    route = respx.get(_FILES_URL).mock(
+        side_effect=[
+            _page([_file("f1")], total=2),
+            _page([_file("f2"), _file("f1")], total=2),
+        ]
+    )
+    with _client() as client:
+        result = client.list_kb_files("kb1")
+    assert [f["id"] for f in result] == ["f1", "f2"]
+    assert route.call_count == 2
