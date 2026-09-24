@@ -45,7 +45,8 @@ Exit codes
      blind; the scanner must cross-check every show_many omission with a
      single GET /tickets/{id}.json before treating the ID as missing
   3  requested IDs missing from BOTH paths (deleted / never existed?)
-  1  transport failure or bad credentials; nothing concluded
+  1  transport failure, bad credentials, or a malformed HTTP 200 payload
+     (batch or single); nothing concluded
 
 Stdlib only; no backend imports, runs anywhere Python 3.9+ runs.
 """
@@ -212,6 +213,12 @@ def main() -> None:
             by_single[ticket_id] = payload["ticket"]
         elif status == 200:
             print(f"  body: {_snippet(raw, 200)}")
+            print(
+                "  fatal: single GET answered 200 with a malformed payload "
+                "(expected a JSON object with a 'ticket' object); nothing concluded.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         else:
             print(f"  body: {_snippet(raw, 200)}")
 
