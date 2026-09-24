@@ -63,6 +63,19 @@ class _CombinedConnector(BaseConnector):
             if callable(mark):
                 mark()
 
+    def requires_empty_sync(self) -> bool:
+        # sync treats an empty manifest as "nothing to sync" unless the
+        # connector requests an empty sync (e.g. every carried-forward
+        # ticket was denylisted away). Forward so a grouped run whose only
+        # source became empty still runs sync_diff/sync_cleanup instead of
+        # stranding the KB's stale files.
+        return any(
+            callable(req) and req()
+            for req in (
+                getattr(child, "requires_empty_sync", None) for child in self._children
+            )
+        )
+
 
 def run_entries_sync(
     client: OikbClient,

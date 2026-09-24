@@ -320,3 +320,38 @@ def test_exact_total_still_completes() -> None:
         result = client.list_kb_files("kb1")
     assert [f["id"] for f in result] == ["f1", "f2"]
     assert route.call_count == 2
+
+
+@respx.mock
+def test_conflicting_duplicate_id_raises() -> None:
+    """A copy of an id already held with different metadata means the
+    listing shifted while it was being read: returning either copy as a
+    complete listing could hand callers stale metadata (e.g. a pre-shift
+    hash, undermining the duplicate-upload guard), so fail closed."""
+    route = respx.get(_FILES_URL).mock(
+        side_effect=[
+            _page([_file("f1")], total=2),
+            _page([{"id": "f1", "hash": "changed"}, _file("f2")], total=2),
+        ]
+    )
+    with (
+        _client() as client,
+        pytest.raises(ValueError, match="conflicting duplicate entry"),
+    ):
+        client.list_kb_files("kb1")
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_identical_duplicate_across_pages_deduped() -> None:
+    """Overlapping pages serving the identical entry still dedupe."""
+    route = respx.get(_FILES_URL).mock(
+        side_effect=[
+            _page([_file("f1")], total=2),
+            _page([_file("f1"), _file("f2")], total=2),
+        ]
+    )
+    with _client() as client:
+        result = client.list_kb_files("kb1")
+    assert [f["id"] for f in result] == ["f1", "f2"]
+    assert route.call_count == 2

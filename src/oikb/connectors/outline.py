@@ -39,12 +39,46 @@ class OutlineConnector(BaseConnector):
         # Resolve collection ID once before starting the loop
         collection_id = None
         if self._collection:
-            cols_resp = self._http.post("/api/collections.list", json={})
-            cols_resp.raise_for_status()
-            cols = cols_resp.json().get("data", [])
-            col = next((c for c in cols if c.get("name") == self._collection or c.get("id") == self._collection), None)
+            # Walk every page of collections.list: a lookup limited to the
+            # first page would misreport a real collection as missing.
+            cols: list[dict] = []
+            offset = 0
+            for _ in range(_MAX_PAGES):
+                cols_resp = self._http.post(
+                    "/api/collections.list", json={"offset": offset, "limit": 100}
+                )
+                cols_resp.raise_for_status()
+                cols_payload = cols_resp.json()
+                if not isinstance(cols_payload, dict) or not isinstance(cols_payload.get("data"), list):
+                    raise ValueError(  # noqa: TRY004 -- repo convention: malformed API payloads raise ValueError
+                        "Outline collections.list returned a malformed payload: "
+                        "expected a JSON object with a list-valued 'data' field"
+                    )
+                page_cols = cols_payload["data"]
+                cols.extend(c for c in page_cols if isinstance(c, dict))
+                if len(page_cols) < 100:
+                    break
+                offset += 100
+            else:
+                raise ValueError(
+                    f"Outline collections.list exceeded {_MAX_PAGES} pages without completing; "
+                    "aborting to avoid an endless pagination loop"
+                )
+            col = next(
+                (c for c in cols if c.get("name") == self._collection or c.get("id") == self._collection),
+                None,
+            )
             if col:
                 collection_id = col["id"]
+            else:
+                # A configured collection that cannot be resolved must fail
+                # before listing documents: leaving collection_id None makes
+                # documents.list omit collectionId and silently sync the
+                # entire workspace instead of the requested scope.
+                raise ValueError(
+                    f"Outline collection {self._collection!r} not found; "
+                    "refusing to fall back to a workspace-wide sync"
+                )
 
         entries: list[ManifestEntry] = []
         seen: set[str] = set()

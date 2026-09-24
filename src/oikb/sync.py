@@ -275,8 +275,8 @@ def _run_sync_inner(
     # the diff cannot see.  Filter such "added" entries before the
     # dry-run return so dry runs report the same totals the real run
     # would produce.  "modified" entries are left alone: their stale
-    # file is cleaned up before upload, so the hash collision resolves
-    # itself.
+    # file is only cleaned up after the replacement uploads, so a hash
+    # collision fails loudly while the old copy is retained.
     # Scope: only sound for content-addressed connectors, where
     # checksum equality implies content equality.  (zendesktickets is
     # content-addressed; gdrive is only when md5Checksum is present —
@@ -359,26 +359,25 @@ def _run_sync_inner(
     if not added and not modified and not deleted and not mkdir and not rmdir:
         return result
 
-    # ── 4. Cleanup stale files ─────────────────────────────────
-    stale_file_ids = [
-        *[d["file_id"] for d in deleted],
-        *[m["stale_file_id"] for m in modified],
-    ]
+    # ── 4. Cleanup deleted files ───────────────────────────────
+    # Only diff-deleted files are removed before upload. A modified
+    # entry's stale file is removed after its replacement uploads
+    # successfully (see _cleanup_replaced): deleting it first meant an
+    # unreadable source (empty read or SourceFileUnavailable) or a failed
+    # upload left the KB with neither the old nor the new copy — data
+    # loss instead of a harmless skip.
+    deleted_ids = [d["file_id"] for d in deleted]
 
-    if stale_file_ids or rmdir:
+    if deleted_ids:
         check_stop()
         if show_progress:
-            with _console.status(f"[bold blue]Cleaning up {len(stale_file_ids)} stale files..."):
-                client.sync_cleanup(kb_id, stale_file_ids, rmdir if rmdir else None)
+            with _console.status(f"[bold blue]Cleaning up {len(deleted_ids)} deleted files..."):
+                client.sync_cleanup(kb_id, deleted_ids)
         else:
             if verbose:
-                click.echo(
-                    f"Cleaning up {len(stale_file_ids)} files, {len(rmdir)} dirs...",
-                    err=True,
-                )
-            client.sync_cleanup(kb_id, stale_file_ids, rmdir if rmdir else None)
+                click.echo(f"Cleaning up {len(deleted_ids)} deleted files...", err=True)
+            client.sync_cleanup(kb_id, deleted_ids)
         result.deleted = len(deleted)
-        result.dirs_removed = len(rmdir)
 
     # ── 5. Create missing directories ──────────────────────────
     for dir_path in mkdir:
@@ -402,7 +401,35 @@ def _run_sync_inner(
         *[(m, "modified") for m in modified],
     ]
 
+    # Stale files of modified entries whose replacement did not upload
+    # (unreadable source, SourceFileUnavailable, or a failed upload) are
+    # retained instead of deleted, so the KB keeps at least one version.
+    retain_stale: set[str] = set()
+
+    def _cleanup_replaced() -> None:
+        """Delete modified entries' stale files after their replacements
+        uploaded, and remove emptied directories."""
+        stale_modified_ids = [
+            m["stale_file_id"] for m in modified
+            if m.get("stale_file_id") and m["stale_file_id"] not in retain_stale
+        ]
+        if not stale_modified_ids and not rmdir:
+            return
+        check_stop()
+        if show_progress:
+            with _console.status(f"[bold blue]Cleaning up {len(stale_modified_ids)} replaced files..."):
+                client.sync_cleanup(kb_id, stale_modified_ids, rmdir if rmdir else None)
+        else:
+            if verbose:
+                click.echo(
+                    f"Cleaning up {len(stale_modified_ids)} replaced files, {len(rmdir)} dirs...",
+                    err=True,
+                )
+            client.sync_cleanup(kb_id, stale_modified_ids, rmdir if rmdir else None)
+        result.dirs_removed = len(rmdir)
+
     if not files_to_upload:
+        _cleanup_replaced()
         return result
 
     def _upload_one(
@@ -427,11 +454,14 @@ def _run_sync_inner(
             try:
                 content = connector.read_file(path, filename)
                 if not content:
+                    note = f"{display}: empty content, skipping"
+                    if change_type == "modified":
+                        note += " — existing KB copy retained"
                     if progress is not None:
                         progress.update(task_id, advance=1, description=f"[yellow]⚠ {display}[/yellow]")
                     else:
-                        click.echo(click.style(f"  ⚠ {display}: empty content, skipping", fg="yellow"), err=True)
-                    return ("warning", f"{display}: empty content, skipping")
+                        click.echo(click.style(f"  ⚠ {note}", fg="yellow"), err=True)
+                    return ("warning", note)
                 check_stop()
                 directory_id = directory_map.get(path) if path else None
                 client.upload_file(
@@ -446,6 +476,8 @@ def _run_sync_inner(
                 return (change_type, None)
             except SourceFileUnavailable as e:
                 message = f"{display}: {e}"
+                if change_type == "modified":
+                    message += " — existing KB copy retained"
                 if progress is not None:
                     progress.update(task_id, advance=1, description=f"[yellow]⚠ {display}[/yellow]")
                 else:
@@ -490,17 +522,23 @@ def _run_sync_inner(
             click.echo(click.style(f"  ✗ {display}: {last_err}", fg="red"), err=True)
         return ("error", f"{display}: {last_err}")
 
-    def _tally(outcome: tuple[str, str | None]) -> None:
+    def _tally(outcome: tuple[str, str | None], entry: dict, change_type: str) -> None:
         """Update result counters from an upload outcome."""
         kind, message = outcome
         if kind == "added":
             result.added += 1
         elif kind == "modified":
             result.modified += 1
-        elif kind == "warning" and message is not None:
-            result.warnings.append(message)
-        elif message is not None:
-            result.errors.append(message)
+        else:
+            # The replacement did not upload: retain the stale KB copy
+            # (removed after success by _cleanup_replaced).
+            stale_id = entry.get("stale_file_id")
+            if change_type == "modified" and stale_id:
+                retain_stale.add(stale_id)
+            if kind == "warning" and message is not None:
+                result.warnings.append(message)
+            elif message is not None:
+                result.errors.append(message)
 
     if show_progress:
         progress = Progress(
@@ -525,10 +563,11 @@ def _run_sync_inner(
                         for i, (entry, ct) in enumerate(files_to_upload, 1)
                     }
                     for future in as_completed(futures):
-                        _tally(future.result())
+                        entry, ct = futures[future]
+                        _tally(future.result(), entry, ct)
             else:
                 for i, (entry, change_type) in enumerate(files_to_upload, 1):
-                    _tally(_upload_one(i, entry, change_type, progress, task_id))
+                    _tally(_upload_one(i, entry, change_type, progress, task_id), entry, change_type)
     else:
         # Quiet or daemon mode — no progress bar.
         if concurrency > 1 and len(files_to_upload) > 1:
@@ -538,10 +577,14 @@ def _run_sync_inner(
                     for i, (entry, ct) in enumerate(files_to_upload, 1)
                 }
                 for future in as_completed(futures):
-                    _tally(future.result())
+                    entry, ct = futures[future]
+                    _tally(future.result(), entry, ct)
         else:
             for i, (entry, change_type) in enumerate(files_to_upload, 1):
-                _tally(_upload_one(i, entry, change_type, None, None))
+                _tally(_upload_one(i, entry, change_type, None, None), entry, change_type)
+
+    # ── 7. Cleanup replaced files and removed dirs ────────────
+    _cleanup_replaced()
 
     return result
 

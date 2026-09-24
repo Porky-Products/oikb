@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
@@ -140,3 +142,53 @@ def test_malformed_documents_list_payload_raises(payload) -> None:
         pytest.raises(ValueError, match="malformed payload"),
     ):
         connector.build_manifest()
+
+
+@respx.mock
+def test_unresolvable_collection_fails_before_listing_documents() -> None:
+    """A configured collection that cannot be resolved must fail before
+    any documents.list call: leaving collectionId unset would silently
+    sync the entire workspace instead of the requested scope."""
+    respx.post("https://outline.example/api/collections.list").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": "col-1", "name": "Other"}]}
+        )
+    )
+    docs_route = respx.post("https://outline.example/api/documents.list").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    with (
+        OutlineConnector(
+            token="token", base_url="https://outline.example", collection="Wanted"
+        ) as connector,
+        pytest.raises(ValueError, match="not found"),
+    ):
+        connector.build_manifest()
+    assert docs_route.call_count == 0
+
+
+@respx.mock
+def test_resolved_collection_scopes_documents_list() -> None:
+    """A collection resolved from any page of collections.list scopes
+    every documents.list request with its collectionId."""
+    respx.post("https://outline.example/api/collections.list").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": "col-9", "name": "Wanted"}]}
+        )
+    )
+    captured: dict = {}
+
+    def docs_handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"data": _docs(0, 1)})
+
+    docs_route = respx.post(
+        "https://outline.example/api/documents.list"
+    ).mock(side_effect=docs_handler)
+    with OutlineConnector(
+        token="token", base_url="https://outline.example", collection="Wanted"
+    ) as connector:
+        manifest = connector.build_manifest()
+    assert [entry.filename for entry in manifest] == ["doc-0.md"]
+    assert docs_route.call_count == 1
+    assert captured["body"]["collectionId"] == "col-9"

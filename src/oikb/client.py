@@ -159,7 +159,7 @@ class OikbClient:
         default 30-item page size and the loop simply takes more iterations.
         """
         files: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
+        seen_entries: dict[str, dict[str, Any]] = {}
         reported_total: int | None = None
         page = 1
         while True:
@@ -234,10 +234,21 @@ class OikbClient:
                     raise ValueError(
                         f"Malformed KB file listing for {kb_id}: entry id must be a non-empty string, got {fid!r}"
                     )
-                # Duplicates are dropped within a page and across pages.
-                if fid not in seen_ids:
+                # Identical duplicates (overlapping pages serving the same
+                # entry) are deduplicated within a page and across pages. A
+                # conflicting copy of an id already held means the listing
+                # shifted while being read: returning either copy as a
+                # complete listing could hand callers stale metadata (e.g. a
+                # pre-shift hash, undermining the duplicate-upload guard),
+                # so complete-or-raise fails closed here.
+                existing = seen_entries.get(fid)
+                if existing is None:
                     new_items.append(f)
-                    seen_ids.add(fid)
+                    seen_entries[fid] = f
+                elif existing != f:
+                    raise ValueError(
+                        f"Malformed KB file listing for {kb_id}: conflicting duplicate entry for id {fid!r} on page {page}"
+                    )
             files.extend(new_items)
             if reported_total is None:
                 if not new_items:
