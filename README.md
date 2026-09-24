@@ -94,8 +94,9 @@ curl -X POST /sync/8f3a2b1c-.. # API: trigger by kb-id
 The daemon blocks an unchanged file after three consecutive duplicate-content
 upload failures. Further scheduled, webhook, and ordinary manual syncs do not
 read or upload that file, retain its existing KB copy, and continue syncing
-other files. Blocked files keep the run in `error` status, with counts in
-`GET /status`, logs, history, and failure notifications.
+other files. Blocked files are reported as warnings — they do not fail the run
+or change its exit status — with counts in `GET /status`, logs, and
+notifications.
 
 Counts are held in RAM per server, KB, destination path, and source checksum.
 Changing the checksum, removing the pending file, or restarting the daemon

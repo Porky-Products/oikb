@@ -66,7 +66,7 @@ def test_blocks_after_three_runs_and_dry_run_does_not_reset(sync_case):
     blocked = run()
     assert blocked.duplicate_blocked == 1
     assert blocked.modified == blocked.added == blocked.duplicate_skipped == 0
-    assert "blocked after 3" in blocked.errors[0]
+    assert "blocked after 3" in blocked.warnings[0]
     assert len(reads) == client.upload_file.call_count == 3
     client.sync_cleanup.assert_not_called()
 
@@ -133,7 +133,7 @@ def test_blocked_added_file_is_not_silently_deduplicated(sync_case, monkeypatch)
     client.list_kb_files.return_value = [{"id": "other", "hash": hashlib.sha256(files["bad.txt"]).hexdigest()}]
     result = run()
     assert result.duplicate_blocked == 1
-    assert result.errors
+    assert result.warnings
     assert result.duplicate_skipped == result.added == 0
     assert len(reads) == client.upload_file.call_count == 3
 
@@ -156,7 +156,7 @@ def daemon_case(monkeypatch, sync_case):
 
 
 @pytest.mark.asyncio
-async def test_daemon_blocks_large_batch_keeps_healthy_uploads_and_reports_hard_error(daemon_case):
+async def test_daemon_blocks_large_batch_keeps_healthy_uploads_and_warns(daemon_case):
     files, reads, client, entry = daemon_case
     files.clear()
     files.update({f"bad-{i}.txt": b"same" for i in range(103)})
@@ -167,7 +167,7 @@ async def test_daemon_blocks_large_batch_keeps_healthy_uploads_and_reports_hard_
             raise rejection()
 
     client.upload_file.side_effect = upload
-    for expected_status in ["partial", "partial", "error", "error"]:
+    for expected_status in ["partial", "partial", "success", "success"]:
         await daemon._run_entry(entry)
         assert daemon._scheduler_state["test"]["status"] == expected_status
     counts = Counter(reads)
@@ -177,15 +177,16 @@ async def test_daemon_blocks_large_batch_keeps_healthy_uploads_and_reports_hard_
     assert all(call.args[1] == ["old-healthy.txt"] for call in client.sync_cleanup.call_args_list)
     state = daemon._scheduler_state["test"]
     assert state["duplicate_blocked"] == 103
-    assert len(state["errors"]) == 103
-    assert daemon.record_sync.call_args.kwargs["status"] == "error"
+    assert len(state["warnings"]) == 103
+    assert state["errors"] == []
+    assert daemon.record_sync.call_args.kwargs["status"] == "success"
     history = daemon._history.log.call_args.kwargs
-    assert history["status"] == "error"
-    assert "blocked after 3" in history["error"]
+    assert history["status"] == "success"
+    assert history["error"] is None
     notification = daemon._send_notification.call_args.args[1]
-    assert notification["status"] == "error"
+    assert notification["status"] == "success"
     assert notification["duplicate_blocked"] == 103
-    assert "103 blocked" in notification["error"]
+    assert len(notification["warnings"]) == 103
 
 
 @pytest.mark.asyncio
@@ -237,7 +238,7 @@ async def test_daemon_failure_state_is_scoped_by_server_and_kb(daemon_case):
     await daemon._run_entry({**entry, "kb-id": "other-kb"})
     assert daemon._scheduler_state["test"]["status"] == "partial"
     await daemon._run_entry(entry)
-    assert daemon._scheduler_state["test"]["status"] == "error"
+    assert daemon._scheduler_state["test"]["status"] == "success"
     assert client.upload_file.call_count == 5
 
 
@@ -268,7 +269,8 @@ def test_same_filename_and_checksum_in_other_destination_has_own_streak():
     failing = "right"
     result = run()
     assert result.duplicate_blocked == 1  # Left remains blocked; right starts at one.
-    assert len(result.errors) == 2
+    assert len(result.errors) == 1
+    assert len(result.warnings) == 1
     assert client.upload_file.call_count == 7
     assert tracker.blocked_keys() == {("left", "same.txt", hashlib.sha256(b"same").hexdigest())}
 

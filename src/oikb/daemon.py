@@ -319,8 +319,6 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False, retry_blocked: b
         duration_s = time.time() - started_at
         duration_ms = int(duration_s * 1000)
         status = "success" if not result.errors else "partial"
-        if result.duplicate_blocked:
-            status = "error"
 
         set_state(
             status=status, last_sync=time.time(), duration_ms=duration_ms,
@@ -353,7 +351,7 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False, retry_blocked: b
                 error="\n".join(result.errors or []) or None,
             )
 
-        log_sync = log.error if result.duplicate_blocked else log.info
+        log_sync = log.warning if result.duplicate_blocked else log.info
         log_sync(
             f"Synced {source} -> {kb_id}: {result.summary()} ({duration_ms}ms)"
         )
@@ -371,7 +369,6 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False, retry_blocked: b
                 "warnings": result.warnings or [],
                 "errors": result.errors or [],
                 "duplicate_blocked": result.duplicate_blocked,
-                "error": result.summary() if result.duplicate_blocked else None,
             })
 
     except SyncCancelled:
