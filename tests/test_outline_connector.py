@@ -117,3 +117,26 @@ def test_non_empty_confirming_page_raises(monkeypatch: pytest.MonkeyPatch) -> No
     ):
         connector.build_manifest()
     assert calls == cap + 1
+
+@respx.mock
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"data": None},
+        {"data": "oops"},
+        {},
+        ["not", "an", "object"],
+    ],
+)
+def test_malformed_documents_list_payload_raises(payload) -> None:
+    """PR #47: a page whose body is not an object with a list-valued data
+    field must fail closed. Reading it as an empty page would return the
+    partial manifest as complete and hide the remaining documents."""
+    respx.post("https://outline.example/api/documents.list").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    with (
+        OutlineConnector(token="token", base_url="https://outline.example") as connector,
+        pytest.raises(ValueError, match="malformed payload"),
+    ):
+        connector.build_manifest()

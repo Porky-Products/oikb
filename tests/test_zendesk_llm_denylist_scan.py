@@ -1139,6 +1139,23 @@ def test_show_many_tickets_non_object_entry_raises(scan):
         monkey.undo()
 
 
+def test_show_many_users_non_object_entry_raises(scan):
+    """PR #47: a users show_many 200 carrying a null/scalar entry must
+    abort like the tickets parser — dropping it would send the ticket to
+    the LLM with missing requester evidence and could record an automatic
+    verdict."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for bad in ({"users": [None]}, {"users": [42]}, {"users": ["oops"]}):
+            monkey.setattr(scan_type, "_get", lambda self, path, p=bad: (200, p, b"raw"))
+            with pytest.raises(RuntimeError, match="non-object user entry"):
+                client.show_many_users([1])
+    finally:
+        monkey.undo()
+
+
 def test_fetch_ticket_non_object_payload_raises(scan):
     """PR #47: a ticket 200 whose body is not a JSON object must abort the
     run, not traceback with AttributeError. None stays reserved for 404."""

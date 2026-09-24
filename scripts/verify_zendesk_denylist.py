@@ -196,14 +196,16 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
                 _die(f"KB file entry is not a JSON object: {str(entry)[:200]}")
             raw_entry_count += 1
             entry_id = entry.get("id")
-            if entry_id is None:
-                _die(f"KB file entry without id: {str(entry)[:200]}")
-            try:
-                if entry_id not in items_by_id:
-                    page_new += 1
-                items_by_id[entry_id] = entry
-            except TypeError as exc:
-                _die(f"KB file entry with unusable id {entry_id!r}: {exc}")
+            if not isinstance(entry_id, str) or not entry_id:
+                # Non-string ids are unusable for dedup: JSON true and 1
+                # are equal dict keys in Python, so a leaked entry keyed
+                # by true could be overwritten by a later safe entry keyed
+                # by 1 and the exact-count guard would still pass. Require
+                # a non-empty string id, matching OikbClient.list_kb_files.
+                _die(f"KB file entry with missing or unusable string id: {str(entry)[:200]}")
+            if entry_id not in items_by_id:
+                page_new += 1
+            items_by_id[entry_id] = entry
         seen_total = total
         if len(items_by_id) > total:
             # More unique ids than the declared total means the server's

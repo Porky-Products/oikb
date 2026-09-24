@@ -458,7 +458,14 @@ class ZendeskClient:
         out: dict[int, dict[str, Any]] = {}
         for user in users:
             if not isinstance(user, dict):
-                continue
+                # Same fail-closed rule as show_many_tickets: a null/scalar
+                # entry is malformed Zendesk data, not an empty lookup.
+                # Dropping it would send the ticket to the LLM with missing
+                # requester evidence and could record an automatic verdict.
+                raise RuntimeError(
+                    f"Zendesk users show_many HTTP 200 carried a "
+                    f"non-object user entry ({user!r})"
+                )
             uid = user.get("id")
             # bool is an int subclass: a JSON `true` id would alias user 1
             # (True == 1 and hash(True) == hash(1)). Skip it.
