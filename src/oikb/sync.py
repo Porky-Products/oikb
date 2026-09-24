@@ -525,7 +525,8 @@ def _run_sync_inner(
                 ):
                     try:
                         client.sync_cleanup(kb_id, [stale_id])
-                    except Exception:  # noqa: BLE001 -- cleanup failure leaves the stale copy indexed; the error path below retains it
+                    except Exception as cleanup_err:  # noqa: BLE001 -- cleanup failure leaves the stale copy indexed; the error path below retains it
+                        last_err = cleanup_err
                         break
                     stale_deleted.add(stale_id)
                     last_err = e
