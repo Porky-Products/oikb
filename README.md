@@ -91,6 +91,27 @@ curl -X POST /sync/wiki        # API: trigger by name
 curl -X POST /sync/8f3a2b1c-.. # API: trigger by kb-id
 ```
 
+The daemon blocks an unchanged file after three consecutive duplicate-content
+upload failures. Further scheduled, webhook, and ordinary manual syncs do not
+read or upload that file, retain its existing KB copy, and continue syncing
+other files. Blocked files keep the run in `error` status, with counts in
+`GET /status`, logs, history, and failure notifications.
+
+Counts are held in RAM per server, KB, destination path, and source checksum.
+Changing the checksum, removing the pending file, or restarting the daemon
+clears its count; a successful upload or a different failure breaks the streak.
+Standalone CLI syncs do not share this state. After fixing the conflict, reset
+the counts for a KB and retry through the daemon:
+
+```bash
+curl -X POST 'http://localhost:8080/sync/wiki?retry_blocked=true'
+```
+
+Include the daemon's bearer token if API authentication is enabled. A dry run
+does not change counts or blocks; `dry_run=true` and `retry_blocked=true` cannot
+be combined. A retry requested while that KB is already syncing is skipped,
+so wait for it to finish before requesting the retry.
+
 ### Docker
 
 ```bash

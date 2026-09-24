@@ -22,6 +22,7 @@ from rich.progress import (
 
 from oikb.client import OikbClient
 from oikb.connectors import BaseConnector, ManifestEntry, SourceFileUnavailable
+from oikb.duplicate_failures import DUPLICATE_FAILURE_LIMIT, DuplicateFailureTracker, FailureKey
 
 # Stderr console for progress output (keeps stdout clean for piping).
 _console = Console(stderr=True)
@@ -36,6 +37,7 @@ class SyncResult:
     deleted: int = 0
     unmodified: int = 0
     duplicate_skipped: int = 0
+    duplicate_blocked: int = 0
     dirs_created: int = 0
     dirs_removed: int = 0
     errors: list[str] | None = None
@@ -57,6 +59,8 @@ class SyncResult:
             parts.append(f"{self.unmodified} unchanged")
         if self.duplicate_skipped:
             parts.append(f"{self.duplicate_skipped} duplicate skipped")
+        if self.duplicate_blocked:
+            parts.append(f"{self.duplicate_blocked} blocked after repeated duplicate-content failures")
         if self.dirs_created:
             parts.append(f"{self.dirs_created} dirs created")
         if self.dirs_removed:
@@ -144,6 +148,7 @@ def run_sync(
     manifest_filter: Callable[[list[ManifestEntry]], list[ManifestEntry]] | None = None,
     concurrency: int = 1,
     cancel_requested: Callable[[], bool] | None = None,
+    duplicate_failures: DuplicateFailureTracker | None = None,
 ) -> SyncResult:
     """Execute a full incremental sync.
 
@@ -164,6 +169,7 @@ def run_sync(
         sync_result = _run_sync_inner(
             client, connector, kb_id, dry_run, verbose, quiet,
             manifest_filter, concurrency, result, cancel_requested,
+            duplicate_failures if not dry_run else None,
         )
         completed = True
         return sync_result
@@ -198,6 +204,7 @@ def _run_sync_inner(
     concurrency: int,
     result: SyncResult,
     cancel_requested: Callable[[], bool] | None,
+    duplicate_failures: DuplicateFailureTracker | None = None,
 ) -> SyncResult:
     """Inner sync logic, separated for clean connector cleanup."""
     show_progress = not quiet and not dry_run
@@ -227,6 +234,9 @@ def _run_sync_inner(
             _console.print(f"  [dim]{len(manifest)} files after filtering[/dim]")
         elif verbose:
             click.echo(f"  {len(manifest)} files after filtering", err=True)
+
+    if not manifest and duplicate_failures is not None:
+        duplicate_failures.retain_pending(set())
 
     if not manifest:
         requires_empty_sync = getattr(connector, "requires_empty_sync", None)
@@ -292,6 +302,22 @@ def _run_sync_inner(
     # files.
     skipped: list[str] = []
     manifest_by_key = {(e.path, e.filename): e for e in manifest}
+
+    def failure_key(entry: dict) -> FailureKey | None:
+        item = manifest_by_key.get((entry.get("path", ""), entry["filename"]))
+        return (item.path, item.filename, item.checksum) if item else None
+
+    blocked_keys: set[FailureKey] = set()
+    if duplicate_failures is not None:
+        duplicate_failures.retain_pending({
+            key for entry in [*added, *modified] if (key := failure_key(entry)) is not None
+        })
+        blocked_keys = duplicate_failures.blocked_keys()
+
+    # An existing block must remain an error, even if the dedup guard would
+    # otherwise silently skip this added entry on a later run.
+    blocked_added = [entry for entry in added if failure_key(entry) in blocked_keys]
+    added = [entry for entry in added if failure_key(entry) not in blocked_keys]
     if added and getattr(connector, "content_addressed_checksums", False):
         kb_files = client.list_kb_files(kb_id)
         # Files scheduled for deletion (directly or as the stale half of
@@ -316,6 +342,11 @@ def _run_sync_inner(
         added, skipped = filter_duplicate_uploads(
             added, modified, manifest_by_key, existing_hashes
         )
+    added.extend(blocked_added)
+    if duplicate_failures is not None:
+        duplicate_failures.retain_pending({
+            key for entry in [*added, *modified] if (key := failure_key(entry)) is not None
+        })
     if skipped:
         result.duplicate_skipped = len(skipped)
         if verbose:
@@ -444,6 +475,12 @@ def _run_sync_inner(
         _cleanup_replaced()
         return result
 
+    def blocked_message(display: str) -> str:
+        return (
+            f"{display}: blocked after {DUPLICATE_FAILURE_LIMIT} consecutive duplicate-content failures; "
+            "change the source checksum or explicitly retry blocked files"
+        )
+
     def _upload_one(
         i: int, entry: dict, change_type: str, progress: Progress | None, task_id: Any,
     ) -> tuple[str, str | None]:
@@ -460,9 +497,16 @@ def _run_sync_inner(
         if not manifest_entry:
             return ("error", f"File not in manifest: {display}")
 
+        if failure_key(entry) in blocked_keys:
+            if progress is not None:
+                progress.update(task_id, advance=1, description=f"[red]✗ {display}[/red]")
+            return ("blocked", blocked_message(display))
+
         last_err: Exception | None = None
+        error_kind = "error"
         for attempt in range(3):
             check_stop()
+            uploading = False
             try:
                 content = connector.read_file(path, filename)
                 if not content:
@@ -476,6 +520,7 @@ def _run_sync_inner(
                     return ("warning", note)
                 check_stop()
                 directory_id = directory_map.get(path) if path else None
+                uploading = True
                 client.upload_file(
                     file_content=content,
                     filename=filename,
@@ -510,6 +555,8 @@ def _run_sync_inner(
                     # Non-JSON error bodies are expected (plain-text or HTML
                     # gateway errors); deliberately fall back to response.text.
                     pass
+                if uploading and e.response.status_code == 400 and "duplicate content" in detail.lower():
+                    error_kind = "duplicate"
                 # A duplicate rejection is terminal too. Even a matching
                 # stale hash cannot make delete-then-retry safe: the next
                 # upload could fail and leave no indexed copy.
@@ -537,11 +584,22 @@ def _run_sync_inner(
             progress.update(task_id, advance=1, description=f"[red]✗ {display}[/red]")
         else:
             click.echo(click.style(f"  ✗ {display}: {last_err}", fg="red"), err=True)
-        return ("error", f"{display}: {last_err}")
+        return (error_kind, f"{display}: {last_err}")
 
     def _tally(outcome: tuple[str, str | None], entry: dict, change_type: str) -> None:
         """Update result counters from an upload outcome."""
         kind, message = outcome
+        key = failure_key(entry)
+        if duplicate_failures is not None and key is not None:
+            if kind == "duplicate":
+                if duplicate_failures.record_duplicate(key):
+                    kind = "blocked"
+                    display = f"{key[0]}/{key[1]}" if key[0] else key[1]
+                    message = f"{message}; {blocked_message(display)}"
+            elif kind != "blocked":
+                duplicate_failures.reset(key)
+        if kind == "blocked":
+            result.duplicate_blocked += 1
         if kind == "added":
             result.added += 1
         elif kind == "modified":
