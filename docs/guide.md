@@ -156,6 +156,39 @@ Then sync all sources at once:
 oikb sync
 ```
 
+### Multiple sources in one Knowledge Base
+
+Entries with the same `kb-id` are scanned together and sent as one manifest.
+This prevents a sync of one source from deleting files belonging to another.
+`oikb sync --name NAME`, daemon schedules, and webhooks all sync the entire
+configured group. Each entry keeps its schedule; whenever one is due, the whole
+group runs under the existing KB lock. Use the same `url` and `token` settings
+for every entry in a group.
+
+```yaml
+sources:
+  - name: engineering
+    source: confluence:ENG
+    kb-id: shared-kb
+    target-path: ENG
+  - name: handbook
+    source: ./handbook
+    kb-id: shared-kb
+    target-path: handbook
+```
+
+`target-path` is an optional destination directory. Filters still match paths
+inside each source, before this prefix is applied. In a group with multiple
+sources, Confluence entries default to their space key as the destination
+directory; other connectors keep their original paths. Explicit `target-path`
+values keep paths stable when sources are added or removed. Duplicate destination
+paths or a failed source scan abort the group before any KB changes.
+
+Existing single-source paths remain unchanged. Combining previously separate
+sources can relocate files; preview with `oikb sync --dry-run`. Use YAML mode
+for a shared KB: a standalone `oikb sync SOURCE --kb-id ID` only knows about that
+one source.
+
 ### Global Defaults
 
 Avoid repeating the same config across entries:
@@ -247,9 +280,39 @@ Requires `GITLAB_TOKEN` or `BITBUCKET_TOKEN` respectively.
 
 ```bash
 oikb sync confluence:SPACE_KEY --kb-id your-kb-id
+
+# Preserve the Confluence page hierarchy in manifest paths.
+oikb sync 'confluence:SPACE_KEY?structure=hierarchical' --kb-id your-kb-id
 ```
 
-Requires `CONFLUENCE_URL`, `CONFLUENCE_USERNAME`, and `CONFLUENCE_API_TOKEN`.
+With hierarchical structure enabled, existing `filter.include` and
+`filter.exclude` patterns can select page trees, for example
+`Engineering/Runbooks*`.
+
+Cloud uses REST API v2 by default. Set `CONFLUENCE_URL` to your instance URL,
+`CONFLUENCE_USER` to your email, and `CONFLUENCE_TOKEN` to your API token.
+
+For Server/Data Center, select v1 and omit the user to use a personal access token:
+
+```bash
+export CONFLUENCE_API_VERSION=v1
+export CONFLUENCE_URL=https://wiki.example.com/confluence
+export CONFLUENCE_TOKEN=your-personal-access-token
+unset CONFLUENCE_USER
+oikb sync confluence:ENG --kb-id your-kb-id
+```
+
+Include your installation's context path (such as `/confluence`) in the URL.
+Both versions support flat and hierarchical paths. A user plus token selects
+Basic authentication; a token alone selects Bearer authentication, as described
+in [Atlassian's PAT documentation](https://confluence.atlassian.com/enterprise/using-personal-access-tokens-1026032365.html).
+Per-source `auth` keys `base_url`, `user`, `token`, and `api_version` override
+environment settings, so Cloud and Data Center can coexist in one config. Set
+`user: ""` to override an inherited user when using a PAT.
+
+Page titles that map to the same filename receive page-ID suffixes. Macro text
+and code blocks retain the existing extraction behavior; blank or index-only
+pages are skipped with a warning.
 
 ### BookStack
 
@@ -390,8 +453,10 @@ pip install oikb[zotero]
 export ZOTERO_LIBRARY_ID=123456
 export ZOTERO_API_KEY=...
 
-oikb sync "zotero:" --kb-id your-kb-id
-oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id
+oikb sync "zotero:" --kb-id your-kb-id # syncs all top-level collections plus _unfiled
+oikb sync "zotero:Research" --kb-id your-kb-id # syncs only the 'Research' collection
+oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id # syncs only the 'Machine Learning' subcollection
+
 ```
 
 Optional settings:
@@ -429,6 +494,7 @@ Optional settings:
 | `ZENDESKTICKET_STATUS` | Comma-separated statuses to include (for example `open,solved,closed`) |
 | `ZENDESKTICKET_INCLUDETAGS` | Comma-separated tags; include tickets matching any listed tag |
 | `ZENDESKTICKET_EXCLUDETAGS` | Comma-separated tags to skip |
+| `ZENDESKTICKET_DENYLIST_FILES` | Comma-separated plaintext denylist files of numeric ticket IDs (`#` comments/blank lines ignored); denylisted tickets are excluded from sync and purged from the KB by the next sync run — see `docs/denylist.md`. Missing or malformed files fail the run (fail-closed) |
 | `ZENDESKTICKET_VERBOSE_HTTP` | Print Zendesk request URLs/params for debugging when true |
 | `ZENDESKTICKET_MAX_RETRIES` | Max retries for `429 Too Many Requests`, defaults to `5` |
 | `ZENDESKTICKET_BACKOFF_BASE_SECONDS` | Base exponential backoff delay in seconds, defaults to `1.0` |
@@ -440,6 +506,7 @@ Behavior notes:
 - If no checkpoint exists on disk, sync starts from the minimum datetime.
 - Checkpoints advance only after a successful sync run.
 - Tickets filtered out by tags or removed from Zendesk are removed from the KB on later syncs.
+- Denylisted tickets (`ZENDESKTICKET_DENYLIST_FILES`) are removed from the KB on the next sync run even if they are never re-served by the incremental crawl — the denylist is also applied to carried-forward state. A missing or malformed denylist file aborts the run rather than risking a sensitive ticket being synced.
 - Turning `ZENDESKTICKET_DOWNLOAD_ATTACHMENTS` off removes previously synced attachment files on the next run.
 - Attachments are matched against `ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS` by filename extension (not content type). Attachments without an extension are blocked while an allowlist is active. Tightening the allowlist removes previously synced attachment files that no longer match on the next run. Setting the variable to an empty value disables filtering and downloads every attachment.
 
