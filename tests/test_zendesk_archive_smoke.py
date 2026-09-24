@@ -81,3 +81,41 @@ def test_well_formed_single_200_still_recorded(
     captured = capsys.readouterr()
     assert "fatal" not in captured.err
     assert "single GET: FOUND" in captured.out
+
+
+@pytest.mark.parametrize("entry", [None, 42, "ticket", True, []])
+@pytest.mark.parametrize("endpoint,field", [("tickets", "tickets"), ("users", "users")])
+def test_non_object_batch_entry_aborts(smoke, monkeypatch, capsys, entry, endpoint, field):
+    valid_get = _stub_get({"ticket": _ticket(45748)})
+
+    def fake_get(base_url, path_qs, auth, timeout):
+        if path_qs.startswith(f"/{endpoint}/show_many"):
+            valid = _ticket(45748) if endpoint == "tickets" else {"id": 1}
+            return 200, {field: [valid, entry]}, "{}"
+        return valid_get(base_url, path_qs, auth, timeout)
+
+    monkeypatch.setattr(smoke, "_get", fake_get)
+    monkeypatch.setattr("sys.argv", ["zendesk_archive_smoke.py", "45748"])
+    with pytest.raises(SystemExit) as exc:
+        smoke.main()
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "malformed payload" in captured.err
+    assert "VERDICT:" not in captured.out
+
+
+@pytest.mark.parametrize("payload", [[], {}, {"users": None}, {"users": "bad"}])
+def test_malformed_users_payload_aborts(smoke, monkeypatch, capsys, payload):
+    valid_get = _stub_get({"ticket": _ticket(45748)})
+
+    def fake_get(base_url, path_qs, auth, timeout):
+        if path_qs.startswith("/users/show_many"):
+            return 200, payload, "{}"
+        return valid_get(base_url, path_qs, auth, timeout)
+
+    monkeypatch.setattr(smoke, "_get", fake_get)
+    monkeypatch.setattr("sys.argv", ["zendesk_archive_smoke.py", "45748"])
+    with pytest.raises(SystemExit) as exc:
+        smoke.main()
+    assert exc.value.code == 1
+    assert "malformed payload" in capsys.readouterr().err

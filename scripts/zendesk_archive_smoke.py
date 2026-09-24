@@ -46,7 +46,7 @@ Exit codes
      single GET /tickets/{id}.json before treating the ID as missing
   3  requested IDs missing from BOTH paths (deleted / never existed?)
   1  transport failure, bad credentials, or a malformed HTTP 200 payload
-     (batch or single); nothing concluded
+     (batch, single, or users); nothing concluded
 
 Stdlib only; no backend imports, runs anywhere Python 3.9+ runs.
 """
@@ -197,7 +197,14 @@ def main() -> None:
         sys.exit(1)
     show_many: dict[str, dict[str, Any]] = {}
     for ticket in payload["tickets"]:
-        if isinstance(ticket, dict) and "id" in ticket:
+        if not isinstance(ticket, dict):
+            print(
+                "  fatal: show_many answered 200 with a malformed payload "
+                "(non-object ticket entry); nothing concluded.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if "id" in ticket:
             show_many[str(ticket["id"])] = ticket
     print(
         f"  payload count={payload.get('count')} "
@@ -257,12 +264,21 @@ def main() -> None:
         status, payload, raw = _get(base_url, f"/users/show_many.json?{qs}", auth, timeout)
         print(f"[users] GET /users/show_many.json?ids=<n={len(requester_ids)}> -> HTTP {status}")
         if status == 200:
-            if isinstance(payload, dict) and isinstance(payload.get("users"), list):
-                for entry in payload["users"]:
-                    if isinstance(entry, dict) and "id" in entry:
-                        resolved[str(entry["id"])] = entry
-            else:
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("users"), list)
+                or any(not isinstance(entry, dict) for entry in payload["users"])
+            ):
                 print(f"  body: {_snippet(raw, 200)}")
+                print(
+                    "  fatal: users/show_many answered 200 with a malformed payload "
+                    "(expected a list of user objects); nothing concluded.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            for entry in payload["users"]:
+                if "id" in entry:
+                    resolved[str(entry["id"])] = entry
         else:
             print(f"  body: {_snippet(raw, 200)}")
     for rid in requester_ids:
