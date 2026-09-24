@@ -359,7 +359,19 @@ def test_entry_without_id_exits_2(verify, denylist, monkeypatch):
     pages = [_page([{"meta": {"name": "1001-order.md"}}], 1)]
     code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
     assert code == 2
-    assert "without id" in out
+    assert "missing or unusable string id" in out
+
+
+@pytest.mark.parametrize("bad_id", [True, False, 1, 1.5])
+def test_entry_with_non_string_id_exits_2(verify, denylist, monkeypatch, bad_id):
+    """PR #47: JSON true/1 are equal dict keys in Python, so a leaked entry
+    keyed by true could be overwritten by a later safe entry keyed by 1 and
+    the exact-count guard would still pass. Entry ids must be non-empty
+    strings, matching OikbClient.list_kb_files."""
+    pages = [_page([{"id": bad_id, "meta": {"name": "1001-order.md"}}], 1)]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 2
+    assert "missing or unusable string id" in out
 
 
 def test_incomplete_listing_exits_2(verify, denylist, monkeypatch):

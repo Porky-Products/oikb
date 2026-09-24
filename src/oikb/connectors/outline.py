@@ -66,7 +66,17 @@ class OutlineConnector(BaseConnector):
 
             resp = self._http.post("/api/documents.list", json=params)
             resp.raise_for_status()
-            docs = resp.json().get("data", [])
+            payload = resp.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                # A malformed page (non-object body, or data missing/null/
+                # non-list) must not be read as natural exhaustion: that
+                # would return the partial manifest as complete and hide
+                # the remaining documents. Fail closed instead.
+                raise ValueError(
+                    "Outline documents.list returned a malformed payload: "
+                    "expected a JSON object with a list-valued 'data' field"
+                )
+            docs = payload["data"]
 
             if not docs:
                 break
