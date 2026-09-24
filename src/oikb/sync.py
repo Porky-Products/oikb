@@ -275,8 +275,11 @@ def _run_sync_inner(
     # the diff cannot see.  Filter such "added" entries before the
     # dry-run return so dry runs report the same totals the real run
     # would produce.  "modified" entries are left alone: their stale
-    # file is only cleaned up after the replacement uploads, so a hash
-    # collision fails loudly while the old copy is retained.
+    # file is only cleaned up after the replacement uploads.  When the
+    # new content is byte-identical to the still-indexed stale copy,
+    # the upload is rejected with "Duplicate content detected";
+    # _upload_one resolves that by deleting the stale copy and
+    # retrying, so the run still converges.
     # Scope: only sound for content-addressed connectors, where
     # checksum equality implies content equality.  (zendesktickets is
     # content-addressed; gdrive is only when md5Checksum is present —
@@ -365,7 +368,10 @@ def _run_sync_inner(
     # successfully (see _cleanup_replaced): deleting it first meant an
     # unreadable source (empty read or SourceFileUnavailable) or a failed
     # upload left the KB with neither the old nor the new copy — data
-    # loss instead of a harmless skip.
+    # loss instead of a harmless skip.  The one exception is the
+    # duplicate-content retry in _upload_one, which deletes the stale
+    # copy only after the server proved that copy is what blocks the
+    # replacement.
     deleted_ids = [d["file_id"] for d in deleted]
 
     if deleted_ids:
@@ -405,13 +411,18 @@ def _run_sync_inner(
     # (unreadable source, SourceFileUnavailable, or a failed upload) are
     # retained instead of deleted, so the KB keeps at least one version.
     retain_stale: set[str] = set()
+    # Stale files already deleted mid-upload by the duplicate-content
+    # retry in _upload_one must not be deleted a second time.
+    stale_deleted: set[str] = set()
 
     def _cleanup_replaced() -> None:
         """Delete modified entries' stale files after their replacements
         uploaded, and remove emptied directories."""
         stale_modified_ids = [
             m["stale_file_id"] for m in modified
-            if m.get("stale_file_id") and m["stale_file_id"] not in retain_stale
+            if m.get("stale_file_id")
+            and m["stale_file_id"] not in retain_stale
+            and m["stale_file_id"] not in stale_deleted
         ]
         if not stale_modified_ids and not rmdir:
             return
@@ -498,6 +509,27 @@ def _run_sync_inner(
                     # Non-JSON error bodies are expected (plain-text or HTML
                     # gateway errors); deliberately fall back to response.text.
                     pass
+                # A modified entry whose new content is byte-identical to its
+                # still-indexed stale copy is rejected with "Duplicate content
+                # detected": the server hashes content, not checksums.  Delete
+                # the stale copy and retry so the replacement (and its
+                # checksum) lands, instead of erroring — and orphaning a File
+                # row — on every run.
+                stale_id = entry.get("stale_file_id")
+                if (
+                    e.response.status_code == 400
+                    and attempt < 2
+                    and stale_id
+                    and stale_id not in stale_deleted
+                    and "duplicate content" in detail.lower()
+                ):
+                    try:
+                        client.sync_cleanup(kb_id, [stale_id])
+                    except Exception:  # noqa: BLE001 -- cleanup failure leaves the stale copy indexed; the error path below retains it
+                        break
+                    stale_deleted.add(stale_id)
+                    last_err = e
+                    continue
                 last_err = RuntimeError(f"{e} — {detail}") if detail else e
                 break
             except httpx.TimeoutException as e:
