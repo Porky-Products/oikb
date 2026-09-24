@@ -242,7 +242,15 @@ class OikbClient:
             if reported_total is None:
                 if not new_items:
                     break  # natural exhaustion: no total, nothing new
-            elif len(files) >= reported_total:
+            elif len(files) > reported_total:
+                # More unique files than the binding total is internally
+                # inconsistent metadata: the total cannot be trusted to
+                # mark the listing complete, and later pages may still
+                # hold files. Complete-or-raise means raise here.
+                raise ValueError(
+                    f"Malformed KB file listing for {kb_id}: collected {len(files)} unique files exceeding the reported total of {reported_total} on page {page}"
+                )
+            elif len(files) == reported_total:
                 break
             elif not new_items:
                 raise ValueError(
