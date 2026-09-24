@@ -300,6 +300,81 @@ def test_modified_file_cleanup_runs_after_successful_upload():
     assert upload_idx < cleanup_idx
 
 
+def _duplicate_content_error():
+    response = httpx.Response(
+        400, json={"detail": "Duplicate content detected."},
+        request=httpx.Request("POST", "https://webui.example/files"),
+    )
+    return httpx.HTTPStatusError("Bad Request", request=response.request, response=response)
+
+
+def test_duplicate_content_modified_file_deletes_stale_and_retries():
+    """A modified file whose new content is byte-identical to its
+    still-indexed stale copy is rejected with "Duplicate content
+    detected"; the stale copy is deleted and the upload retried so the
+    run converges instead of erroring forever."""
+    client = Mock()
+    client.sync_diff.return_value = {
+        "modified": [
+            {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
+        ]
+    }
+    client.upload_file.side_effect = [_duplicate_content_error(), Mock()]
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=Source({"a.txt": b"same"})),
+        quiet=True,
+    )
+    assert client.upload_file.call_count == 2
+    client.sync_cleanup.assert_called_once_with("kb", ["old-1"])
+    cleanup_idx = next(i for i, c in enumerate(client.mock_calls) if c[0] == "sync_cleanup")
+    second_upload_idx = [i for i, c in enumerate(client.mock_calls) if c[0] == "upload_file"][1]
+    assert cleanup_idx < second_upload_idx
+    assert result.modified == 1
+    assert not result.errors
+
+
+def test_duplicate_content_retry_still_failing_keeps_single_delete():
+    """If the retry also hits duplicate content (another file owns the
+    hash), the error surfaces and the stale copy is not deleted twice."""
+    client = Mock()
+    client.sync_diff.return_value = {
+        "modified": [
+            {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
+        ]
+    }
+    client.upload_file.side_effect = [_duplicate_content_error(), _duplicate_content_error()]
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=Source({"a.txt": b"same"})),
+        quiet=True,
+    )
+    assert client.upload_file.call_count == 2
+    client.sync_cleanup.assert_called_once_with("kb", ["old-1"])
+    assert result.errors
+
+
+def test_duplicate_content_added_file_does_not_delete_anything():
+    """Added entries have no stale copy to remove: a duplicate-content
+    rejection is a plain error."""
+    client = Mock()
+    client.sync_diff.return_value = {
+        "added": [{"filename": "a.txt", "path": "", "checksum": "new", "size": 3}]
+    }
+    client.upload_file.side_effect = [_duplicate_content_error()]
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=Source({"a.txt": b"a"})),
+        quiet=True,
+    )
+    client.upload_file.assert_called_once()
+    client.sync_cleanup.assert_not_called()
+    assert result.errors
+
+
 def test_rmdir_only_diff_still_cleans_up():
     """A diff that only removes directories still runs cleanup after the
     (empty) upload step — the rmdir used to run in the pre-upload cleanup
