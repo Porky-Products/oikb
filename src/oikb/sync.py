@@ -299,7 +299,12 @@ def _run_sync_inner(
         # move is an added path plus a deleted path carrying the same
         # checksum, and treating that as a duplicate would skip the new
         # path while cleanup removes the only indexed copy.  Exclude
-        # them before comparing.
+        # them before comparing.  Note the stale half of a modification is
+        # only removed after its replacement uploads, so an added entry
+        # matching those bytes can still hit a duplicate-content rejection
+        # in the same run; the error is surfaced and the entry syncs on the
+        # next run (deleting the stale copy first would reintroduce the
+        # data-loss bug the deferred cleanup prevents).
         stale_ids = {d["file_id"] for d in deleted if d.get("file_id")}
         stale_ids |= {m["stale_file_id"] for m in modified if m.get("stale_file_id")}
         existing_hashes = {

@@ -468,6 +468,39 @@ def test_duplicate_content_added_file_does_not_delete_anything():
     assert result.errors
 
 
+def test_duplicate_content_added_entry_matching_pending_stale_surfaces_error():
+    """An added entry whose bytes match a modified entry's still-indexed
+    stale copy is rejected by the server, because that copy is only
+    removed after replacements upload. The run surfaces the duplicate
+    error for the added entry (it syncs on the next run) while the
+    replacement still lands and the stale copy is cleaned exactly once,
+    at the end — never before the uploads."""
+    client = Mock()
+    client.sync_diff.return_value = {
+        "added": [{"filename": "a.txt", "path": "", "checksum": "old", "size": 3}],
+        "modified": [
+            {"filename": "m.txt", "path": "", "checksum": "new", "size": 4, "stale_file_id": "old-1"}
+        ],
+    }
+    client.list_kb_files.return_value = [
+        {"id": "old-1", "hash": hashlib.sha256(b"old").hexdigest()}
+    ]
+    client.upload_file.side_effect = [_duplicate_content_error(), None]
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(
+            return_value=Source({"a.txt": b"old", "m.txt": b"new"})
+        ),
+        quiet=True,
+    )
+    assert client.upload_file.call_count == 2
+    client.sync_cleanup.assert_called_once_with("kb", ["old-1"], None)
+    assert result.errors and "Duplicate content" in result.errors[0]
+    assert result.added == 0
+    assert result.modified == 1
+
+
 def test_rmdir_only_diff_still_cleans_up():
     """A diff that only removes directories still runs cleanup after the
     (empty) upload step — the rmdir used to run in the pre-upload cleanup
