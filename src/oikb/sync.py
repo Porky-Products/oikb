@@ -277,9 +277,10 @@ def _run_sync_inner(
     # would produce.  "modified" entries are left alone: their stale
     # file is only cleaned up after the replacement uploads.  When the
     # new content is byte-identical to the still-indexed stale copy,
-    # the upload is rejected with "Duplicate content detected";
-    # _upload_one resolves that by deleting the stale copy and
-    # retrying, so the run still converges.
+    # the upload is rejected with "Duplicate content detected"; the
+    # error is surfaced and the stale copy is retained (never deleted
+    # before the replacement succeeds), so a failed replacement cannot
+    # leave the KB without an indexed copy.
     # Scope: only sound for content-addressed connectors, where
     # checksum equality implies content equality.  (zendesktickets is
     # content-addressed; gdrive is only when md5Checksum is present —
