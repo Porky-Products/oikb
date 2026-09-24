@@ -356,6 +356,28 @@ def test_duplicate_content_retry_still_failing_keeps_single_delete():
     assert result.errors
 
 
+def test_duplicate_content_cleanup_failure_surfaces_cause():
+    """If deleting the stale copy itself fails, the surfaced error names
+    the cleanup failure instead of a meaningless `None`."""
+    client = Mock()
+    client.sync_diff.return_value = {
+        "modified": [
+            {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
+        ]
+    }
+    client.upload_file.side_effect = [_duplicate_content_error()]
+    client.sync_cleanup.side_effect = RuntimeError("cleanup boom")
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=Source({"a.txt": b"same"})),
+        quiet=True,
+    )
+    client.upload_file.assert_called_once()
+    assert result.errors and "cleanup boom" in result.errors[0]
+    assert "None" not in result.errors[0]
+
+
 def test_duplicate_content_added_file_does_not_delete_anything():
     """Added entries have no stale copy to remove: a duplicate-content
     rejection is a plain error."""
