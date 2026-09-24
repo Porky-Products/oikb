@@ -309,83 +309,46 @@ def _duplicate_content_error():
     return httpx.HTTPStatusError("Bad Request", request=response.request, response=response)
 
 
-def test_duplicate_content_modified_file_deletes_stale_and_retries():
-    """A modified file whose new content is byte-identical to its
-    still-indexed stale copy is rejected with "Duplicate content
-    detected"; the stale copy is deleted and the upload retried so the
-    run converges instead of erroring forever."""
+@pytest.mark.parametrize("concurrency", [1, 3])
+@pytest.mark.parametrize("quiet", [True, False])
+def test_duplicate_content_modified_files_retain_stale_without_retry(concurrency, quiet):
+    """Even matching bytes never justify deleting the only indexed copy.
+
+    A peer replacement may succeed, but only its stale copy is cleaned.
+    Duplicate failures must not trigger live listings inside workers.
+    """
     client = Mock()
+    content = {"a.txt": b"same", "b.txt": b"same", "c.txt": b"new"}
     client.sync_diff.return_value = {
         "modified": [
-            {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
+            {"filename": name, "path": "", "stale_file_id": f"old-{name}"}
+            for name in content
         ]
     }
     client.list_kb_files.return_value = [
-        {"id": "old-1", "hash": hashlib.sha256(b"same").hexdigest()}
+        {"id": f"old-{name}", "hash": hashlib.sha256(b"same").hexdigest()}
+        for name in content
     ]
-    client.upload_file.side_effect = [_duplicate_content_error(), Mock()]
+
+    def upload(**kwargs):
+        if kwargs["filename"] != "c.txt":
+            raise _duplicate_content_error()
+
+    client.upload_file.side_effect = upload
     result = kb_sync.run_entries_sync(
         client,
         [{"source": "one", "kb-id": "kb"}],
-        resolve_connector=Mock(return_value=Source({"a.txt": b"same"})),
-        quiet=True,
+        resolve_connector=Mock(return_value=Source(content)),
+        concurrency=concurrency,
+        quiet=quiet,
     )
-    assert client.upload_file.call_count == 2
-    client.sync_cleanup.assert_called_once_with("kb", ["old-1"])
-    cleanup_idx = next(i for i, c in enumerate(client.mock_calls) if c[0] == "sync_cleanup")
-    second_upload_idx = [i for i, c in enumerate(client.mock_calls) if c[0] == "upload_file"][1]
-    assert cleanup_idx < second_upload_idx
+    assert client.upload_file.call_count == 3
+    client.list_kb_files.assert_not_called()
+    client.sync_cleanup.assert_called_once_with("kb", ["old-c.txt"], None)
     assert result.modified == 1
-    assert not result.errors
-
-
-def test_duplicate_content_retry_still_failing_keeps_single_delete():
-    """If the retry also hits duplicate content (another file owns the
-    hash), the error surfaces and the stale copy is not deleted twice."""
-    client = Mock()
-    client.sync_diff.return_value = {
-        "modified": [
-            {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
-        ]
-    }
-    client.list_kb_files.return_value = [
-        {"id": "old-1", "hash": hashlib.sha256(b"same").hexdigest()}
-    ]
-    client.upload_file.side_effect = [_duplicate_content_error(), _duplicate_content_error()]
-    result = kb_sync.run_entries_sync(
-        client,
-        [{"source": "one", "kb-id": "kb"}],
-        resolve_connector=Mock(return_value=Source({"a.txt": b"same"})),
-        quiet=True,
-    )
-    assert client.upload_file.call_count == 2
-    client.sync_cleanup.assert_called_once_with("kb", ["old-1"])
-    assert result.errors
-
-
-def test_duplicate_content_cleanup_failure_surfaces_cause():
-    """If deleting the stale copy itself fails, the surfaced error names
-    the cleanup failure instead of a meaningless `None`."""
-    client = Mock()
-    client.sync_diff.return_value = {
-        "modified": [
-            {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
-        ]
-    }
-    client.list_kb_files.return_value = [
-        {"id": "old-1", "hash": hashlib.sha256(b"same").hexdigest()}
-    ]
-    client.upload_file.side_effect = [_duplicate_content_error()]
-    client.sync_cleanup.side_effect = RuntimeError("cleanup boom")
-    result = kb_sync.run_entries_sync(
-        client,
-        [{"source": "one", "kb-id": "kb"}],
-        resolve_connector=Mock(return_value=Source({"a.txt": b"same"})),
-        quiet=True,
-    )
-    client.upload_file.assert_called_once()
-    assert result.errors and "cleanup boom" in result.errors[0]
-    assert "None" not in result.errors[0]
+    assert len(result.errors) == 2
+    assert all("Duplicate content" in error for error in result.errors)
+    assert all("existing KB copy retained" in error for error in result.errors)
 
 
 def test_duplicate_content_mismatched_stale_hash_retains_stale_copy():

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fnmatch
-import hashlib
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -374,10 +373,9 @@ def _run_sync_inner(
     # successfully (see _cleanup_replaced): deleting it first meant an
     # unreadable source (empty read or SourceFileUnavailable) or a failed
     # upload left the KB with neither the old nor the new copy — data
-    # loss instead of a harmless skip.  The one exception is the
-    # duplicate-content retry in _upload_one, which deletes the stale
-    # copy only after the server proved that copy is what blocks the
-    # replacement.
+    # loss instead of a harmless skip. Duplicate-content rejections also
+    # retain the stale copy: deleting it to retry cannot guarantee that
+    # the replacement will succeed.
     deleted_ids = [d["file_id"] for d in deleted]
 
     if deleted_ids:
@@ -417,9 +415,6 @@ def _run_sync_inner(
     # (unreadable source, SourceFileUnavailable, or a failed upload) are
     # retained instead of deleted, so the KB keeps at least one version.
     retain_stale: set[str] = set()
-    # Stale files already deleted mid-upload by the duplicate-content
-    # retry in _upload_one must not be deleted a second time.
-    stale_deleted: set[str] = set()
 
     def _cleanup_replaced() -> None:
         """Delete modified entries' stale files after their replacements
@@ -428,7 +423,6 @@ def _run_sync_inner(
             m["stale_file_id"] for m in modified
             if m.get("stale_file_id")
             and m["stale_file_id"] not in retain_stale
-            and m["stale_file_id"] not in stale_deleted
         ]
         if not stale_modified_ids and not rmdir:
             return
@@ -468,10 +462,6 @@ def _run_sync_inner(
         last_err: Exception | None = None
         for attempt in range(3):
             check_stop()
-            # Reset per attempt so the duplicate-content handler below can
-            # tell "this attempt's read succeeded" from a stale binding
-            # (e.g. read_file itself raising HTTPStatusError).
-            content: bytes | None = None
             try:
                 content = connector.read_file(path, filename)
                 if not content:
@@ -519,35 +509,11 @@ def _run_sync_inner(
                     # Non-JSON error bodies are expected (plain-text or HTML
                     # gateway errors); deliberately fall back to response.text.
                     pass
-                # A modified entry whose new content is byte-identical to its
-                # still-indexed stale copy is rejected with "Duplicate content
-                # detected": the server hashes content, not checksums.  Delete
-                # the stale copy and retry so the replacement (and its
-                # checksum) lands, instead of erroring — and orphaning a File
-                # row — on every run.  The response only proves that *some*
-                # indexed file has these bytes, though: delete the stale copy
-                # only after verifying its server-side content hash matches
-                # the bytes being uploaded.  Otherwise the retry would fail
-                # anyway (another file owns the hash) and the failed
-                # replacement would have lost its stale copy.
-                stale_id = entry.get("stale_file_id")
-                if (
-                    e.response.status_code == 400
-                    and attempt < 2
-                    and stale_id
-                    and stale_id not in stale_deleted
-                    and "duplicate content" in detail.lower()
-                    and content is not None
-                    and _stale_copy_owns_content(content, client, kb_id, stale_id)
-                ):
-                    try:
-                        client.sync_cleanup(kb_id, [stale_id])
-                    except Exception as cleanup_err:  # noqa: BLE001 -- cleanup failure leaves the stale copy indexed; the error path below retains it
-                        last_err = cleanup_err
-                        break
-                    stale_deleted.add(stale_id)
-                    last_err = e
-                    continue
+                # A duplicate rejection is terminal too. Even a matching
+                # stale hash cannot make delete-then-retry safe: the next
+                # upload could fail and leave no indexed copy.
+                if change_type == "modified" and entry.get("stale_file_id"):
+                    detail = f"{detail} — existing KB copy retained"
                 last_err = RuntimeError(f"{e} — {detail}") if detail else e
                 break
             except httpx.TimeoutException as e:
@@ -637,32 +603,6 @@ def _run_sync_inner(
     _cleanup_replaced()
 
     return result
-
-
-def _stale_copy_owns_content(content: bytes, client: Any, kb_id: str, stale_id: str) -> bool:
-    """True only if the stale KB file's server-side content hash matches
-    the bytes about to be uploaded.
-
-    A "Duplicate content detected" response proves only that *some*
-    indexed file already has these bytes; deleting the stale copy is
-    sound only when the stale file is that conflicting file.  ``hash``
-    is open-webui's full SHA-256 of the stored bytes; ``meta.file_hash``
-    is the manifest checksum sent at upload time (a 16-char content
-    digest for content-addressed connectors).  Anything unverifiable —
-    stale file absent from the listing, no usable hash, listing
-    failure — returns False so the stale copy is retained and the
-    duplicate error surfaces.
-    """
-    digest = hashlib.sha256(content).hexdigest()
-    try:
-        kb_files = client.list_kb_files(kb_id)
-    except Exception:  # noqa: BLE001 -- unverifiable means no delete
-        return False
-    for f in kb_files:
-        if f.get("id") == stale_id:
-            candidates = ((f.get("meta") or {}).get("file_hash"), f.get("hash"))
-            return any(h in (digest, digest[:16]) for h in candidates if h)
-    return False
 
 
 def filter_duplicate_uploads(
