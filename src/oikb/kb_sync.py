@@ -8,6 +8,7 @@ from dataclasses import replace
 
 from oikb.client import OikbClient
 from oikb.connectors import BaseConnector, ManifestEntry
+from oikb.duplicate_failures import DuplicateFailureTracker
 from oikb.sync import (
     SyncCancelled,
     SyncResult,
@@ -63,6 +64,19 @@ class _CombinedConnector(BaseConnector):
             if callable(mark):
                 mark()
 
+    def requires_empty_sync(self) -> bool:
+        # sync treats an empty manifest as "nothing to sync" unless the
+        # connector requests an empty sync (e.g. every carried-forward
+        # ticket was denylisted away). Forward so a grouped run whose only
+        # source became empty still runs sync_diff/sync_cleanup instead of
+        # stranding the KB's stale files.
+        return any(
+            callable(req) and req()
+            for req in (
+                getattr(child, "requires_empty_sync", None) for child in self._children
+            )
+        )
+
 
 def run_entries_sync(
     client: OikbClient,
@@ -75,6 +89,7 @@ def run_entries_sync(
     max_file_size: str | None = None,
     concurrency: int = 1,
     cancel_requested: Callable[[], bool] | None = None,
+    duplicate_failures: DuplicateFailureTracker | None = None,
 ) -> SyncResult:
     """Scan and filter every source before allowing a KB-wide diff or deletion.
 
@@ -131,4 +146,5 @@ def run_entries_sync(
             quiet=quiet,
             concurrency=max(entry.get("concurrency", concurrency) for entry in entries),
             cancel_requested=cancel_requested,
+            duplicate_failures=duplicate_failures,
         )

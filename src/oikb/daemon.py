@@ -17,6 +17,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from oikb import __version__
+from oikb.duplicate_failures import DuplicateFailureTracker
 from oikb.env import API_KEY
 from oikb.history import SyncHistory
 from oikb.metrics import record_sync, set_build_info
@@ -46,6 +47,7 @@ app = FastAPI(
 # Runtime state populated by start_daemon().
 _scheduler_state: dict[str, dict[str, Any]] = {}
 _sync_locks: dict[str, asyncio.Lock] = {}
+_duplicate_failures: dict[tuple[str, str], DuplicateFailureTracker] = {}
 _history: SyncHistory | None = None
 _entries: list[dict] = []
 _shutdown_event: asyncio.Event | None = None
@@ -185,14 +187,21 @@ async def history_endpoint(
     summary="Trigger an immediate sync by alias or KB ID",
     dependencies=[Depends(verify_api_key)],
 )
-async def trigger_sync(identifier: str, dry_run: bool = False):
-    """Triggers an immediate sync matching the given alias or Knowledge Base ID. The sync runs asynchronously in the background. Use get_sync_status to check progress. Set dry_run=true to preview changes without uploading."""
+async def trigger_sync(identifier: str, dry_run: bool = False, retry_blocked: bool = False):
+    """Trigger a sync by alias or KB ID; use get_sync_status for progress.
+
+    dry_run previews changes without uploads or changes to failure counts.
+    retry_blocked resets duplicate failure counts for this KB before syncing;
+    it cannot be combined with dry_run.
+    """
+    if dry_run and retry_blocked:
+        raise HTTPException(status_code=400, detail="retry_blocked cannot be combined with dry_run")
     for entry in _entries:
         if entry.get("name") == identifier or entry.get("kb-id") == identifier:
             if dry_run:
                 result = await _run_entry(entry, dry_run=True)
                 return {"dry_run": True, "name": entry.get("name"), "kb_id": entry.get("kb-id"), "result": result}
-            asyncio.create_task(_run_entry(entry))
+            asyncio.create_task(_run_entry(entry, retry_blocked=retry_blocked))
             return {"triggered": True, "name": entry.get("name"), "kb_id": entry.get("kb-id")}
     return {"triggered": False, "error": f"No entry matching '{identifier}'"}
 
@@ -239,7 +248,7 @@ async def _send_notification(entry: dict, payload: dict) -> None:
         log.warning(f"Notification failed for {source}: {exc}")
 
 
-async def _run_entry(entry: dict, dry_run: bool = False) -> dict | None:
+async def _run_entry(entry: dict, dry_run: bool = False, retry_blocked: bool = False) -> dict | None:
     """Sync every configured source sharing this entry's KB.
 
     Uses a per-KB lock to prevent overlapping syncs to the same
@@ -257,10 +266,10 @@ async def _run_entry(entry: dict, dry_run: bool = False) -> dict | None:
         return {"skipped": True, "reason": "sync already running"} if dry_run else None
 
     async with lock:
-        return await _run_entry_locked(entry, dry_run=dry_run)
+        return await _run_entry_locked(entry, dry_run=dry_run, retry_blocked=retry_blocked)
 
 
-async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
+async def _run_entry_locked(entry: dict, dry_run: bool = False, retry_blocked: bool = False) -> dict | None:
     """Inner sync logic, called under the per-KB lock."""
     from oikb.cli import _make_client, _resolve_connector
     from oikb.kb_sync import run_entries_sync
@@ -283,11 +292,17 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
 
     try:
         client = _make_client(url=entry.get("url"), token=entry.get("token"))
+        failures = None
+        if not dry_run:
+            failures = _duplicate_failures.setdefault((client.base_url, kb_id), DuplicateFailureTracker())
+            if retry_blocked:
+                failures.clear()
         result = await asyncio.to_thread(
             run_entries_sync,
             client, entries, resolve_connector=_resolve_connector,
             dry_run=dry_run, quiet=True,
             cancel_requested=_shutdown_event.is_set if _shutdown_event else None,
+            duplicate_failures=failures,
         )
 
         if dry_run:
@@ -309,6 +324,7 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
             status=status, last_sync=time.time(), duration_ms=duration_ms,
             files_added=result.added, files_modified=result.modified,
             files_deleted=result.deleted, unmodified=result.unmodified,
+            duplicate_blocked=result.duplicate_blocked,
             warnings=result.warnings or [], errors=result.errors or [],
         )
 
@@ -335,7 +351,8 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
                 error="\n".join(result.errors or []) or None,
             )
 
-        log.info(
+        log_sync = log.warning if result.duplicate_blocked else log.info
+        log_sync(
             f"Synced {source} -> {kb_id}: {result.summary()} ({duration_ms}ms)"
         )
 
@@ -351,6 +368,7 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
                 "files_deleted": result.deleted,
                 "warnings": result.warnings or [],
                 "errors": result.errors or [],
+                "duplicate_blocked": result.duplicate_blocked,
             })
 
     except SyncCancelled:
@@ -459,6 +477,7 @@ def start_daemon(
     from oikb.kb_sync import group_entries_by_kb
     group_entries_by_kb(entries)  # Validate shared destinations before starting tasks.
     _entries = entries
+    _duplicate_failures.clear()
     _history = SyncHistory()
     set_build_info(__version__)
 

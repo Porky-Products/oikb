@@ -203,9 +203,21 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
                 # by 1 and the exact-count guard would still pass. Require
                 # a non-empty string id, matching OikbClient.list_kb_files.
                 _die(f"KB file entry with missing or unusable string id: {str(entry)[:200]}")
-            if entry_id not in items_by_id:
+            existing = items_by_id.get(entry_id)
+            if existing is None:
                 page_new += 1
-            items_by_id[entry_id] = entry
+                items_by_id[entry_id] = entry
+            elif existing != entry:
+                # The same id reappearing with different metadata means the
+                # listing shifted while it was being read: the pages held so
+                # far are not a stable complete set, and keeping either copy
+                # could hide a leaked entry behind a safe one (or vice versa)
+                # once the unique count reaches total. Identical duplicates
+                # (overlapping pages serving the same entry) still dedupe.
+                _die(
+                    f"KB listing returned conflicting entries for id {entry_id!r}: "
+                    "the listing moved between pages, so no CLEAN verdict is possible"
+                )
         seen_total = total
         if len(items_by_id) > total:
             # More unique ids than the declared total means the server's

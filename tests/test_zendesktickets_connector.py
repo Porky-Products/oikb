@@ -1588,7 +1588,12 @@ def test_disabling_attachments_removes_prior_attachment_files(monkeypatch: pytes
 
     assert result.deleted == 1
     assert [upload["filename"] for upload in client.upload_calls] == ["1001.md"]
-    assert client.cleanup_calls == [{"kb_id": "kb-1", "file_ids": ["file-img", "file-md"], "dir_ids": None}]
+    # Cleanup is split: diff-deleted files go first (before upload), the
+    # modified file's stale copy goes after its replacement uploaded.
+    assert client.cleanup_calls == [
+        {"kb_id": "kb-1", "file_ids": ["file-img"], "dir_ids": None},
+        {"kb_id": "kb-1", "file_ids": ["file-md"], "dir_ids": None},
+    ]
 
 
 def test_attachments_with_same_name_use_content_hashes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

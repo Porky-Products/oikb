@@ -45,7 +45,8 @@ Exit codes
      blind; the scanner must cross-check every show_many omission with a
      single GET /tickets/{id}.json before treating the ID as missing
   3  requested IDs missing from BOTH paths (deleted / never existed?)
-  1  transport failure or bad credentials; nothing concluded
+  1  transport failure, bad credentials, or a malformed HTTP 200 payload
+     (batch, single, or users); nothing concluded
 
 Stdlib only; no backend imports, runs anywhere Python 3.9+ runs.
 """
@@ -186,12 +187,27 @@ def main() -> None:
         print(f"  body: {_snippet(raw, 300)}")
         print("  fatal: show_many did not answer 200; nothing concluded.", file=sys.stderr)
         sys.exit(1)
+    if not isinstance(payload, dict) or not isinstance(payload.get("tickets"), list):
+        print(f"  body: {_snippet(raw, 300)}")
+        print(
+            "  fatal: show_many answered 200 with a malformed payload "
+            "(expected a JSON object with a list-valued 'tickets' field); nothing concluded.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     show_many: dict[str, dict[str, Any]] = {}
-    for ticket in (payload or {}).get("tickets") or []:
-        if isinstance(ticket, dict) and "id" in ticket:
+    for ticket in payload["tickets"]:
+        if not isinstance(ticket, dict):
+            print(
+                "  fatal: show_many answered 200 with a malformed payload "
+                "(non-object ticket entry); nothing concluded.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if "id" in ticket:
             show_many[str(ticket["id"])] = ticket
     print(
-        f"  payload count={((payload or {}).get('count'))} "
+        f"  payload count={payload.get('count')} "
         f"returned={len(show_many)} requested={len(ids)}"
     )
 
@@ -200,9 +216,17 @@ def main() -> None:
     for ticket_id in ids:
         status, payload, raw = _get(base_url, f"/tickets/{ticket_id}.json", auth, timeout)
         print(f"[single] GET /tickets/{ticket_id}.json -> HTTP {status}")
-        if status == 200 and isinstance((payload or {}).get("ticket"), dict):
+        if status == 200 and isinstance(payload, dict) and isinstance(payload.get("ticket"), dict):
             by_single[ticket_id] = payload["ticket"]
-        elif status != 200:
+        elif status == 200:
+            print(f"  body: {_snippet(raw, 200)}")
+            print(
+                "  fatal: single GET answered 200 with a malformed payload "
+                "(expected a JSON object with a 'ticket' object); nothing concluded.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        else:
             print(f"  body: {_snippet(raw, 200)}")
 
     # ---- Ticket detail report ------------------------------------------
@@ -240,11 +264,21 @@ def main() -> None:
         status, payload, raw = _get(base_url, f"/users/show_many.json?{qs}", auth, timeout)
         print(f"[users] GET /users/show_many.json?ids=<n={len(requester_ids)}> -> HTTP {status}")
         if status == 200:
-            for entry in (payload or {}).get("users") or []:
-                if isinstance(entry, dict) and "id" in entry:
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(payload.get("users"), list)
+                or any(not isinstance(entry, dict) for entry in payload["users"])
+            ):
+                print(f"  body: {_snippet(raw, 200)}")
+                print(
+                    "  fatal: users/show_many answered 200 with a malformed payload "
+                    "(expected a list of user objects); nothing concluded.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            for entry in payload["users"]:
+                if "id" in entry:
                     resolved[str(entry["id"])] = entry
-                else:
-                    print(f"  body: {_snippet(raw, 200)}")
         else:
             print(f"  body: {_snippet(raw, 200)}")
     for rid in requester_ids:
