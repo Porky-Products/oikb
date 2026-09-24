@@ -1296,3 +1296,42 @@ def test_reset_recovers_from_non_object_state(scan, tmp_path, monkeypatch, capsy
     # The damaged state file was replaced by the fresh pass's completion state.
     state = json.loads((tmp_path / "state.json").read_text())
     assert state["next_id"] == 2
+
+def test_fetch_ticket_comments_malformed_next_page_raises(scan):
+    """PR #47 follow-up: Zendesk's contract is `next_page` = null or a URL
+    string. Falsey malformed values (false, 0, "") used to be treated as
+    terminal via bool(), presenting a possibly-incomplete comment set as
+    complete and allowing an automatic verdict on absent evidence."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for bad in (False, 0, "", True, 5, ["http://n"], {"url": "http://n"}):
+            monkey.setattr(
+                scan_type,
+                "_get",
+                lambda self, path, p=bad: (200, {"comments": [], "next_page": p}, b"raw"),
+            )
+            with pytest.raises(RuntimeError, match="malformed next_page"):
+                client.fetch_ticket_comments(1)
+    finally:
+        monkey.undo()
+
+
+def test_fetch_ticket_comments_next_page_contract_preserved(scan):
+    """Behavior preservation: null stays terminal, a non-empty URL string
+    stays paginated."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for page, expected in ((None, False), ("http://n", True)):
+            monkey.setattr(
+                scan_type,
+                "_get",
+                lambda self, path, p=page: (200, {"comments": [], "next_page": p}, b"raw"),
+            )
+            _, more, _ = client.fetch_ticket_comments(1)
+            assert more is expected
+    finally:
+        monkey.undo()

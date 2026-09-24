@@ -401,7 +401,22 @@ class ZendeskClient:
                     f"Zendesk comments HTTP 200 for ticket {ticket_id} carried a "
                     f"non-object comment entry ({comment!r})"
                 )
-        more = bool(payload.get("next_page"))
+        # Zendesk's contract: ``next_page`` is ``null`` (terminal) or a
+        # URL string. Any other value — ``false``, ``0``, ``""``, a number,
+        # a list — is malformed metadata: treating a falsey one as
+        # terminal would present a possibly-incomplete comment set as
+        # complete and could yield an automatic verdict on absent
+        # evidence. Fail closed instead (state resumes at the batch
+        # boundary).
+        next_page = payload.get("next_page")
+        if next_page is None:
+            more = False
+        elif isinstance(next_page, str) and next_page:
+            more = True
+        else:
+            raise RuntimeError(
+                f"Zendesk comments HTTP 200 for ticket {ticket_id} carried a malformed next_page ({next_page!r})"
+            )
         return comments, more, False
 
     def show_many_users(self, ids: list[int]) -> dict[int, dict[str, Any]]:
