@@ -1,3 +1,4 @@
+import hashlib
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import httpx
@@ -319,6 +320,9 @@ def test_duplicate_content_modified_file_deletes_stale_and_retries():
             {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
         ]
     }
+    client.list_kb_files.return_value = [
+        {"id": "old-1", "hash": hashlib.sha256(b"same").hexdigest()}
+    ]
     client.upload_file.side_effect = [_duplicate_content_error(), Mock()]
     result = kb_sync.run_entries_sync(
         client,
@@ -344,6 +348,9 @@ def test_duplicate_content_retry_still_failing_keeps_single_delete():
             {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
         ]
     }
+    client.list_kb_files.return_value = [
+        {"id": "old-1", "hash": hashlib.sha256(b"same").hexdigest()}
+    ]
     client.upload_file.side_effect = [_duplicate_content_error(), _duplicate_content_error()]
     result = kb_sync.run_entries_sync(
         client,
@@ -365,6 +372,9 @@ def test_duplicate_content_cleanup_failure_surfaces_cause():
             {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
         ]
     }
+    client.list_kb_files.return_value = [
+        {"id": "old-1", "hash": hashlib.sha256(b"same").hexdigest()}
+    ]
     client.upload_file.side_effect = [_duplicate_content_error()]
     client.sync_cleanup.side_effect = RuntimeError("cleanup boom")
     result = kb_sync.run_entries_sync(
@@ -376,6 +386,67 @@ def test_duplicate_content_cleanup_failure_surfaces_cause():
     client.upload_file.assert_called_once()
     assert result.errors and "cleanup boom" in result.errors[0]
     assert "None" not in result.errors[0]
+
+
+def test_duplicate_content_mismatched_stale_hash_retains_stale_copy():
+    """A duplicate-content response proves only that *some* indexed file
+    has these bytes. When the stale file's server-side hash does not
+    match the uploaded bytes, another file owns the hash: the stale copy
+    must be retained and the duplicate error surfaced, not deleted into
+    a guaranteed-failing retry."""
+    client = Mock()
+    client.sync_diff.return_value = {
+        "modified": [
+            {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
+        ]
+    }
+    client.list_kb_files.return_value = [
+        {"id": "old-1", "hash": hashlib.sha256(b"different").hexdigest()}
+    ]
+    client.upload_file.side_effect = [_duplicate_content_error()]
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=Source({"a.txt": b"same"})),
+        quiet=True,
+    )
+    client.upload_file.assert_called_once()
+    client.sync_cleanup.assert_not_called()
+    assert result.errors and "Duplicate content" in result.errors[0]
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        [{"id": "other-1", "hash": "x"}],  # stale file absent from the listing
+        [{"id": "old-1"}],  # no usable hash fields
+        RuntimeError("listing boom"),  # the listing itself fails
+    ],
+)
+def test_duplicate_content_unverifiable_stale_retains_stale_copy(listing):
+    """No verifiable server-side hash for the stale file means the delete
+    cannot be proven safe: retain the stale copy and surface the
+    duplicate error."""
+    client = Mock()
+    client.sync_diff.return_value = {
+        "modified": [
+            {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
+        ]
+    }
+    client.upload_file.side_effect = [_duplicate_content_error()]
+    if isinstance(listing, Exception):
+        client.list_kb_files.side_effect = listing
+    else:
+        client.list_kb_files.return_value = listing
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=Source({"a.txt": b"same"})),
+        quiet=True,
+    )
+    client.upload_file.assert_called_once()
+    client.sync_cleanup.assert_not_called()
+    assert result.errors and "Duplicate content" in result.errors[0]
 
 
 def test_duplicate_content_added_file_does_not_delete_anything():

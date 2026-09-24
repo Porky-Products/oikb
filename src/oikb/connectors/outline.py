@@ -69,7 +69,18 @@ class OutlineConnector(BaseConnector):
                 None,
             )
             if col:
-                collection_id = col["id"]
+                resolved_id = col.get("id")
+                if not isinstance(resolved_id, str) or not resolved_id:
+                    # A matched collection with an empty, null, or non-string
+                    # id would make `if collection_id` false below, so
+                    # documents.list would omit collectionId and silently
+                    # sync the entire workspace. Fail closed instead.
+                    raise ValueError(
+                        f"Outline collection {self._collection!r} matched but "
+                        f"carries a malformed id ({resolved_id!r}); refusing "
+                        "to fall back to a workspace-wide sync"
+                    )
+                collection_id = resolved_id
             else:
                 # A configured collection that cannot be resolved must fail
                 # before listing documents: leaving collection_id None makes

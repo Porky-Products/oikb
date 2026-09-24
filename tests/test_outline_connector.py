@@ -168,6 +168,31 @@ def test_unresolvable_collection_fails_before_listing_documents() -> None:
 
 
 @respx.mock
+@pytest.mark.parametrize("bad_id", ["", None, 7, ["col-9"]])
+def test_malformed_collection_id_fails_before_listing_documents(bad_id) -> None:
+    """A matched collection with an empty, null, or non-string id must
+    fail closed: assigning it would make `if collection_id` false, so
+    documents.list would omit collectionId and silently sync the entire
+    workspace instead of the requested scope."""
+    respx.post("https://outline.example/api/collections.list").mock(
+        return_value=httpx.Response(
+            200, json={"data": [{"id": bad_id, "name": "Wanted"}]}
+        )
+    )
+    docs_route = respx.post("https://outline.example/api/documents.list").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+    with (
+        OutlineConnector(
+            token="token", base_url="https://outline.example", collection="Wanted"
+        ) as connector,
+        pytest.raises(ValueError, match="malformed id"),
+    ):
+        connector.build_manifest()
+    assert docs_route.call_count == 0
+
+
+@respx.mock
 def test_resolved_collection_scopes_documents_list() -> None:
     """A collection resolved from any page of collections.list scopes
     every documents.list request with its collectionId."""
