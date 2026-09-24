@@ -2320,6 +2320,26 @@ def test_fetch_ticket_comments_non_dict_comment_element_returns_none(monkeypatch
     connector.close()
 
 
+@pytest.mark.parametrize("bad_next_page", [False, 0, ""])
+def test_fetch_ticket_comments_falsey_next_page_returns_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_next_page
+):
+    """PR #47: Zendesk's pagination contract is null (terminal) or a
+    non-empty URL string. A falsey non-null next_page (false, 0, "") is
+    malformed metadata, not end-of-pages: treating it as terminal would
+    sync a possibly-partial comment set, so the ticket must be skipped."""
+    state_dir = _make_state_dir(tmp_path, f"comments-falsey-next-page-{type(bad_next_page).__name__}")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "next_page": None}],
+        comment_pages={1001: [{"comments": [_comment(501, "First page.")], "next_page": bad_next_page}]},
+    )
+
+    assert connector._fetch_ticket_comments(1001) is None
+    connector.close()
+
+
 def test_fetch_ticket_comments_valid_payload_returns_all_comments(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """A well-formed payload still returns the full comment list."""
     state_dir = _make_state_dir(tmp_path, "comments-valid-payload")

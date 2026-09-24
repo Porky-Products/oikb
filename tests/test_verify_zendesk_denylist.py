@@ -460,6 +460,27 @@ def test_valid_int_total_proceeds(verify, monkeypatch):
     assert code == 0
 
 
+def test_items_exceeding_total_exits_2(verify, monkeypatch):
+    """PR #47: a page whose unique item count already exceeds the declared
+    total is internally inconsistent metadata (total=1 with two items).
+    Completing on >= would report CLEAN without ever checking later pages,
+    so the verifier must fail closed; completion requires exact equality."""
+    import json
+
+    body = json.dumps(
+        {
+            "items": [
+                {"id": "f1", "meta": {"name": "1001-order.md"}},
+                {"id": "f2", "meta": {"name": "1002-order.md"}},
+            ],
+            "total": 1,
+        }
+    ).encode()
+    code, err = _run_list_kb_files(verify, monkeypatch, lambda *a, **k: _FakeResponse(body))
+    assert code == 2
+    assert "reported total=1 but already yielded 2 unique files" in err
+
+
 def test_leaked_files_exact_md_match(verify):
     """F11 (issue #46): "<id>.md" is the exact-match leak form."""
     leaked, unmatchable = verify._leaked_files({"45748"}, _named_items("45748.md"))
