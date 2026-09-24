@@ -205,7 +205,17 @@ def _list_kb_files(base_url: str, api_key: str, kb_id: str, timeout: float) -> l
             except TypeError as exc:
                 _die(f"KB file entry with unusable id {entry_id!r}: {exc}")
         seen_total = total
-        if len(items_by_id) >= total:
+        if len(items_by_id) > total:
+            # More unique ids than the declared total means the server's
+            # metadata is internally inconsistent; completing here would
+            # report CLEAN from unverifiable evidence (later pages never
+            # checked). Complete only on exact equality, mirroring
+            # OikbClient.list_kb_files.
+            _die(
+                f"KB listing reported total={total} but already yielded "
+                f"{len(items_by_id)} unique files after page {page}"
+            )
+        if len(items_by_id) == total:
             break
         if page_new == 0:
             # A page that adds no new unique ids while the listing is still

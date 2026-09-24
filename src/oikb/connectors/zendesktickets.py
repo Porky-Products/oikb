@@ -616,9 +616,14 @@ class ZendeskTicketsConnector(BaseConnector):
                 return None
             comments.extend(page_comments)
             candidate = payload.get("next_page")
-            if not candidate:
+            if candidate is None:
                 return comments
-            if not isinstance(candidate, str) or _foreign_zendesk_url(candidate, self._subdomain):
+            if not isinstance(candidate, str) or not candidate or _foreign_zendesk_url(candidate, self._subdomain):
+                # Zendesk's contract: next_page is null (terminal) or a
+                # non-empty URL string. Other falsey values (false, 0, "")
+                # are malformed metadata: treating them as terminal would
+                # sync a possibly-partial comment set, breaking the
+                # fail-closed guarantee.
                 log.warning(
                     "ZendeskTicketsConnector: ticket %s returned an unusable comments next_page (%r); skipping ticket",
                     ticket_id,

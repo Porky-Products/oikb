@@ -303,7 +303,15 @@ class ZendeskClient:
         out: dict[int, dict[str, Any]] = {}
         for ticket in tickets:
             if not isinstance(ticket, dict):
-                continue
+                # A null/scalar entry is malformed Zendesk data, not an
+                # omitted ID: treating it as an omission falls back to
+                # fetch_ticket, whose 404 would mark the requested ticket
+                # deleted and consume it unclassified. Abort the run
+                # instead (state resumes at the batch boundary).
+                raise RuntimeError(
+                    f"Zendesk show_many HTTP 200 for {len(ids)} ids carried a "
+                    f"non-object ticket entry ({ticket!r})"
+                )
             tid = ticket.get("id")
             # bool is an int subclass: a JSON `true` id would alias ticket 1
             # (True == 1 and hash(True) == hash(1)), attaching another

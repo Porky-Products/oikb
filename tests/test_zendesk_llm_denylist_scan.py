@@ -1121,6 +1121,24 @@ def test_show_many_tickets_non_object_payload_raises(scan):
         monkey.undo()
 
 
+def test_show_many_tickets_non_object_entry_raises(scan):
+    """PR #47: a show_many 200 carrying a null/scalar ticket entry is
+    malformed Zendesk data, not an omitted ID. Treating it as an omission
+    falls back to fetch_ticket, whose 404 would mark the requested ticket
+    deleted and consume it unclassified — so the entry must abort the run
+    (RuntimeError reaches main's state-saving handler)."""
+    client = scan.ZendeskClient("x", "u", "t", timeout=1.0, max_retries=0)
+    scan_type = type(client)
+    monkey = pytest.MonkeyPatch()
+    try:
+        for bad in ({"tickets": [None]}, {"tickets": [42]}, {"tickets": ["oops"]}):
+            monkey.setattr(scan_type, "_get", lambda self, path, p=bad: (200, p, b"raw"))
+            with pytest.raises(RuntimeError, match="non-object ticket entry"):
+                client.show_many_tickets([1])
+    finally:
+        monkey.undo()
+
+
 def test_fetch_ticket_non_object_payload_raises(scan):
     """PR #47: a ticket 200 whose body is not a JSON object must abort the
     run, not traceback with AttributeError. None stays reserved for 404."""
