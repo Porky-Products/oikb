@@ -5,7 +5,7 @@ import pytest
 from click.testing import CliRunner
 
 from oikb import kb_sync
-from oikb.connectors import BaseConnector, ManifestEntry
+from oikb.connectors import BaseConnector, ManifestEntry, SourceFileUnavailable
 from oikb.sync import SyncCancelled, SyncResult
 
 
@@ -187,3 +187,132 @@ def test_run_entries_sync_advances_checkpoints_on_every_child_including_empty_on
     )
     full.mark_sync_complete.assert_called_once_with()
     empty.mark_sync_complete.assert_called_once_with()
+
+
+def test_combined_connector_forwards_requires_empty_sync():
+    requesting = Mock()
+    requesting.requires_empty_sync = Mock(return_value=True)
+    nonrequesting = Mock()
+    nonrequesting.requires_empty_sync = Mock(return_value=False)
+    plain = Mock(spec=BaseConnector)  # Most connectors define no requires_empty_sync.
+    assert kb_sync._CombinedConnector([], {}, [requesting]).requires_empty_sync() is True
+    assert kb_sync._CombinedConnector([], {}, [nonrequesting]).requires_empty_sync() is False
+    assert (
+        kb_sync._CombinedConnector([], {}, [plain, nonrequesting, requesting]).requires_empty_sync()
+        is True
+    )
+
+
+def test_all_denylisted_grouped_source_still_runs_cleanup():
+    """A grouped source whose manifest emptied (every carried-forward
+    ticket denylisted away) requests an empty sync, so its stale KB files
+    are still diffed and cleaned up instead of stranded."""
+    child = _mock_child([])
+    child.requires_empty_sync = Mock(return_value=True)
+    client = Mock()
+    client.sync_diff.return_value = {"deleted": [{"file_id": "stale-1"}]}
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=child),
+        quiet=True,
+    )
+    client.sync_cleanup.assert_called_once_with("kb", ["stale-1"])
+    assert result.deleted == 1
+
+
+def test_unreadable_modified_file_retains_stale_kb_copy():
+    """An empty read on a modified file skips the upload but must NOT
+    delete the stale KB copy: the KB keeps at least one version."""
+    source = Source({"a.txt": b""})
+    client = Mock()
+    client.sync_diff.return_value = {
+        "modified": [
+            {"filename": "a.txt", "path": "", "checksum": "old", "size": 5, "stale_file_id": "old-1"}
+        ]
+    }
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=source),
+        quiet=True,
+    )
+    client.upload_file.assert_not_called()
+    client.sync_cleanup.assert_not_called()
+    assert result.warnings and "retained" in result.warnings[0]
+
+
+class UnreadableSource(BaseConnector):
+    def build_manifest(self):
+        return [ManifestEntry("a.txt", "", "5", 5)]
+
+    def read_file(self, path, filename):
+        raise SourceFileUnavailable("permission denied")
+
+    def close(self):
+        pass
+
+
+def test_source_unavailable_modified_file_retains_stale_kb_copy():
+    """SourceFileUnavailable on a modified file skips the upload but must
+    NOT delete the stale KB copy."""
+    client = Mock()
+    client.sync_diff.return_value = {
+        "modified": [
+            {"filename": "a.txt", "path": "", "checksum": "old", "size": 5, "stale_file_id": "old-1"}
+        ]
+    }
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=UnreadableSource()),
+        quiet=True,
+    )
+    client.upload_file.assert_not_called()
+    client.sync_cleanup.assert_not_called()
+    assert result.warnings and "retained" in result.warnings[0]
+
+
+def test_modified_file_cleanup_runs_after_successful_upload():
+    """A modified file's stale KB copy is removed only after its
+    replacement uploads successfully."""
+    source = Source({"a.txt": b"new"})
+    client = Mock()
+    client.sync_diff.return_value = {
+        "modified": [
+            {"filename": "a.txt", "path": "", "checksum": "new", "size": 3, "stale_file_id": "old-1"}
+        ]
+    }
+    kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=source),
+        quiet=True,
+    )
+    client.upload_file.assert_called_once()
+    client.sync_cleanup.assert_called_once_with("kb", ["old-1"], None)
+    upload_idx = next(
+        i for i, c in enumerate(client.mock_calls) if c[0] == "upload_file"
+    )
+    cleanup_idx = next(
+        i for i, c in enumerate(client.mock_calls) if c[0] == "sync_cleanup"
+    )
+    assert upload_idx < cleanup_idx
+
+
+def test_rmdir_only_diff_still_cleans_up():
+    """A diff that only removes directories still runs cleanup after the
+    (empty) upload step — the rmdir used to run in the pre-upload cleanup
+    and must not regress with the reordered cleanup."""
+    source = Source({"a.txt": b"x"})
+    client = Mock()
+    client.sync_diff.return_value = {"rmdir": ["d1"]}
+    result = kb_sync.run_entries_sync(
+        client,
+        [{"source": "one", "kb-id": "kb"}],
+        resolve_connector=Mock(return_value=source),
+        quiet=True,
+    )
+    client.upload_file.assert_not_called()
+    client.sync_cleanup.assert_called_once_with("kb", [], ["d1"])
+    assert result.dirs_removed == 1

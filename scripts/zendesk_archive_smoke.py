@@ -186,12 +186,20 @@ def main() -> None:
         print(f"  body: {_snippet(raw, 300)}")
         print("  fatal: show_many did not answer 200; nothing concluded.", file=sys.stderr)
         sys.exit(1)
+    if not isinstance(payload, dict) or not isinstance(payload.get("tickets"), list):
+        print(f"  body: {_snippet(raw, 300)}")
+        print(
+            "  fatal: show_many answered 200 with a malformed payload "
+            "(expected a JSON object with a list-valued 'tickets' field); nothing concluded.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     show_many: dict[str, dict[str, Any]] = {}
-    for ticket in (payload or {}).get("tickets") or []:
+    for ticket in payload["tickets"]:
         if isinstance(ticket, dict) and "id" in ticket:
             show_many[str(ticket["id"])] = ticket
     print(
-        f"  payload count={((payload or {}).get('count'))} "
+        f"  payload count={payload.get('count')} "
         f"returned={len(show_many)} requested={len(ids)}"
     )
 
@@ -200,9 +208,11 @@ def main() -> None:
     for ticket_id in ids:
         status, payload, raw = _get(base_url, f"/tickets/{ticket_id}.json", auth, timeout)
         print(f"[single] GET /tickets/{ticket_id}.json -> HTTP {status}")
-        if status == 200 and isinstance((payload or {}).get("ticket"), dict):
+        if status == 200 and isinstance(payload, dict) and isinstance(payload.get("ticket"), dict):
             by_single[ticket_id] = payload["ticket"]
-        elif status != 200:
+        elif status == 200:
+            print(f"  body: {_snippet(raw, 200)}")
+        else:
             print(f"  body: {_snippet(raw, 200)}")
 
     # ---- Ticket detail report ------------------------------------------
@@ -240,11 +250,12 @@ def main() -> None:
         status, payload, raw = _get(base_url, f"/users/show_many.json?{qs}", auth, timeout)
         print(f"[users] GET /users/show_many.json?ids=<n={len(requester_ids)}> -> HTTP {status}")
         if status == 200:
-            for entry in (payload or {}).get("users") or []:
-                if isinstance(entry, dict) and "id" in entry:
-                    resolved[str(entry["id"])] = entry
-                else:
-                    print(f"  body: {_snippet(raw, 200)}")
+            if isinstance(payload, dict) and isinstance(payload.get("users"), list):
+                for entry in payload["users"]:
+                    if isinstance(entry, dict) and "id" in entry:
+                        resolved[str(entry["id"])] = entry
+            else:
+                print(f"  body: {_snippet(raw, 200)}")
         else:
             print(f"  body: {_snippet(raw, 200)}")
     for rid in requester_ids:

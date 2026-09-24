@@ -588,3 +588,41 @@ def test_leaked_ticket_ids_sorted_numerically(verify, tmp_path, monkeypatch):
     assert code == 1
     assert "VERDICT: LEAKED" in out
     assert out.index("ticket 2:") < out.index("ticket 10:")
+
+
+def test_conflicting_duplicate_ids_exit_2(verify, denylist, monkeypatch):
+    """The same id reappearing with different metadata means the listing
+    moved between pages: the pages held so far are not a stable complete
+    set, and keeping either copy could hide a leaked entry behind a safe
+    one (or vice versa) once the unique count reaches total. Exit 2."""
+    pages = [
+        _page([{"id": "f1", "meta": {"name": "45748.md"}}], 2),
+        _page(
+            [
+                {"id": "f1", "meta": {"name": "safe.md"}},
+                {"id": "f2", "meta": {"name": "ok.md"}},
+            ],
+            2,
+        ),
+    ]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 2
+    assert "conflicting" in out
+
+
+def test_identical_duplicate_ids_still_dedupe(verify, denylist, monkeypatch):
+    """Overlapping pages serving the identical entry dedupe as before:
+    the unique count reaches total and the run completes CLEAN."""
+    pages = [
+        _page([{"id": "f1", "meta": {"name": "1001-order.md"}}], 2),
+        _page(
+            [
+                {"id": "f1", "meta": {"name": "1001-order.md"}},
+                {"id": "f2", "meta": {"name": "ok.md"}},
+            ],
+            2,
+        ),
+    ]
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
+    assert code == 0
+    assert "VERDICT: CLEAN" in out
