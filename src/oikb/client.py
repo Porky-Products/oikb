@@ -36,6 +36,11 @@ class OikbClient:
     def close(self) -> None:
         self._http.close()
 
+    @property
+    def base_url(self) -> str:
+        """Resolved server identity, without a trailing slash."""
+        return self._base_url
+
     # ── Sync API ────────────────────────────────────────────────
 
     def sync_diff(
