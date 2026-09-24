@@ -498,9 +498,12 @@ def _run_sync_inner(
             return ("error", f"File not in manifest: {display}")
 
         if failure_key(entry) in blocked_keys:
+            message = blocked_message(display)
             if progress is not None:
-                progress.update(task_id, advance=1, description=f"[red]✗ {display}[/red]")
-            return ("blocked", blocked_message(display))
+                progress.update(task_id, advance=1, description=f"[yellow]⚠ {display}[/yellow]")
+            else:
+                click.echo(click.style(f"  ⚠ {message}", fg="yellow"), err=True)
+            return ("blocked", message)
 
         last_err: Exception | None = None
         error_kind = "error"
@@ -610,7 +613,7 @@ def _run_sync_inner(
             stale_id = entry.get("stale_file_id")
             if change_type == "modified" and stale_id:
                 retain_stale.add(stale_id)
-            if kind == "warning" and message is not None:
+            if kind in ("warning", "blocked") and message is not None:
                 result.warnings.append(message)
             elif message is not None:
                 result.errors.append(message)
