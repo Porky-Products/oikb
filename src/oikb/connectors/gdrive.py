@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-from typing import Any
 
 from oikb.connectors import BaseConnector, ManifestEntry
 
@@ -52,6 +51,7 @@ class GDriveConnector(BaseConnector):
             )
 
         self.folder_id = folder_id
+        self._file_ids: dict[tuple[str, str], str] | None = None
 
         creds_file = service_account_file or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
         if not creds_file:
@@ -69,7 +69,10 @@ class GDriveConnector(BaseConnector):
     def build_manifest(self) -> list[ManifestEntry]:
         """List all files in the folder recursively."""
         entries: list[ManifestEntry] = []
-        self._walk_folder(self.folder_id, "", entries)
+        self._file_ids = None
+        file_ids: dict[tuple[str, str], str] = {}
+        self._walk_folder(self.folder_id, "", entries, file_ids)
+        self._file_ids = file_ids
         entries.sort(key=lambda e: e.display_path)
         return entries
 
@@ -78,6 +81,7 @@ class GDriveConnector(BaseConnector):
         folder_id: str,
         relative_prefix: str,
         entries: list[ManifestEntry],
+        file_ids: dict[tuple[str, str], str],
     ) -> None:
         """Recursively list files in a Drive folder."""
         page_token = None
@@ -105,7 +109,7 @@ class GDriveConnector(BaseConnector):
                 if mime == "application/vnd.google-apps.folder":
                     # Recurse into subfolders.
                     sub_prefix = f"{relative_prefix}/{item['name']}" if relative_prefix else item["name"]
-                    self._walk_folder(item["id"], sub_prefix, entries)
+                    self._walk_folder(item["id"], sub_prefix, entries, file_ids)
                     continue
 
                 # Determine filename (add extension for exported types).
@@ -122,6 +126,11 @@ class GDriveConnector(BaseConnector):
                     f"{item['id']}:{item.get('modifiedTime', '')}".encode()
                 ).hexdigest()[:16]
 
+                key = (relative_prefix, filename)
+                if key in file_ids:
+                    raise ValueError(f"Ambiguous Drive file path: {relative_prefix}/{filename}")
+                file_ids[key] = item["id"]
+
                 entries.append(
                     ManifestEntry(
                         filename=filename,
@@ -137,7 +146,7 @@ class GDriveConnector(BaseConnector):
 
     def read_file(self, path: str, filename: str) -> bytes:
         """Download or export a file from Drive."""
-        # Find the file by walking to it.
+        # Resolve the exact file discovered during enumeration.
         file_id = self._find_file(path, filename)
         if not file_id:
             raise FileNotFoundError(f"File not found in Drive: {path}/{filename}")
@@ -165,47 +174,10 @@ class GDriveConnector(BaseConnector):
         )
 
     def _find_file(self, path: str, filename: str) -> str | None:
-        """Find a file ID by navigating the folder path."""
-        # Strip export extension for Google Docs lookup.
-        search_name = filename
-        for _, ext in _EXPORT_MIMES.values():
-            if filename.endswith(ext):
-                search_name = filename[: -len(ext)]
-                break
-
-        current_folder = self.folder_id
-
-        # Navigate to the target directory.
-        if path:
-            for segment in path.split("/"):
-                resp = (
-                    self._service.files()
-                    .list(
-                        q=f"'{current_folder}' in parents and name = '{segment}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-                        fields="files(id)",
-                        supportsAllDrives=True,
-                        includeItemsFromAllDrives=True,
-                    )
-                    .execute()
-                )
-                files = resp.get("files", [])
-                if not files:
-                    return None
-                current_folder = files[0]["id"]
-
-        # Find the file.
-        resp = (
-            self._service.files()
-            .list(
-                q=f"'{current_folder}' in parents and name = '{search_name}' and trashed = false",
-                fields="files(id)",
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            )
-            .execute()
-        )
-        files = resp.get("files", [])
-        return files[0]["id"] if files else None
+        """Resolve a manifest path without parsing or querying displayed names."""
+        if self._file_ids is None:
+            self.build_manifest()
+        return self._file_ids.get((path, filename))
 
 
 def parse_gdrive_source(source: str) -> dict[str, str | None]:

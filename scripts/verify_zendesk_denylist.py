@@ -261,7 +261,10 @@ def _item_filename(item: dict[str, Any]) -> str:
     meta.name is the upload filename; filename is the FileModelResponse field."""
     meta = item.get("meta") or {}
     name = meta.get("name") if isinstance(meta, dict) else None
-    return str(name or item.get("filename") or "")
+    for candidate in (name, item.get("filename")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return ""
 
 
 def _leaked_files(

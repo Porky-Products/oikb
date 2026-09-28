@@ -626,3 +626,18 @@ def test_identical_duplicate_ids_still_dedupe(verify, denylist, monkeypatch):
     code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, pages)
     assert code == 0
     assert "VERDICT: CLEAN" in out
+
+
+@pytest.mark.parametrize("name", [{"unexpected": True}, ["45748.md"], 45748, True, "", "  "])
+@pytest.mark.parametrize("field", ["meta", "filename"])
+def test_invalid_filename_refuses_clean(verify, denylist, monkeypatch, name, field):
+    item = {"id": "f1"}
+    item[field] = {"name": name} if field == "meta" else name
+    code, out = _run_main_with_kb_pages(verify, denylist, monkeypatch, [_page([item], 1)])
+    assert code == 2
+    assert "VERDICT: CLEAN" not in out
+    assert "no resolvable filename" in out
+
+
+def test_invalid_meta_name_uses_valid_filename(verify):
+    assert verify._item_filename({"meta": {"name": {}}, "filename": "45748.md"}) == "45748.md"

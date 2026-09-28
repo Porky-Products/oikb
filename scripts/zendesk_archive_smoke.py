@@ -69,6 +69,20 @@ _TIMEOUT_SECONDS = 30.0
 _MAX_SHOW_MANY = 100
 
 
+def _payload_id(value: Any, endpoint: str) -> str:
+    """Accept positive integer IDs or their decimal string representation."""
+    if type(value) is int and value > 0:
+        return str(value)
+    if isinstance(value, str) and value.isascii() and value.isdecimal() and value.strip("0"):
+        return value.lstrip("0")
+    print(
+        f"  fatal: {endpoint} answered 200 with a malformed payload "
+        "(missing or invalid id); nothing concluded.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _auth_header(user: str, token: str) -> str:
     raw = f"{user}/token:{token}".encode("utf-8")
     return "Basic " + base64.b64encode(raw).decode("ascii")
@@ -204,8 +218,8 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        if "id" in ticket:
-            show_many[str(ticket["id"])] = ticket
+        ticket_id = _payload_id(ticket.get("id"), "show_many")
+        show_many[ticket_id] = ticket
     print(
         f"  payload count={payload.get('count')} "
         f"returned={len(show_many)} requested={len(ids)}"
@@ -277,8 +291,8 @@ def main() -> None:
                 )
                 sys.exit(1)
             for entry in payload["users"]:
-                if "id" in entry:
-                    resolved[str(entry["id"])] = entry
+                user_id = _payload_id(entry.get("id"), "users/show_many")
+                resolved[user_id] = entry
         else:
             print(f"  body: {_snippet(raw, 200)}")
     for rid in requester_ids:
