@@ -119,3 +119,31 @@ def test_malformed_users_payload_aborts(smoke, monkeypatch, capsys, payload):
         smoke.main()
     assert exc.value.code == 1
     assert "malformed payload" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("entry", [{}, {"id": None}, {"id": {}}, {"id": []},
+                                   {"id": True}, {"id": 1.5}, {"id": 0}, {"id": -1},
+                                   {"id": ""}, {"id": " "}, {"id": "abc"}])
+@pytest.mark.parametrize("endpoint", ["tickets", "users"])
+def test_invalid_batch_id_aborts(smoke, monkeypatch, capsys, entry, endpoint):
+    valid_get = _stub_get({"ticket": _ticket(45748)})
+
+    def fake_get(base_url, path_qs, auth, timeout):
+        if path_qs.startswith(f"/{endpoint}/show_many"):
+            valid = _ticket(45748) if endpoint == "tickets" else {"id": 1}
+            return 200, {endpoint: [valid, entry]}, "{}"
+        return valid_get(base_url, path_qs, auth, timeout)
+
+    monkeypatch.setattr(smoke, "_get", fake_get)
+    monkeypatch.setattr("sys.argv", ["zendesk_archive_smoke.py", "45748"])
+    with pytest.raises(SystemExit) as exc:
+        smoke.main()
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "malformed payload" in captured.err
+    assert "VERDICT:" not in captured.out
+
+
+@pytest.mark.parametrize("value", [45748, "45748"])
+def test_usable_id(smoke, value):
+    assert smoke._payload_id(value, "show_many") == "45748"
