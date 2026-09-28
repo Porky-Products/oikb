@@ -1,6 +1,7 @@
 """Offline regression tests for scripts/zendesk_archive_smoke.py.
 
-These cover the PR #49 review finding: a single GET that answers 200
+These cover malformed batch responses from issue #48 and the PR #49
+review finding: a single GET that answers 200
 with a malformed payload is indeterminate evidence — the run must abort
 (exit 1) instead of letting the final verdict report the ID as
 deleted/nonexistent (exit 3).
@@ -147,3 +148,29 @@ def test_invalid_batch_id_aborts(smoke, monkeypatch, capsys, entry, endpoint):
 @pytest.mark.parametrize("value", [45748, "45748"])
 def test_usable_id(smoke, value):
     assert smoke._payload_id(value, "show_many") == "45748"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [None, [], ["ticket"], "ticket", 42, True, {},
+     {"tickets": None}, {"tickets": "bad"}, {"tickets": {"id": 45748}}],
+)
+def test_malformed_show_many_payload_aborts_before_followup(
+    smoke, monkeypatch, capsys, payload
+):
+    calls = []
+
+    def fake_get(base_url, path_qs, auth, timeout):
+        calls.append(path_qs)
+        assert path_qs.startswith("/tickets/show_many.json?")
+        return 200, payload, "{}"
+
+    monkeypatch.setattr(smoke, "_get", fake_get)
+    monkeypatch.setattr("sys.argv", ["zendesk_archive_smoke.py", "45748"])
+    with pytest.raises(SystemExit) as exc:
+        smoke.main()
+    assert exc.value.code == 1
+    assert len(calls) == 1
+    captured = capsys.readouterr()
+    assert "malformed payload" in captured.err
+    assert "VERDICT:" not in captured.out
