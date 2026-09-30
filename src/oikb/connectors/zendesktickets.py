@@ -481,6 +481,7 @@ class ZendeskTicketsConnector(BaseConnector):
 
         if self._download_attachments:
             attachments = self._collect_attachments(ticket, comments)
+            emitted_filenames: set[str] = set()
             for attachment in attachments:
                 content = self._download_attachment_with_retry(attachment["content_url"])
                 if content is None:
@@ -489,6 +490,12 @@ class ZendeskTicketsConnector(BaseConnector):
                     continue
                 short_hash = hashlib.sha1(content).hexdigest()[:6]  # noqa: S324
                 filename = f"{ticket_id}-{short_hash}-{self._sanitize_filename(attachment['file_name'])}"
+                # Distinct uploads can still carry identical content under the
+                # same filename; emitting both would duplicate the manifest
+                # path and fail the whole sync.
+                if filename in emitted_filenames:
+                    continue
+                emitted_filenames.add(filename)
                 entries.append(self._cache_entry(path=f"{_ATTACHMENT_PATH}/{ticket_id}", filename=filename, content=content))
 
         return entries, updated_at_value
@@ -705,16 +712,26 @@ class ZendeskTicketsConnector(BaseConnector):
         return "\n".join(lines).strip() + "\n"
 
     def _collect_attachments(self, ticket: dict[str, Any], comments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        attachments = list(ticket.get("attachments") or [])
-        for comment in comments:
-            attachments.extend(comment.get("attachments") or [])
+        # The same attachment can be listed at ticket level and on a comment,
+        # or on several comments; keep the first reference only so it is
+        # fetched and emitted once.
+        by_content_url: dict[str, dict[str, Any]] = {}
+        candidates = [
+            *(ticket.get("attachments") or []),
+            *(attachment for comment in comments for attachment in (comment.get("attachments") or [])),
+        ]
+        for attachment in candidates:
+            content_url = attachment.get("content_url")
+            if isinstance(content_url, str) and content_url:
+                by_content_url.setdefault(content_url, attachment)
+        collected = list(by_content_url.values())
         if self._attachment_extensions is not None:
-            attachments = [
+            collected = [
                 attachment
-                for attachment in attachments
+                for attachment in collected
                 if self._filename_extension_allowed(str(attachment.get("file_name") or ""))
             ]
-        return attachments
+        return collected
 
     def _filename_extension_allowed(self, filename: str) -> bool:
         if self._attachment_extensions is None:
