@@ -1632,6 +1632,87 @@ def test_attachments_with_same_name_use_content_hashes(monkeypatch: pytest.Monke
     connector.close()
 
 
+def test_repeated_attachment_reference_is_emitted_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """The same attachment listed at ticket level and on comments must not
+    duplicate the manifest path (#52): emitting it twice failed the whole
+    KB sync with 'Duplicate manifest path'."""
+    state_dir = _make_state_dir(tmp_path, "attachments-repeated-reference")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "png")
+    attachment_url = "https://acme.zendesk.com/attachments/dup.png"
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[_attachment("dup.png", url=attachment_url)],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={
+            1001: [
+                _comment(501, "first", attachments=[_attachment("dup.png", url=attachment_url)]),
+                _comment(502, "second", attachments=[_attachment("dup.png", url=attachment_url)]),
+            ]
+        },
+        attachments={"dup.png": b"dup-bytes"},
+    )
+
+    manifest = connector.build_manifest()
+
+    short_hash = hashlib.sha1(b"dup-bytes").hexdigest()[:6]
+    assert [entry.display_path for entry in manifest] == [
+        f"attachments/1001/1001-{short_hash}-dup.png",
+        "tickets/1001.md",
+    ]
+    assert [call["path"] for call in connector._http.calls].count(attachment_url) == 1
+    connector.close()
+
+
+def test_identical_uploads_with_same_name_emit_one_entry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Two distinct uploads with identical content and filename collapse to a
+    single manifest entry instead of duplicating the manifest path (#52)."""
+    state_dir = _make_state_dir(tmp_path, "attachments-identical-uploads")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "png")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[
+                            _attachment("dup.png", url="https://acme.zendesk.com/attachments/dup-1.png"),
+                            _attachment("dup.png", url="https://acme.zendesk.com/attachments/dup-2.png"),
+                        ],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+        attachments={"dup-1.png": b"same-bytes", "dup-2.png": b"same-bytes"},
+    )
+
+    manifest = connector.build_manifest()
+
+    short_hash = hashlib.sha1(b"same-bytes").hexdigest()[:6]
+    assert sorted(entry.display_path for entry in manifest) == [
+        f"attachments/1001/1001-{short_hash}-dup.png",
+        "tickets/1001.md",
+    ]
+    connector.close()
+
+
 def test_no_attachment_directory_created_when_no_attachments(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "attachments-empty")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
