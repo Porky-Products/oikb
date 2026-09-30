@@ -1713,6 +1713,53 @@ def test_identical_uploads_with_same_name_emit_one_entry(monkeypatch: pytest.Mon
     connector.close()
 
 
+def test_duplicate_entries_in_saved_state_are_healed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """State saved by aggressive mid-run checkpoints before attachment dedup
+    existed can carry duplicate (path, filename) entries forward; the
+    manifest and the state re-saved after the run must both be clean (#52)."""
+    state_dir = _make_state_dir(tmp_path, "attachments-state-duplicates")
+    attachment_entry = {"path": "attachments/1001", "filename": "1001-8a1766-dup.pdf", "checksum": "abc123", "size": 9}
+    (state_dir / "manifest_state.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "2024-01-02T00:00:00Z",
+                "attachments_enabled": True,
+                "ticket_files": {
+                    "1001": {
+                        "updated_at": "2024-01-01T00:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "1001.md", "checksum": "md", "size": 10},
+                            attachment_entry,
+                            dict(attachment_entry),
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[{"tickets": [], "end_time": 1704249600, "next_page": None}],
+    )
+
+    manifest = connector.build_manifest()
+
+    assert [entry.display_path for entry in manifest] == [
+        "attachments/1001/1001-8a1766-dup.pdf",
+        "tickets/1001.md",
+    ]
+
+    connector.mark_sync_complete()
+    saved = json.loads((state_dir / "manifest_state.json").read_text())
+    assert [entry["filename"] for entry in saved["ticket_files"]["1001"]["entries"]] == [
+        "1001.md",
+        "1001-8a1766-dup.pdf",
+    ]
+    connector.close()
+
+
 def test_no_attachment_directory_created_when_no_attachments(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "attachments-empty")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
