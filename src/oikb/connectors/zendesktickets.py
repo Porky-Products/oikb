@@ -295,6 +295,29 @@ class ZendeskTicketsConnector(BaseConnector):
                 carried_forward[ticket_id] = kept
 
         combined_entries_by_ticket = carried_forward | current_entries_by_ticket
+        # Defensive: state saved before attachment dedup existed (aggressive
+        # mid-run checkpoints persist entries before the sync runs) can hold
+        # duplicate (path, filename) entries for a ticket, which still fails
+        # the whole sync at manifest-assembly time. Keep the first and drop
+        # the rest so this run's manifest and the state saved after it are
+        # both clean.
+        for ticket_id, entries in combined_entries_by_ticket.items():
+            seen_keys: set[tuple[str, str]] = set()
+            deduped: list[ManifestEntry] = []
+            for entry in entries:
+                key = (entry.path, entry.filename)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                deduped.append(entry)
+            if len(deduped) != len(entries):
+                log.warning(
+                    "ZendeskTicketsConnector: dropped %d duplicate manifest ent%s for ticket %s from saved state",
+                    len(entries) - len(deduped),
+                    "y" if len(entries) - len(deduped) == 1 else "ies",
+                    ticket_id,
+                )
+                combined_entries_by_ticket[ticket_id] = deduped
         manifest = [entry for entries in combined_entries_by_ticket.values() for entry in entries]
         manifest.sort(key=lambda entry: entry.display_path)
 
