@@ -17,6 +17,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from oikb import __version__
+from oikb.duplicate_failures import DuplicateFailureTracker
 from oikb.env import API_KEY
 from oikb.history import SyncHistory
 from oikb.metrics import record_sync, set_build_info
@@ -46,6 +47,7 @@ app = FastAPI(
 # Runtime state populated by start_daemon().
 _scheduler_state: dict[str, dict[str, Any]] = {}
 _sync_locks: dict[str, asyncio.Lock] = {}
+_duplicate_failures: dict[tuple[str, str], DuplicateFailureTracker] = {}
 _history: SyncHistory | None = None
 _entries: list[dict] = []
 _shutdown_event: asyncio.Event | None = None
@@ -185,14 +187,21 @@ async def history_endpoint(
     summary="Trigger an immediate sync by alias or KB ID",
     dependencies=[Depends(verify_api_key)],
 )
-async def trigger_sync(identifier: str, dry_run: bool = False):
-    """Triggers an immediate sync matching the given alias or Knowledge Base ID. The sync runs asynchronously in the background. Use get_sync_status to check progress. Set dry_run=true to preview changes without uploading."""
+async def trigger_sync(identifier: str, dry_run: bool = False, retry_blocked: bool = False):
+    """Trigger a sync by alias or KB ID; use get_sync_status for progress.
+
+    dry_run previews changes without uploads or changes to failure counts.
+    retry_blocked resets duplicate failure counts for this KB before syncing;
+    it cannot be combined with dry_run.
+    """
+    if dry_run and retry_blocked:
+        raise HTTPException(status_code=400, detail="retry_blocked cannot be combined with dry_run")
     for entry in _entries:
         if entry.get("name") == identifier or entry.get("kb-id") == identifier:
             if dry_run:
                 result = await _run_entry(entry, dry_run=True)
                 return {"dry_run": True, "name": entry.get("name"), "kb_id": entry.get("kb-id"), "result": result}
-            asyncio.create_task(_run_entry(entry))
+            asyncio.create_task(_run_entry(entry, retry_blocked=retry_blocked))
             return {"triggered": True, "name": entry.get("name"), "kb_id": entry.get("kb-id")}
     return {"triggered": False, "error": f"No entry matching '{identifier}'"}
 
@@ -239,8 +248,8 @@ async def _send_notification(entry: dict, payload: dict) -> None:
         log.warning(f"Notification failed for {source}: {exc}")
 
 
-async def _run_entry(entry: dict, dry_run: bool = False) -> dict | None:
-    """Run a single sync for an entry.
+async def _run_entry(entry: dict, dry_run: bool = False, retry_blocked: bool = False) -> dict | None:
+    """Sync every configured source sharing this entry's KB.
 
     Uses a per-KB lock to prevent overlapping syncs to the same
     Knowledge Base (e.g. webhook fires while a scheduled sync is running).
@@ -257,60 +266,43 @@ async def _run_entry(entry: dict, dry_run: bool = False) -> dict | None:
         return {"skipped": True, "reason": "sync already running"} if dry_run else None
 
     async with lock:
-        return await _run_entry_locked(entry, dry_run=dry_run)
+        return await _run_entry_locked(entry, dry_run=dry_run, retry_blocked=retry_blocked)
 
 
-async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
+async def _run_entry_locked(entry: dict, dry_run: bool = False, retry_blocked: bool = False) -> dict | None:
     """Inner sync logic, called under the per-KB lock."""
     from oikb.cli import _make_client, _resolve_connector
-    from oikb.sync import SyncCancelled, run_sync
+    from oikb.kb_sync import run_entries_sync
+    from oikb.sync import SyncCancelled
 
-    source = entry["source"]
+    entries = [e for e in _entries if e.get("kb-id") == entry["kb-id"]] or [entry]
+    source = ", ".join(e["source"] for e in entries)
     kb_id = entry["kb-id"]
     started_at = time.time()
     client = None
 
-    _scheduler_state[source] = {
-        **_scheduler_state.get(source, {}),
-        "name": entry.get("name", source),
-        "status": "running",
-        "started_at": started_at,
-    }
+    def set_state(**state):
+        for member in entries:
+            _scheduler_state[member["source"]] = {
+                "name": member.get("name", member["source"]), **state,
+            }
+
+    if not dry_run:
+        set_state(status="running", started_at=started_at)
 
     try:
-        connector = _resolve_connector(
-            source,
-            branch=entry.get("branch"),
-            path=entry.get("path"),
-        )
-        client = _make_client(
-            url=entry.get("url"),
-            token=entry.get("token"),
-        )
-
-        mf = None
-        entry_filter = entry.get("filter", {})
-        inc = entry_filter.get("include")
-        exc = entry_filter.get("exclude")
-        ms = entry_filter.get("max-size")
-        if inc or exc or ms:
-            from oikb.sync import build_manifest_filter, parse_size
-            mf = build_manifest_filter(
-                include=inc,
-                exclude=exc,
-                max_size=parse_size(ms),
-            )
-
+        client = _make_client(url=entry.get("url"), token=entry.get("token"))
+        failures = None
+        if not dry_run:
+            failures = _duplicate_failures.setdefault((client.base_url, kb_id), DuplicateFailureTracker())
+            if retry_blocked:
+                failures.clear()
         result = await asyncio.to_thread(
-            run_sync,
-            client=client,
-            connector=connector,
-            kb_id=kb_id,
-            dry_run=dry_run,
-            quiet=True,
-            manifest_filter=mf,
-            concurrency=entry.get("concurrency", 1),
+            run_entries_sync,
+            client, entries, resolve_connector=_resolve_connector,
+            dry_run=dry_run, quiet=True,
             cancel_requested=_shutdown_event.is_set if _shutdown_event else None,
+            duplicate_failures=failures,
         )
 
         if dry_run:
@@ -328,18 +320,13 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
         duration_ms = int(duration_s * 1000)
         status = "success" if not result.errors else "partial"
 
-        _scheduler_state[source] = {
-            "name": entry.get("name", source),
-            "status": status,
-            "last_sync": time.time(),
-            "duration_ms": duration_ms,
-            "files_added": result.added,
-            "files_modified": result.modified,
-            "files_deleted": result.deleted,
-            "unmodified": result.unmodified,
-            "warnings": result.warnings or [],
-            "errors": result.errors or [],
-        }
+        set_state(
+            status=status, last_sync=time.time(), duration_ms=duration_ms,
+            files_added=result.added, files_modified=result.modified,
+            files_deleted=result.deleted, unmodified=result.unmodified,
+            duplicate_blocked=result.duplicate_blocked,
+            warnings=result.warnings or [], errors=result.errors or [],
+        )
 
         record_sync(
             source=source,
@@ -364,38 +351,32 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
                 error="\n".join(result.errors or []) or None,
             )
 
-        log.info(
+        log_sync = log.warning if result.duplicate_blocked else log.info
+        log_sync(
             f"Synced {source} -> {kb_id}: {result.summary()} ({duration_ms}ms)"
         )
 
-        await _send_notification(entry, {
-            "source": source,
-            "kb_id": kb_id,
-            "status": status,
-            "duration_ms": duration_ms,
-            "summary": result.summary(),
-            "files_added": result.added,
-            "files_modified": result.modified,
-            "files_deleted": result.deleted,
-            "warnings": result.warnings or [],
-            "errors": result.errors or [],
-        })
+        for member in entries:
+            await _send_notification(member, {
+                "source": source,
+                "kb_id": kb_id,
+                "status": status,
+                "duration_ms": duration_ms,
+                "summary": result.summary(),
+                "files_added": result.added,
+                "files_modified": result.modified,
+                "files_deleted": result.deleted,
+                "warnings": result.warnings or [],
+                "errors": result.errors or [],
+                "duplicate_blocked": result.duplicate_blocked,
+            })
 
     except SyncCancelled:
-        _scheduler_state[source] = {
-            "name": entry.get("name", source),
-            "status": "cancelled",
-            "last_sync": time.time(),
-        }
+        set_state(status="cancelled", last_sync=time.time())
         log.info(f"Sync cancelled for {source}")
 
     except Exception as e:
-        _scheduler_state[source] = {
-            "name": entry.get("name", source),
-            "status": "error",
-            "last_sync": time.time(),
-            "error": str(e),
-        }
+        set_state(status="error", last_sync=time.time(), error=str(e))
         record_sync(
             source=source,
             status="error",
@@ -412,12 +393,13 @@ async def _run_entry_locked(entry: dict, dry_run: bool = False) -> dict | None:
             )
         log.error(f"Sync failed for {source}: {e}", exc_info=True)
 
-        await _send_notification(entry, {
-            "source": source,
-            "kb_id": kb_id,
-            "status": "error",
-            "error": str(e),
-        })
+        for member in entries:
+            await _send_notification(member, {
+                "source": source,
+                "kb_id": kb_id,
+                "status": "error",
+                "error": str(e),
+            })
     finally:
         if client:
             client.close()
@@ -492,7 +474,10 @@ def start_daemon(
     from oikb.logging import configure_logging
     configure_logging(log_format=log_format)
 
+    from oikb.kb_sync import group_entries_by_kb
+    group_entries_by_kb(entries)  # Validate shared destinations before starting tasks.
     _entries = entries
+    _duplicate_failures.clear()
     _history = SyncHistory()
     set_build_info(__version__)
 

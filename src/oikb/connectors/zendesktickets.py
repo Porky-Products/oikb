@@ -35,6 +35,24 @@ _DEFAULT_ATTACHMENT_EXTENSIONS = frozenset(
     }
 )
 _ATTACHMENT_EXTENSIONS_ENV = "ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS"
+_DENYLIST_FILES_ENV = "ZENDESKTICKET_DENYLIST_FILES"
+# Safety bound for comments pagination: a ticket needs an extreme comment
+# count to exceed it (100 pages x 100 comments/page default). Hitting the
+# bound fails closed -- the ticket is skipped rather than synced partially.
+_MAX_COMMENT_PAGES = 100
+
+
+def _foreign_zendesk_url(url: str, subdomain: str) -> bool:
+    """True when url is absolute but not the expected Zendesk API host.
+
+    next_page URLs are only followed on the authenticated client's own
+    host; anything else must not receive the token credentials.
+    """
+    parsed = urlparse(url)
+    return bool(parsed.netloc) and (
+        parsed.scheme.lower() != "https"
+        or parsed.netloc.lower() != f"{subdomain.lower()}.zendesk.com"
+    )
 
 
 class ZendeskTicketsConnector(BaseConnector):
@@ -75,6 +93,21 @@ class ZendeskTicketsConnector(BaseConnector):
         self._include_tags = _parse_tags(include_tags_value)
         self._exclude_tags = _parse_tags(exclude_tags_value)
         self._statuses = _parse_statuses(status_value)
+        # Deduplicated union of every denylist file. Loaded once at init and
+        # applied to both newly crawled tickets and carried-forward state,
+        # so a denylisted ticket already synced to the KB drops out of the
+        # manifest and sync's deleted-diff removes its KB files (same purge
+        # path as the tag filters -- see reset_zendesktickets_checkpoint.py
+        # for why re-serving alone is insufficient). Fail-closed: an
+        # unreadable file or malformed line aborts the run rather than
+        # risking a sensitive ticket being synced.
+        self._denied_ticket_ids = _load_denylist_files(os.environ.get(_DENYLIST_FILES_ENV, ""))
+        if self._denied_ticket_ids:
+            log.info(
+                "ZendeskTicketsConnector.denylist_loaded: files_env=%r denied_ticket_ids=%d",
+                os.environ.get(_DENYLIST_FILES_ENV),
+                len(self._denied_ticket_ids),
+            )
         if not self._subdomain or not self._user or not self._token:
             raise ValueError(
                 "Zendesk tickets credentials required. Set ZENDESKTICKET_SUBDOMAIN, "
@@ -168,7 +201,7 @@ class ZendeskTicketsConnector(BaseConnector):
 
                     seen_ticket_ids.add(ticket_id)
 
-                    if not self._should_include_ticket(ticket):
+                    if self._denied(ticket_id) or not self._should_include_ticket(ticket):
                         excluded_ticket_ids.add(ticket_id)
                         continue
 
@@ -234,7 +267,9 @@ class ZendeskTicketsConnector(BaseConnector):
         carried_forward = {
             ticket_id: entries
             for ticket_id, entries in prior_entries.items()
-            if ticket_id not in seen_ticket_ids and ticket_id not in excluded_ticket_ids
+            if ticket_id not in seen_ticket_ids
+            and ticket_id not in excluded_ticket_ids
+            and not self._denied(ticket_id)
         }
 
         if attachments_enabled_previously and not self._download_attachments:
@@ -331,7 +366,9 @@ class ZendeskTicketsConnector(BaseConnector):
         carried_forward = {
             ticket_id: entries
             for ticket_id, entries in prior_entries.items()
-            if ticket_id not in seen_ticket_ids and ticket_id not in excluded_ticket_ids
+            if ticket_id not in seen_ticket_ids
+            and ticket_id not in excluded_ticket_ids
+            and not self._denied(ticket_id)
         }
         if attachments_enabled_previously and not self._download_attachments:
             for ticket_id, entries in list(carried_forward.items()):
@@ -548,9 +585,75 @@ class ZendeskTicketsConnector(BaseConnector):
             ) from exc
 
     def _fetch_ticket_comments(self, ticket_id: int) -> list[dict[str, Any]] | None:
-        """Fetch comments for a ticket, returning None on 404 or after exhausting retries."""
+        """Fetch every comments page for a ticket, following next_page.
+
+        Returns None on 404, when any page cannot be fetched after
+        exhausting retries, or when a page payload is malformed
+        (fail-closed: a ticket is never synced with a partial comment
+        set, matching the excluded-ticket contract).
+        """
+        comments: list[dict[str, Any]] = []
+        next_page: str | None = None
+        seen_page_urls: set[str] = set()
+        for _page in range(_MAX_COMMENT_PAGES):
+            response = self._get_comments_page(ticket_id, next_page)
+            if response is None:
+                return None
+            try:
+                payload = response.json()
+            except ValueError:
+                # A non-JSON body (httpx raises a ValueError subclass) is
+                # malformed, not "zero comments" -- fail closed.
+                payload = None
+            page_comments = payload.get("comments") if isinstance(payload, dict) else None
+            if not isinstance(page_comments, list) or not all(
+                isinstance(comment, dict) for comment in page_comments
+            ):
+                log.warning(
+                    "ZendeskTicketsConnector: ticket %s returned a malformed comments payload; skipping ticket",
+                    ticket_id,
+                )
+                return None
+            comments.extend(page_comments)
+            candidate = payload.get("next_page")
+            if candidate is None:
+                return comments
+            if not isinstance(candidate, str) or not candidate or _foreign_zendesk_url(candidate, self._subdomain):
+                # Zendesk's contract: next_page is null (terminal) or a
+                # non-empty URL string. Other falsey values (false, 0, "")
+                # are malformed metadata: treating them as terminal would
+                # sync a possibly-partial comment set, breaking the
+                # fail-closed guarantee.
+                log.warning(
+                    "ZendeskTicketsConnector: ticket %s returned an unusable comments next_page (%r); skipping ticket",
+                    ticket_id,
+                    candidate,
+                )
+                return None
+            if candidate in seen_page_urls:
+                log.warning(
+                    "ZendeskTicketsConnector: ticket %s comments next_page repeated (%s); skipping ticket",
+                    ticket_id,
+                    candidate,
+                )
+                return None
+            seen_page_urls.add(candidate)
+            next_page = candidate
+        log.warning(
+            "ZendeskTicketsConnector: ticket %s comments exceeded %d pages; skipping ticket",
+            ticket_id,
+            _MAX_COMMENT_PAGES,
+        )
+        return None
+
+    def _get_comments_page(self, ticket_id: int, next_page: str | None):
+        """Fetch one comments page, retrying 429/5xx like the single-page path.
+
+        Returns the response, or None on 404 or after exhausting retries.
+        """
+        url = next_page if next_page else f"/tickets/{ticket_id}/comments.json"
         for attempt in range(self._max_retries + 1):
-            response = self._zendesk_get(f"/tickets/{ticket_id}/comments.json")
+            response = self._zendesk_get(url)
             status = getattr(response, "status_code", None)
             if status == 404:
                 if self._verbose_http:
@@ -567,7 +670,7 @@ class ZendeskTicketsConnector(BaseConnector):
                 time.sleep(delay)
                 continue
             response.raise_for_status()
-            return response.json().get("comments", [])
+            return response
         return None
 
     def _render_ticket_markdown(self, ticket: dict[str, Any], comments: list[dict[str, Any]]) -> str:
@@ -725,6 +828,17 @@ class ZendeskTicketsConnector(BaseConnector):
             return False
         return True
 
+    def _denied(self, ticket_id: str) -> bool:
+        """Whether a ticket ID is denylisted.
+
+        Applied to newly crawled tickets AND carried-forward state entries:
+        dropping a carried-forward ticket from the manifest makes sync's
+        deleted-diff purge its KB files, which is the only way an
+        already-synced ticket leaves the KB (stored state is never
+        re-filtered by _should_include_ticket alone).
+        """
+        return ticket_id in self._denied_ticket_ids
+
     def _checkpoint_path(self) -> Path:
         return self._state_dir / "resume_checkpoint.txt"
 
@@ -877,6 +991,63 @@ def _parse_tags(value: str) -> set[str]:
         for part in value.split(",")
         if (tag := part.strip("\"'").strip().lower())
     }
+
+
+def _load_denylist_files(value: str) -> set[str]:
+    """Load and union the comma-separated plaintext denylist files.
+
+    Format: one ticket ID per line; blank lines and ``#`` comments ignored.
+    A missing or unreadable file, or a non-numeric data line, raises
+    ValueError so a misconfigured denylist fails the run instead of
+    silently syncing a sensitive ticket (fail-closed). A leading UTF-8
+    BOM (a common editor artifact) is tolerated.
+    """
+    denied: set[str] = set()
+    paths = [part.strip() for part in value.split(",") if part.strip()]
+    for raw_path in paths:
+        expanded = Path(os.path.expanduser(raw_path))
+        if not expanded.is_file():
+            raise ValueError(
+                f"Zendesk tickets denylist file not found: {raw_path!r} "
+                f"(from {_DENYLIST_FILES_ENV}={value!r})"
+            )
+        try:
+            # utf-8-sig strips an editor-written BOM; identical to utf-8
+            # for BOM-less files.
+            text = expanded.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            # UnicodeDecodeError (invalid UTF-8) is not an OSError; wrap it
+            # too so a non-UTF-8 denylist fails closed with file context.
+            raise ValueError(
+                f"Cannot read Zendesk tickets denylist file {raw_path!r}: {exc}"
+            ) from exc
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            entry = line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            # ASCII-only digits: str.isdigit() alone also accepts non-ASCII
+            # decimal digits (fullwidth, Arabic-Indic, superscripts) that can
+            # never compare equal to the ASCII str(ticket_id), and storing
+            # raw would let a non-canonical-but-accepted entry like '045748'
+            # silently match nothing. Canonicalize so every accepted entry is
+            # provably equal to the ASCII string form of a ticket ID.
+            if not (entry.isascii() and entry.isdigit()):
+                raise ValueError(
+                    f"Malformed denylist line {raw_path}:{line_number}: "
+                    f"expected a numeric ticket ID, got {entry!r}"
+                )
+            try:
+                denied.add(str(int(entry)))
+            except ValueError as exc:
+                # isdigit() passes absurdly long digit strings, but CPython's
+                # int/str conversion limit (~4300 digits) still raises; keep
+                # the same controlled fail-closed contract as malformed
+                # entries instead of a raw traceback.
+                raise ValueError(
+                    f"Malformed denylist line {raw_path}:{line_number}: "
+                    f"unparseable numeric ticket ID {entry!r}: {exc}"
+                ) from exc
+    return denied
 
 
 def _parse_attachment_extensions(value: str | None) -> frozenset[str] | None:

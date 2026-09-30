@@ -91,6 +91,28 @@ curl -X POST /sync/wiki        # API: trigger by name
 curl -X POST /sync/8f3a2b1c-.. # API: trigger by kb-id
 ```
 
+The daemon blocks an unchanged file after three consecutive duplicate-content
+upload failures. Further scheduled, webhook, and ordinary manual syncs do not
+read or upload that file, retain its existing KB copy, and continue syncing
+other files. Blocked files are reported as warnings — they do not fail the run
+or change its exit status — with counts in `GET /status`, logs, and
+notifications.
+
+Counts are held in RAM per server, KB, destination path, and source checksum.
+Changing the checksum, removing the pending file, or restarting the daemon
+clears its count; a successful upload or a different failure breaks the streak.
+Standalone CLI syncs do not share this state. After fixing the conflict, reset
+the counts for a KB and retry through the daemon:
+
+```bash
+curl -X POST 'http://localhost:8080/sync/wiki?retry_blocked=true'
+```
+
+Include the daemon's bearer token if API authentication is enabled. A dry run
+does not change counts or blocks; `dry_run=true` and `retry_blocked=true` cannot
+be combined. A retry requested while that KB is already syncing is skipped,
+so wait for it to finish before requesting the retry.
+
 ### Docker
 
 ```bash
@@ -198,6 +220,7 @@ Options:
 | `ZENDESKTICKET_STATUS` | Comma-separated statuses to include (for example `open,solved,closed`) |
 | `ZENDESKTICKET_INCLUDETAGS` | Comma-separated tags; include tickets matching any listed tag |
 | `ZENDESKTICKET_EXCLUDETAGS` | Comma-separated tags to skip |
+| `ZENDESKTICKET_DENYLIST_FILES` | Comma-separated plaintext denylist files of numeric ticket IDs (`#` comments/blank lines ignored); denylisted tickets are excluded from sync and purged from the KB by the next sync run — see `docs/denylist.md`. Missing or malformed files fail the run (fail-closed) |
 | `ZENDESKTICKET_VERBOSE_HTTP` | Print Zendesk request URLs/params for debugging when true |
 | `ZENDESKTICKET_MAX_RETRIES` | Max retries for `429 Too Many Requests`, defaults to `5` |
 | `ZENDESKTICKET_BACKOFF_BASE_SECONDS` | Base exponential backoff delay in seconds, defaults to `1.0` |
@@ -210,8 +233,9 @@ Options:
 export ZOTERO_LIBRARY_ID=123456
 export ZOTERO_API_KEY=...
 
-oikb sync "zotero:" --kb-id your-kb-id                 # all top-level collections plus _unfiled
-oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id
+oikb sync "zotero:" --kb-id your-kb-id # syncs all top-level collections plus _unfiled
+oikb sync "zotero:Research" --kb-id your-kb-id # syncs only the 'Research' collection
+oikb sync "zotero:Research%%Machine Learning" --kb-id your-kb-id # syncs only the 'Machine Learning' subcollection
 ```
 
 Options:
