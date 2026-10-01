@@ -1760,6 +1760,58 @@ def test_duplicate_entries_in_saved_state_are_healed(monkeypatch: pytest.MonkeyP
     connector.close()
 
 
+def test_aggressive_checkpoint_midrun_save_heals_duplicate_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """With aggressive checkpointing, a mid-run save must not persist the
+    duplicate entries loaded from pre-fix state (#52): a run that dies after
+    the save would otherwise leave them for the next run to inherit."""
+    state_dir = _make_state_dir(tmp_path, "attachments-aggressive-duplicates")
+    attachment_entry = {"path": "attachments/1001", "filename": "1001-8a1766-dup.pdf", "checksum": "abc123", "size": 9}
+    (state_dir / "manifest_state.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "2024-01-02T00:00:00Z",
+                "attachments_enabled": True,
+                "ticket_files": {
+                    "1001": {
+                        "updated_at": "2024-01-01T00:00:00Z",
+                        "entries": [
+                            {"path": "tickets", "filename": "1001.md", "checksum": "md", "size": 10},
+                            attachment_entry,
+                            dict(attachment_entry),
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_AGGRESSIVE_CHECKPOINT", "true")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        # One page with a next_page: the mid-run save fires after it, then
+        # the follow-up page fetch fails and build_manifest raises, leaving
+        # only the mid-run snapshot on disk.
+        pages=[
+            {
+                "tickets": [],
+                "end_time": 1704249600,
+                "next_page": "https://acme.zendesk.com/api/v2/incremental/tickets.json?cursor=2",
+            }
+        ],
+    )
+
+    with pytest.raises(AssertionError):
+        connector.build_manifest()
+
+    saved = json.loads((state_dir / "manifest_state.json").read_text())
+    assert [entry["filename"] for entry in saved["ticket_files"]["1001"]["entries"]] == [
+        "1001.md",
+        "1001-8a1766-dup.pdf",
+    ]
+    connector.close()
+
+
 def test_no_attachment_directory_created_when_no_attachments(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "attachments-empty")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")

@@ -302,21 +302,8 @@ class ZendeskTicketsConnector(BaseConnector):
         # the rest so this run's manifest and the state saved after it are
         # both clean.
         for ticket_id, entries in combined_entries_by_ticket.items():
-            seen_keys: set[tuple[str, str]] = set()
-            deduped: list[ManifestEntry] = []
-            for entry in entries:
-                key = (entry.path, entry.filename)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                deduped.append(entry)
+            deduped = self._dedupe_ticket_entries(ticket_id, entries)
             if len(deduped) != len(entries):
-                log.warning(
-                    "ZendeskTicketsConnector: dropped %d duplicate manifest ent%s for ticket %s from saved state",
-                    len(entries) - len(deduped),
-                    "y" if len(entries) - len(deduped) == 1 else "ies",
-                    ticket_id,
-                )
                 combined_entries_by_ticket[ticket_id] = deduped
         manifest = [entry for entries in combined_entries_by_ticket.values() for entry in entries]
         manifest.sort(key=lambda entry: entry.display_path)
@@ -370,6 +357,30 @@ class ZendeskTicketsConnector(BaseConnector):
             )
         return manifest
 
+    def _dedupe_ticket_entries(self, ticket_id: str, entries: list[ManifestEntry]) -> list[ManifestEntry]:
+        """Drop duplicate (path, filename) entries for a ticket, keeping the first.
+
+        State saved before attachment dedup existed (aggressive mid-run
+        checkpoints persist entries before the sync runs) can hold duplicates,
+        which fail the whole sync at manifest-assembly time.
+        """
+        seen_keys: set[tuple[str, str]] = set()
+        deduped: list[ManifestEntry] = []
+        for entry in entries:
+            key = (entry.path, entry.filename)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(entry)
+        if len(deduped) != len(entries):
+            log.warning(
+                "ZendeskTicketsConnector: dropped %d duplicate manifest entr%s for ticket %s from saved state",
+                len(entries) - len(deduped),
+                "y" if len(entries) - len(deduped) == 1 else "ies",
+                ticket_id,
+            )
+        return deduped
+
     def _build_midrun_state(
         self,
         prior_entries: dict[str, list[ManifestEntry]],
@@ -408,6 +419,10 @@ class ZendeskTicketsConnector(BaseConnector):
                     if entry.path != attachment_path or self._filename_extension_allowed(entry.filename)
                 ]
         combined = carried_forward | page_entries
+        for ticket_id, entries in combined.items():
+            deduped = self._dedupe_ticket_entries(ticket_id, entries)
+            if len(deduped) != len(entries):
+                combined[ticket_id] = deduped
         snapshot = {
             "attachments_enabled": self._download_attachments,
             "attachment_extensions": self._state_extensions_value(),
