@@ -20,6 +20,7 @@ from oikb.connectors.zendesktickets import (
     _DEFAULT_ATTACHMENT_EXTENSIONS,
     _extensions_from_state,
     _parse_attachment_extensions,
+    _parse_sha1_prefix_len,
     _parse_tags,
     ZendeskTicketsConnector,
     parse_zendesktickets_source,
@@ -1514,6 +1515,7 @@ def test_attachments_are_added_when_enabled(monkeypatch: pytest.MonkeyPatch, tmp
     state_dir = _make_state_dir(tmp_path, "attachments-enabled")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "txt,png")
+    monkeypatch.setenv("ZENDESKTICKET_SHA1_PREFIX_LEN", "6")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -1600,6 +1602,7 @@ def test_attachments_with_same_name_use_content_hashes(monkeypatch: pytest.Monke
     state_dir = _make_state_dir(tmp_path, "attachments-same-name")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "png")
+    monkeypatch.setenv("ZENDESKTICKET_SHA1_PREFIX_LEN", "6")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -1639,6 +1642,7 @@ def test_repeated_attachment_reference_is_emitted_once(monkeypatch: pytest.Monke
     state_dir = _make_state_dir(tmp_path, "attachments-repeated-reference")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "png")
+    monkeypatch.setenv("ZENDESKTICKET_SHA1_PREFIX_LEN", "6")
     attachment_url = "https://acme.zendesk.com/attachments/dup.png"
     connector = _build_connector(
         monkeypatch,
@@ -1681,6 +1685,7 @@ def test_identical_uploads_with_same_name_emit_one_entry(monkeypatch: pytest.Mon
     state_dir = _make_state_dir(tmp_path, "attachments-identical-uploads")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "png")
+    monkeypatch.setenv("ZENDESKTICKET_SHA1_PREFIX_LEN", "6")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -1711,6 +1716,92 @@ def test_identical_uploads_with_same_name_emit_one_entry(monkeypatch: pytest.Mon
         "tickets/1001.md",
     ]
     connector.close()
+
+
+def test_sha1_prefix_len_defaults_to_full_hash(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Without ZENDESKTICKET_SHA1_PREFIX_LEN, attachment filenames embed the
+    full SHA-1 digest (#52 review follow-up)."""
+    state_dir = _make_state_dir(tmp_path, "attachments-full-hash")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "png")
+    monkeypatch.delenv("ZENDESKTICKET_SHA1_PREFIX_LEN", raising=False)
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[_attachment("dup.png", url="https://acme.zendesk.com/attachments/dup.png")],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+        attachments={"dup.png": b"dup-bytes"},
+    )
+
+    manifest = connector.build_manifest()
+
+    full_hash = hashlib.sha1(b"dup-bytes").hexdigest()
+    assert [entry.display_path for entry in manifest] == [
+        f"attachments/1001/1001-{full_hash}-dup.png",
+        "tickets/1001.md",
+    ]
+    connector.close()
+
+
+def test_sha1_prefix_len_six_matches_legacy_format(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """ZENDESKTICKET_SHA1_PREFIX_LEN=6 reproduces the pre-#52 filename format."""
+    state_dir = _make_state_dir(tmp_path, "attachments-prefix-six")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "png")
+    monkeypatch.setenv("ZENDESKTICKET_SHA1_PREFIX_LEN", "6")
+    connector = _build_connector(
+        monkeypatch,
+        state_dir,
+        pages=[
+            {
+                "tickets": [
+                    _ticket(
+                        1001,
+                        "2024-01-02T03:04:05Z",
+                        attachments=[_attachment("dup.png", url="https://acme.zendesk.com/attachments/dup.png")],
+                    )
+                ],
+                "next_page": None,
+            }
+        ],
+        comments={1001: []},
+        attachments={"dup.png": b"dup-bytes"},
+    )
+
+    manifest = connector.build_manifest()
+
+    short_hash = hashlib.sha1(b"dup-bytes").hexdigest()[:6]
+    assert [entry.display_path for entry in manifest] == [
+        f"attachments/1001/1001-{short_hash}-dup.png",
+        "tickets/1001.md",
+    ]
+    connector.close()
+
+
+def test_parse_sha1_prefix_len_valid_values():
+    assert _parse_sha1_prefix_len(None) is None
+    assert _parse_sha1_prefix_len("") is None
+    assert _parse_sha1_prefix_len("  ") is None
+    assert _parse_sha1_prefix_len("6") == 6
+    assert _parse_sha1_prefix_len(" 12 ") == 12
+    assert _parse_sha1_prefix_len("40") == 40
+
+
+@pytest.mark.parametrize("value", ["5", "41", "abc", "-1", "4.0"])
+def test_parse_sha1_prefix_len_rejects_invalid_values(value: str):
+    with pytest.raises(ValueError, match="ZENDESKTICKET_SHA1_PREFIX_LEN"):
+        _parse_sha1_prefix_len(value)
 
 
 def test_duplicate_entries_in_saved_state_are_healed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1864,6 +1955,7 @@ def test_external_attachment_downloads_without_authenticated_client(monkeypatch:
     state_dir = _make_state_dir(tmp_path, "external-attachments")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "png")
+    monkeypatch.setenv("ZENDESKTICKET_SHA1_PREFIX_LEN", "6")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -1901,6 +1993,7 @@ def test_default_attachment_allowlist_blocks_non_matching_extensions(monkeypatch
     state_dir = _make_state_dir(tmp_path, "default-allowlist")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
     monkeypatch.delenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", raising=False)
+    monkeypatch.setenv("ZENDESKTICKET_SHA1_PREFIX_LEN", "6")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -2101,6 +2194,7 @@ def test_attachment_extensions_persisted_in_state(monkeypatch: pytest.MonkeyPatc
 def test_zendesk_attachment_redirect_is_followed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     state_dir = _make_state_dir(tmp_path, "zendesk-attachment-redirect")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
+    monkeypatch.setenv("ZENDESKTICKET_SHA1_PREFIX_LEN", "6")
     connector = _build_connector(
         monkeypatch,
         state_dir,
@@ -2300,6 +2394,7 @@ def test_multipage_comments_follow_next_page_into_manifest(monkeypatch: pytest.M
     state_dir = _make_state_dir(tmp_path, "multipage-comments")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "true")
     monkeypatch.setenv("ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS", "pdf")
+    monkeypatch.setenv("ZENDESKTICKET_SHA1_PREFIX_LEN", "6")
     connector = _build_connector(
         monkeypatch,
         state_dir,
