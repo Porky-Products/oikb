@@ -36,6 +36,8 @@ _DEFAULT_ATTACHMENT_EXTENSIONS = frozenset(
 )
 _ATTACHMENT_EXTENSIONS_ENV = "ZENDESKTICKET_DOWNLOAD_ATTACHMENT_ALLOWED_EXTENSIONS"
 _DENYLIST_FILES_ENV = "ZENDESKTICKET_DENYLIST_FILES"
+_SHA1_PREFIX_LEN_ENV = "ZENDESKTICKET_SHA1_PREFIX_LEN"
+_SHA1_DIGEST_LEN = len(hashlib.sha1(b"").hexdigest())
 # Safety bound for comments pagination: a ticket needs an extreme comment
 # count to exceed it (100 pages x 100 comments/page default). Hitting the
 # bound fails closed -- the ticket is skipped rather than synced partially.
@@ -73,6 +75,7 @@ class ZendeskTicketsConnector(BaseConnector):
         self._page_size = _parse_page_size(os.environ.get("ZENDESKTICKET_PAGE_SIZE", "10"))
         self._download_attachments = _parse_bool(os.environ.get("ZENDESKTICKET_DOWNLOAD_ATTACHMENTS", "false"))
         self._attachment_extensions = _parse_attachment_extensions(os.environ.get(_ATTACHMENT_EXTENSIONS_ENV))
+        self._sha1_prefix_len = _parse_sha1_prefix_len(os.environ.get(_SHA1_PREFIX_LEN_ENV))
         self._verbose_http = _parse_bool(os.environ.get("ZENDESKTICKET_VERBOSE_HTTP", "false"))
         self._max_retries = _parse_non_negative_int(os.environ.get("ZENDESKTICKET_MAX_RETRIES", "5"), "ZENDESKTICKET_MAX_RETRIES")
         self._backoff_base_seconds = _parse_positive_float(
@@ -526,7 +529,8 @@ class ZendeskTicketsConnector(BaseConnector):
                     if self._verbose_http:
                         print(f"[zendesktickets] skipping attachment after retries: {attachment['content_url']}")
                     continue
-                short_hash = hashlib.sha1(content).hexdigest()[:6]  # noqa: S324
+                digest = hashlib.sha1(content).hexdigest()  # noqa: S324
+                short_hash = digest if self._sha1_prefix_len is None else digest[: self._sha1_prefix_len]
                 filename = f"{ticket_id}-{short_hash}-{self._sanitize_filename(attachment['file_name'])}"
                 # Distinct uploads can still carry identical content under the
                 # same filename; emitting both would duplicate the manifest
@@ -1169,6 +1173,26 @@ def _parse_positive_float(value: str, var_name: str) -> float:
         raise ValueError(f"{var_name} must be a positive number.") from exc
     if parsed <= 0:
         raise ValueError(f"{var_name} must be a positive number.")
+    return parsed
+
+
+def _parse_sha1_prefix_len(value: str | None) -> int | None:
+    """Attachment-filename SHA-1 prefix length; None means the full digest."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        parsed = int(stripped)
+    except ValueError as exc:
+        raise ValueError(
+            f"{_SHA1_PREFIX_LEN_ENV} must be an integer between 6 and {_SHA1_DIGEST_LEN}, or empty for the full hash."
+        ) from exc
+    if parsed < 6 or parsed > _SHA1_DIGEST_LEN:
+        raise ValueError(
+            f"{_SHA1_PREFIX_LEN_ENV} must be an integer between 6 and {_SHA1_DIGEST_LEN}, or empty for the full hash."
+        )
     return parsed
 
 
